@@ -340,7 +340,7 @@ def create_dashboard(df, fwd_df, mkt, p5, p95, output='fx_gamma_trading.html'):
     today_str = datetime.now().strftime('%Y-%m-%d')
 
     html = f'''<!DOCTYPE html>
-<html><head><title>FX Gamma Trading</title>
+<html><head><meta charset="utf-8"><title>FX Gamma Trading</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
 *{{box-sizing:border-box}}body{{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:15px;background:#2d2d2d;color:#e0e0e0}}
@@ -519,7 +519,7 @@ select{{padding:6px;background:#3d3d3d;color:#e0e0e0;border:1px solid #555;borde
 </div>
 
 <script>
-var S={json.dumps(sdata)},T={json.dumps(tenors)},D={json.dumps(deltas)},DL={json.dumps(dlabels)};
+var S={json.dumps(sdata)},T={json.dumps(tenors)},D={json.dumps(deltas)},DL={json.dumps(dlabels, ensure_ascii=False)};
 var M_richness={json.dumps(matrix_richness)};
 var M_theta={json.dumps(matrix_theta)};
 var M_gamma={json.dumps(matrix_gamma)};
@@ -1053,7 +1053,7 @@ function renderTimeSeries(){{
 init();
 </script></body></html>'''
 
-    with open(output, 'w') as f: f.write(html)
+    with open(output, 'w', encoding='utf-8') as f: f.write(html)
     return output
 
 # === MAIN ===
