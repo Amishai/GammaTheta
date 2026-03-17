@@ -116,8 +116,7 @@ def create_template(fp):
     for i, (n, v, d) in enumerate([
         ('Spot', 1.0850, 'Spot rate'),
         ('TermsRate', 0.045, 'Terms/quote currency rate'),
-        ('BaseRate', 0.025, 'Base currency rate'),
-        ('TN_Roll_Pips', -0.55, 'T/N roll in pips')
+        ('BaseRate', 0.025, 'Base currency rate')
     ], 2):
         ws.cell(row=i, column=1, value=n).border = bord
         c = ws.cell(row=i, column=2, value=v)
@@ -126,28 +125,28 @@ def create_template(fp):
     ws.column_dimensions['A'].width, ws.column_dimensions['B'].width, ws.column_dimensions['C'].width = 15, 12, 35
 
     ws2 = wb.create_sheet('VolSurface')
-    for i, h in enumerate(['Tenor', 'T_Years', 'ATM', 'RR25', 'RR10', 'FLY25', 'FLY10'], 1):
+    for i, h in enumerate(['Tenor', 'T_Years', 'ATM', 'RR25', 'RR10', 'FLY25', 'FLY10', 'FwdPts'], 1):
         c = ws2.cell(row=1, column=i, value=h)
         c.font, c.fill, c.border = hf, hfill, bord
 
     data = [
-        ('O/N', 1/365, 7.50, -0.30, -0.60, 0.15, 0.40),
-        ('1W', 7/365, 7.80, -0.35, -0.70, 0.18, 0.45),
-        ('2W', 14/365, 8.00, -0.40, -0.80, 0.20, 0.50),
-        ('1M', 1/12, 8.20, -0.50, -1.00, 0.25, 0.60),
-        ('2M', 2/12, 8.50, -0.60, -1.20, 0.30, 0.70),
-        ('3M', 3/12, 8.80, -0.70, -1.40, 0.35, 0.80),
-        ('6M', 6/12, 9.20, -0.80, -1.60, 0.40, 0.95),
-        ('9M', 9/12, 9.50, -0.85, -1.70, 0.42, 1.05),
-        ('1Y', 1.0, 9.80, -0.90, -1.80, 0.45, 1.15),
-        ('2Y', 2.0, 10.20, -1.00, -2.00, 0.50, 1.30),
+        ('O/N', 1/365, 7.50, -0.30, -0.60, 0.15, 0.40, 0.59),
+        ('1W', 7/365, 7.80, -0.35, -0.70, 0.18, 0.45, 4.16),
+        ('2W', 14/365, 8.00, -0.40, -0.80, 0.20, 0.50, 8.33),
+        ('1M', 1/12, 8.20, -0.50, -1.00, 0.25, 0.60, 18.10),
+        ('2M', 2/12, 8.50, -0.60, -1.20, 0.30, 0.70, 36.23),
+        ('3M', 3/12, 8.80, -0.70, -1.40, 0.35, 0.80, 54.39),
+        ('6M', 6/12, 9.20, -0.80, -1.60, 0.40, 0.95, 109.04),
+        ('9M', 9/12, 9.50, -0.85, -1.70, 0.42, 1.05, 163.98),
+        ('1Y', 1.0, 9.80, -0.90, -1.80, 0.45, 1.15, 219.18),
+        ('2Y', 2.0, 10.20, -1.00, -2.00, 0.50, 1.30, 442.80),
     ]
     for ri, row in enumerate(data, 2):
         for ci, v in enumerate(row, 1):
             c = ws2.cell(row=ri, column=ci, value=v)
             c.border = bord
             if ci >= 3: c.font, c.fill = inf, infill
-    for i, w in enumerate([8, 10, 10, 10, 10, 10, 10], 1):
+    for i, w in enumerate([8, 10, 10, 10, 10, 10, 10, 10], 1):
         ws2.column_dimensions[get_column_letter(i)].width = w
 
     ws3 = wb.create_sheet('Positions')
@@ -188,7 +187,25 @@ def load_data(fp):
     p = pd.read_excel(fp, sheet_name='Parameters')
     params = dict(zip(p['Parameter'], p['Value']))
     v = pd.read_excel(fp, sheet_name='VolSurface')
-    v.columns = ['tenor', 'T_years', 'atm', 'rr25', 'rr10', 'fly25', 'fly10']
+
+    S = params['Spot']
+    r_d = params['TermsRate']
+
+    # Handle both old (7-col) and new (8-col with FwdPts) formats
+    if v.shape[1] >= 8:
+        v.columns = ['tenor', 'T_years', 'atm', 'rr25', 'rr10', 'fly25', 'fly10', 'fwd_pts']
+    else:
+        v.columns = ['tenor', 'T_years', 'atm', 'rr25', 'rr10', 'fly25', 'fly10']
+        # Fall back to rate-derived forward points
+        r_f_flat = params['BaseRate']
+        v['fwd_pts'] = v['T_years'].apply(lambda T: (S * np.exp((r_d - r_f_flat) * T) - S) * 10000)
+
+    # Derive forward and implied r_f for each tenor from actual fwd pts
+    v['forward'] = S + v['fwd_pts'] / 10000
+    v['r_f_implied'] = v.apply(lambda r: r_d - np.log(r['forward'] / S) / r['T_years'] if r['T_years'] > 0 else params.get('BaseRate', 0.025), axis=1)
+
+    # Build forward curve for interpolation (used by portfolio positions)
+    fwd_curve = v[['T_years', 'forward', 'r_f_implied']].to_dict('records')
 
     positions = []
     try:
@@ -214,13 +231,22 @@ def load_data(fp):
     except:
         pass
 
-    return {'spot': params['Spot'], 'r_terms': params['TermsRate'], 'r_base': params['BaseRate'],
-            'tn_roll': params['TN_Roll_Pips'], 'vol_surface': v, 'positions': positions}
+    # T/N roll cost = negative of O/N fwd pts
+    # (positive fwd pts = base at premium = costs to roll short base hedge)
+    if 'TN_Roll_Pips' in params:
+        tn_roll = params['TN_Roll_Pips']
+    else:
+        on_row = v[v['T_years'] == v['T_years'].min()].iloc[0]
+        tn_roll = -on_row['fwd_pts']
+
+    return {'spot': S, 'r_terms': r_d, 'r_base': params.get('BaseRate', 0.025),
+            'tn_roll': tn_roll, 'vol_surface': v, 'positions': positions,
+            'fwd_curve': fwd_curve}
 
 # === BUILD SURFACE ===
 
 def build_surface(mkt):
-    S, r_d, r_f, tn = mkt['spot'], mkt['r_terms'], mkt['r_base'], mkt['tn_roll']
+    S, r_d, tn = mkt['spot'], mkt['r_terms'], mkt['tn_roll']
     notional = 1_000_000
 
     deltas = [('10P', -0.10, False), ('15P', -0.15, False), ('20P', -0.20, False), ('25P', -0.25, False),
@@ -234,11 +260,12 @@ def build_surface(mkt):
 
     for _, r in mkt['vol_surface'].iterrows():
         T = r['T_years']
-        F = S * np.exp((r_d - r_f) * T)
+        F = r['forward']
+        r_f = r['r_f_implied']
         df_f = np.exp(-r_f * T)
         smile = solve_smile(r['atm'], r['rr25'], r['fly25'], r['rr10'], r['fly10'])
 
-        fwd_pts = (F - S) * 10000
+        fwd_pts = r['fwd_pts']
         days = max(1, round(T * 365))
         fwd_points_list.append({'tenor': r['tenor'], 'T_years': T, 'days': days, 'forward': F, 'fwd_points': fwd_pts})
 
@@ -259,8 +286,7 @@ def build_surface(mkt):
             gamma = bs_gamma(S, K, T, sigma, r_d, r_f)
             vega = bs_vega(S, K, T, sigma, r_d, r_f)
 
-            # Core formula: (Theta + Delta * TN_roll) / Gamma
-            # Both theta and roll are in price terms per unit per day
+            # Core formula: |Theta + Delta * T/N_roll| / Gamma
             roll = delta * (tn / 10000)
             cost = abs(theta + roll) / gamma if gamma > 1e-12 else 0
 
@@ -339,6 +365,8 @@ def create_dashboard(df, fwd_df, mkt, p5, p95, output='fx_gamma_trading.html'):
     positions = mkt.get('positions', [])
     today_str = datetime.now().strftime('%Y-%m-%d')
 
+    on_fwd_pts = fwd_df.loc[fwd_df['T_years'].idxmin(), 'fwd_points'] if len(fwd_df) > 0 else 0
+
     html = f'''<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>FX Gamma Trading</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
@@ -388,7 +416,7 @@ select{{padding:6px;background:#3d3d3d;color:#e0e0e0;border:1px solid #555;borde
 <div class="market-item"><div class="label">Spot</div><div class="value">{mkt['spot']:.4f}</div></div>
 <div class="market-item"><div class="label">Terms Rate</div><div class="value">{mkt['r_terms']*100:.2f}%</div></div>
 <div class="market-item"><div class="label">Base Rate</div><div class="value">{mkt['r_base']*100:.2f}%</div></div>
-<div class="market-item"><div class="label">T/N Roll</div><div class="value">{mkt['tn_roll']:.2f} pips</div></div>
+<div class="market-item"><div class="label">O/N Fwd Pts</div><div class="value">{on_fwd_pts:.2f} pips</div></div>
 <div class="market-item"><div class="label">Notional ($M)</div><input type="number" id="notional" class="notional-input" value="1" min="0.1" step="0.1" onchange="updateNotional()"></div>
 </div>
 
@@ -528,6 +556,7 @@ var M_strikes={json.dumps(matrix_strikes)};
 var M_delta={json.dumps(matrix_delta)};
 var tenorDays={json.dumps(tenor_days)};
 var mkt={{spot:{mkt['spot']},r_d:{mkt['r_terms']},r_f:{mkt['r_base']},tn_roll:{mkt['tn_roll']}}};
+var fwdCurve={json.dumps(mkt['fwd_curve'])};
 var excelPositions={json.dumps(positions)};
 var todayStr="{today_str}";
 
@@ -669,9 +698,31 @@ function normcdf(x){{
 }}
 function normpdf(x){{return Math.exp(-0.5*x*x)/Math.sqrt(2*Math.PI);}}
 
+// Interpolate forward and implied r_f for a given T from the forward curve
+function interpForward(T){{
+    if(fwdCurve.length===0) return {{F:mkt.spot,r_f:mkt.r_f}};
+    // Clamp to curve boundaries
+    if(T<=fwdCurve[0].T_years) return {{F:fwdCurve[0].forward,r_f:fwdCurve[0].r_f_implied}};
+    if(T>=fwdCurve[fwdCurve.length-1].T_years) return {{F:fwdCurve[fwdCurve.length-1].forward,r_f:fwdCurve[fwdCurve.length-1].r_f_implied}};
+    // Linear interpolation
+    for(var i=0;i<fwdCurve.length-1;i++){{
+        if(T>=fwdCurve[i].T_years&&T<=fwdCurve[i+1].T_years){{
+            var t0=fwdCurve[i].T_years,t1=fwdCurve[i+1].T_years;
+            var w=(T-t0)/(t1-t0);
+            var F=fwdCurve[i].forward+(fwdCurve[i+1].forward-fwdCurve[i].forward)*w;
+            var rf=fwdCurve[i].r_f_implied+(fwdCurve[i+1].r_f_implied-fwdCurve[i].r_f_implied)*w;
+            return {{F:F,r_f:rf}};
+        }}
+    }}
+    return {{F:mkt.spot,r_f:mkt.r_f}};
+}}
+
 function calcPositionGreeks(K,T,vol,notional,isCall){{
-    var Sp=mkt.spot,rd=mkt.r_d,rf=mkt.r_f,sigma=vol/100;
+    var Sp=mkt.spot,rd=mkt.r_d,sigma=vol/100;
     if(T<=0) T=1/365;
+    // Use interpolated forward to get correct r_f for this tenor
+    var fwd=interpForward(T);
+    var rf=fwd.r_f;
     var d1v=(Math.log(Sp/K)+(rd-rf+0.5*sigma*sigma)*T)/(sigma*Math.sqrt(T));
     var d2v=d1v-sigma*Math.sqrt(T);
     var df=Math.exp(-rd*T);
@@ -847,6 +898,7 @@ function buildPortfolioHeatmap(positions){{
     // Accumulate positions into buckets
     var bucketGammaSum=tenorList.map(()=>strikeBuckets.map(()=>0));
     var bucketRichGammaSum=tenorList.map(()=>strikeBuckets.map(()=>0));
+    var bucketNetNotional=tenorList.map(()=>strikeBuckets.map(()=>0));
     positions.forEach(p=>{{
         var ti=tenorList.indexOf(p.tenorBucket),si=getSI(p.strike);
         if(ti>=0&&si>=0){{
@@ -855,13 +907,16 @@ function buildPortfolioHeatmap(positions){{
             var gAbs=Math.abs(p.gamma);
             bucketGammaSum[ti][si]+=gAbs;
             bucketRichGammaSum[ti][si]+=p.richness*gAbs;
+            bucketNetNotional[ti][si]+=p.notional;
         }}
     }});
     // Compute gamma-weighted average richness per bucket
+    portfolioData.heatmaps.direction=tenorList.map(()=>strikeBuckets.map(()=>null));
     for(var ti=0;ti<tenorList.length;ti++){{
         for(var si=0;si<nb;si++){{
             if(bucketGammaSum[ti][si]>1e-10){{
                 portfolioData.heatmaps.richness[ti][si]=bucketRichGammaSum[ti][si]/bucketGammaSum[ti][si];
+                portfolioData.heatmaps.direction[ti][si]=bucketNetNotional[ti][si]>=0?'L':'S';
             }}
         }}
     }}
@@ -889,7 +944,17 @@ function renderPortHeatmap(){{
         zmin=-mx; zmax=mx;
     }}
     var xLabels=portfolioData.strikeLabels;
-    var txt=M.map(r=>r.map(v=>v===null?'':v.toFixed(2)));
+    var dir=portfolioData.heatmaps.direction;
+    var txt;
+    if(currentPortHeatmap==='richness'){{
+        txt=M.map((r,ti)=>r.map((v,si)=>v===null?'':(dir[ti][si]||'')+' '+v.toFixed(2)));
+    }}else{{
+        txt=M.map((r,ti)=>r.map((v,si)=>{{
+            if(v===null) return '';
+            var d=dir[ti]&&dir[ti][si]?dir[ti][si]:'';
+            return d+' '+v.toFixed(1);
+        }}));
+    }}
     Plotly.react('port-heatmap',[{{z:M,x:xLabels,y:T,type:'heatmap',colorscale:cs,text:txt,texttemplate:'%{{text}}',
     textfont:{{size:9,color:'black'}},colorbar:{{title:{{text:currentPortHeatmap==='richness'?'Score':'$K',font:{{color:'#e0e0e0'}}}},tickfont:{{color:'#e0e0e0'}},len:.9}},
     zmin:zmin,zmax:zmax,hoverongaps:false}}],
@@ -963,7 +1028,7 @@ function buildTimeSeries(positions){{
     var projDays=Math.min(maxDays,730);
     var dates=[],gammas=[],thetas=[],vegas=[],deltas=[],cumDecays=[];
     var cumDecay=0;
-    var Sp=mkt.spot,rd=mkt.r_d,rf=mkt.r_f;
+    var Sp=mkt.spot,rd=mkt.r_d;
 
     for(var day=0;day<=projDays;day++){{
         var dStr=new Date(Date.now()+day*86400000).toISOString().slice(0,10);
@@ -973,6 +1038,8 @@ function buildTimeSeries(positions){{
             var remainT=p.T-day/365;
             if(remainT<1/365) return; // expired
             var sigma=p.vol/100,K=p.strike,isCall=p.type==='C';
+            var fwd=interpForward(remainT);
+            var rf=fwd.r_f;
             var d1v=(Math.log(Sp/K)+(rd-rf+0.5*sigma*sigma)*remainT)/(sigma*Math.sqrt(remainT));
             var d2v=d1v-sigma*Math.sqrt(remainT);
             var dfr=Math.exp(-rd*remainT),dff=Math.exp(-rf*remainT);
@@ -1070,11 +1137,12 @@ def main():
 
     print(f"Loading: {fp}")
     mkt = load_data(fp)
-    print(f"  Spot: {mkt['spot']:.4f} | Terms: {mkt['r_terms']*100:.2f}% | Base: {mkt['r_base']*100:.2f}% | Roll: {mkt['tn_roll']:.2f} pips")
+    print(f"  Spot: {mkt['spot']:.4f} | Terms: {mkt['r_terms']*100:.2f}% | Base: {mkt['r_base']*100:.2f}%")
 
     print("\nBuilding surface...")
     df, fwd_df, p5, p95 = build_surface(mkt)
-    print(f"  Normalization bounds: p5={p5:.6f}, p95={p95:.6f}")
+    on_fwd = fwd_df.loc[fwd_df['T_years'].idxmin(), 'fwd_points'] if len(fwd_df) > 0 else 0
+    print(f"  O/N Fwd Pts: {on_fwd:.2f} pips | Normalization: p5={p5:.6f}, p95={p95:.6f}")
 
     print("\nForward Points:")
     print(fwd_df[['tenor', 'days', 'forward', 'fwd_points']].to_string(index=False))
