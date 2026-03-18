@@ -216,7 +216,23 @@ def create_dashboard(positions, output='fx_gamma_trading.html'):
 <div class="summary-box"><div class="summary-label">Projected Decay</div><div class="summary-value" id="sd">-</div></div>
 </div>
 <div class="portfolio-grid">
+<div class="card">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:10px">
+<h2 style="margin:0" id="ph-title">Portfolio Richness (1-5)</h2>
+<div>
+<button class="btn-toggle active" onclick="setPhView('richness')" id="ph-btn-richness">Richness</button>
+<button class="btn-toggle" onclick="setPhView('vega')" id="ph-btn-vega">Vega</button>
+<button class="btn-toggle" onclick="setPhView('decay')" id="ph-btn-decay">Decay</button>
+</div></div>
+<div id="port-hm" style="height:350px"></div>
+<div class="help">Click a cell to see positions. Gamma-weighted avg richness.</div></div>
 <div class="card"><h2>Position Details</h2><div id="pos-tbl" style="max-height:500px;overflow-y:auto"></div></div>
+</div>
+<div class="card" style="margin-top:15px"><h2>Inefficient Positions</h2>
+<div style="margin-bottom:10px">
+<button class="btn-toggle active" onclick="setIneff('long')" id="ie-long">Long (Rich Gamma)</button>
+<button class="btn-toggle" onclick="setIneff('short')" id="ie-short">Short (Cheap Gamma)</button>
+</div><div id="ineff-tbl" style="max-height:300px;overflow-y:auto"></div></div>
 <div class="card"><h2>Portfolio Greeks Over Time</h2>
 <div style="margin-bottom:10px">
 <button class="btn-toggle active" onclick="setTv('gamma')" id="tv-gamma">Gamma</button>
@@ -426,7 +442,75 @@ function renderPortTab(){
     var h='<table><tr><th>#</th><th>Strike</th><th>Expiry</th><th>Days</th><th>Vol</th><th>Notl</th><th>Type</th><th>\u03b3</th><th>\u03b8</th><th>\u03bd</th><th>Rich</th></tr>';
     comp.forEach(function(p){h+='<tr class="'+(p.notional>=0?'cheap':'rich')+'"><td>'+p.id+'</td><td>'+p.strike.toFixed(3)+'</td><td>'+p.expiry+'</td><td>'+p.days+'</td><td>'+p.vol.toFixed(1)+'</td><td>'+(p.notional>=0?'+':'')+p.notional.toFixed(1)+'</td><td>'+p.type+'</td><td>'+p.gamma.toFixed(4)+'</td><td>'+p.theta.toFixed(2)+'</td><td>'+p.vega.toFixed(1)+'</td><td><span class="richness-badge" style="background:'+richColor(p.rich)+'">'+p.rich.toFixed(2)+'</span></td></tr>';});
     h+='</table>';document.getElementById('pos-tbl').innerHTML=h;
-    buildTS(cs,comp);
+    portComp=comp;portCS=cs;
+    buildPortHm(cs,comp);renderIneff();buildTS(cs,comp);
+}
+var portComp=null,portCS=null,currentPh='richness',currentIneff='long';
+
+function setPhView(v){currentPh=v;['richness','vega','decay'].forEach(function(k){document.getElementById('ph-btn-'+k).className='btn-toggle'+(k===v?' active':'');});
+    document.getElementById('ph-title').textContent={richness:'Portfolio Richness (1-5)',vega:'Portfolio Vega ($K)',decay:'Portfolio Decay ($K/day)'}[v];renderPortHm();}
+
+function buildPortHm(cs,comp){
+    var tenorList=TENORS;
+    var allK=comp.map(function(p){return p.strike;});var mnK=Math.min.apply(null,allK),mxK=Math.max.apply(null,allK),rng=mxK-mnK;
+    var maxB=18,rw=rng/maxB;var nice=[0.001,0.0025,0.005,0.01,0.025,0.05,0.1,0.25,0.5,1,5,10,50,100,500];
+    var bw=nice.find(function(w){return w>=rw;})||500;
+    var uK=[].concat(allK).filter(function(v,i,a){return a.indexOf(v)===i;}).sort(function(a,b){return a-b;});
+    var useB=uK.length>maxB;var sB,sL;
+    if(useB){var s=Math.floor(mnK/bw)*bw,e=Math.ceil(mxK/bw)*bw;sB=[];sL=[];for(var b=s;b<e+bw;b+=bw){sB.push(b);sL.push(b.toFixed(3));}}
+    else{sB=uK;sL=uK.map(function(k){return k.toFixed(3);});}
+    var nb=sB.length;
+    portHmData={strikes:sB,labels:sL,bw:useB?bw:0,
+        rich:tenorList.map(function(){return sB.map(function(){return null;});}),
+        vega:tenorList.map(function(){return sB.map(function(){return 0;});}),
+        decay:tenorList.map(function(){return sB.map(function(){return 0;});}),
+        dir:tenorList.map(function(){return sB.map(function(){return null;});}),
+        byBucket:tenorList.map(function(){return sB.map(function(){return[];});})};
+    function getSI(k){if(!useB)return sB.indexOf(k);return Math.max(0,Math.min(Math.floor((k-sB[0])/bw),nb-1));}
+    function getTI(days){var bk=[['O/N',1],['1W',7],['2W',14],['1M',30],['2M',61],['3M',91],['6M',182],['9M',274],['1Y',365],['2Y',730]];for(var i=bk.length-1;i>=0;i--){if(days>=bk[i][1]*0.7)return tenorList.indexOf(bk[i][0]);}return 0;}
+    var gSum=tenorList.map(function(){return sB.map(function(){return 0;});}),rgSum=tenorList.map(function(){return sB.map(function(){return 0;});}),nSum=tenorList.map(function(){return sB.map(function(){return 0;});});
+    comp.forEach(function(p){var ti=getTI(p.days),si=getSI(p.strike);if(ti<0||si<0)return;
+        portHmData.vega[ti][si]+=p.vega;portHmData.decay[ti][si]+=p.theta;portHmData.byBucket[ti][si].push(p);
+        var ga=Math.abs(p.gamma);gSum[ti][si]+=ga;rgSum[ti][si]+=p.rich*ga;nSum[ti][si]+=p.notional;});
+    for(var ti=0;ti<tenorList.length;ti++){for(var si=0;si<nb;si++){if(gSum[ti][si]>1e-10){portHmData.rich[ti][si]=rgSum[ti][si]/gSum[ti][si];portHmData.dir[ti][si]=nSum[ti][si]>=0?'L':'S';}}}
+    renderPortHm();
+}
+var portHmData=null;
+function renderPortHm(){
+    if(!portHmData)return;var M,cs2,z1,z5,bt;
+    if(currentPh==='richness'){M=portHmData.rich;cs2=[[0,'#1565c0'],[0.5,'#e0e0e0'],[1,'#c62828']];z1=1;z5=5;bt='Score';}
+    else if(currentPh==='vega'){M=portHmData.vega.map(function(r){return r.map(function(v){return v===0?null:v;});});cs2=[[0,'#1565c0'],[0.5,'#e0e0e0'],[1,'#c62828']];bt='$K';var fl=M.flat().filter(function(v){return v!==null;});var mx=fl.length>0?Math.max(Math.abs(Math.min.apply(null,fl)),Math.abs(Math.max.apply(null,fl))):1;z1=-mx;z5=mx;}
+    else{M=portHmData.decay.map(function(r){return r.map(function(v){return v===0?null:v;});});cs2=[[0,'#1565c0'],[0.5,'#e0e0e0'],[1,'#c62828']];bt='$K/day';var fl=M.flat().filter(function(v){return v!==null;});var mx=fl.length>0?Math.max(Math.abs(Math.min.apply(null,fl)),Math.abs(Math.max.apply(null,fl))):1;z1=-mx;z5=mx;}
+    var dir=portHmData.dir;
+    var txt=M.map(function(r,ti){return r.map(function(v,si){if(v===null)return'';var d=dir[ti]&&dir[ti][si]?dir[ti][si]:'';return d+' '+v.toFixed(currentPh==='vega'?1:2);});});
+    Plotly.react('port-hm',[{z:M,x:portHmData.labels,y:TENORS,type:'heatmap',colorscale:cs2,text:txt,texttemplate:'%{text}',textfont:{size:9,color:'black'},colorbar:{title:{text:bt,font:{color:'#e0e0e0'}},tickfont:{color:'#e0e0e0'},len:.9},zmin:z1,zmax:z5,hoverongaps:false}],
+    {margin:{t:20,b:80,l:60,r:50},xaxis:{title:'Strike',tickangle:45,color:'#e0e0e0',type:'category'},yaxis:{title:'Tenor',color:'#e0e0e0'},paper_bgcolor:'#3d3d3d',plot_bgcolor:'#3d3d3d'},{displayModeBar:false,responsive:true});
+    var hm=document.getElementById('port-hm');if(hm.removeAllListeners)hm.removeAllListeners('plotly_click');
+    hm.on('plotly_click',function(data){var pt=data.points[0],ti=TENORS.indexOf(pt.y),si=pt.pointIndex[1];if(ti>=0&&si>=0)showDrill(ti,si);});
+}
+
+function showDrill(ti,si){
+    if(!portHmData)return;var pos=portHmData.byBucket[ti][si];
+    var bw=portHmData.bw,sk=portHmData.strikes[si];
+    var skL=bw>0?sk.toFixed(3)+'-'+(sk+bw).toFixed(3):sk.toFixed(3);
+    document.getElementById('drill-title').textContent=TENORS[ti]+' / '+skL+' ('+pos.length+')';
+    if(!pos.length){document.getElementById('drill-content').innerHTML='<p style="text-align:center;color:#aaa">No positions</p>';}
+    else{var h='<table><tr><th>#</th><th>Strike</th><th>Expiry</th><th>Vol</th><th>Notl</th><th>Type</th><th>\u03b3</th><th>\u03b8</th><th>\u03bd</th><th>Rich</th></tr>';
+    pos.forEach(function(p){h+='<tr class="'+(p.notional>=0?'cheap':'rich')+'"><td>'+p.id+'</td><td>'+p.strike.toFixed(3)+'</td><td>'+p.expiry+'</td><td>'+p.vol.toFixed(1)+'</td><td>'+(p.notional>=0?'+':'')+p.notional.toFixed(1)+'</td><td>'+p.type+'</td><td>'+p.gamma.toFixed(4)+'</td><td>'+p.theta.toFixed(2)+'</td><td>'+p.vega.toFixed(1)+'</td><td><span class="richness-badge" style="background:'+richColor(p.rich)+'">'+p.rich.toFixed(2)+'</span></td></tr>';});
+    h+='</table>';document.getElementById('drill-content').innerHTML=h;}
+    document.getElementById('drill-modal').classList.add('show');
+}
+function closeDrillDown(){document.getElementById('drill-modal').classList.remove('show');}
+
+function setIneff(v){currentIneff=v;['long','short'].forEach(function(k){document.getElementById('ie-'+k).className='btn-toggle'+(k===v?' active':'');});renderIneff();}
+function renderIneff(){
+    if(!portComp)return;var filtered,sorted;
+    if(currentIneff==='long'){filtered=portComp.filter(function(p){return p.notional>0;});sorted=filtered.sort(function(a,b){return b.rich-a.rich;});}
+    else{filtered=portComp.filter(function(p){return p.notional<0;});sorted=filtered.sort(function(a,b){return b.rich-a.rich;});}
+    if(!sorted.length){document.getElementById('ineff-tbl').innerHTML='<p style="text-align:center;color:#aaa">No '+(currentIneff==='long'?'long':'short')+' positions</p>';return;}
+    var h='<table><tr><th>#</th><th>Strike</th><th>Expiry</th><th>Days</th><th>Notl</th><th>Type</th><th>\u03b3</th><th>\u03b8</th><th>Decay</th><th>Rich</th></tr>';
+    sorted.forEach(function(p){h+='<tr class="'+(p.notional>=0?'cheap':'rich')+'"><td>'+p.id+'</td><td>'+p.strike.toFixed(3)+'</td><td>'+p.expiry+'</td><td>'+p.days+'</td><td>'+(p.notional>=0?'+':'')+p.notional.toFixed(1)+'</td><td>'+p.type+'</td><td>'+p.gamma.toFixed(4)+'</td><td>'+p.theta.toFixed(2)+'</td><td>'+p.decay.toFixed(1)+'</td><td><span class="richness-badge" style="background:'+richColor(p.rich)+'">'+p.rich.toFixed(2)+'</span></td></tr>';});
+    h+='</table>';document.getElementById('ineff-tbl').innerHTML=h;
 }
 function cpg(cs,K,T,vol,notional,ic){
     var S=cs.spot,rd=cs.rd,sig=vol/100;if(T<=0)T=1/365;
