@@ -560,7 +560,7 @@ function dtccShifts(b,acc){var sh={dA:0,dR25:0,dR10:0,dF25:0,dF10:0},h=[],o=[];f
     return sh;}
 function dtccApply(b,sh){var nA=b.atm+sh.dA,nR25=b.rr25+sh.dR25,nR10=b.rr10+sh.dR10,nF25=Math.max(0,b.fly25+sh.dF25),nF10=Math.max(0,b.fly10+sh.dF10);if(nF10<nF25)nF10=nF25;
     var r=[nA+nF10-nR10/2,nA+nF25-nR25/2,nA,nA+nF25+nR25/2,nA+nF10+nR10/2];for(var i=0;i<5;i++){if(i!==2&&r[i]<r[2])r[i]=r[2]+0.01;}return r;}
-function dDB(d){var a=Math.abs(d);if(a<0.15)return d<0?0:4;if(a<0.375)return d<0?1:3;return 2;}
+function dDB(d){var a=Math.abs(d);if(a<0.07)return-1;if(a<0.175)return d<0?0:4;if(a<0.375)return d<0?1:3;return 2;}
 function dTB(d){for(var i=0;i<DTM.length;i++){if(d<=DTM[i])return i;}return DT.length-1;}
 function dCD(F,K,s,T,ic){if(T<=0||s<=0||F<=0||K<=0)return ic?0.5:-0.5;var d1=(Math.log(F/K)+0.5*s*s*T)/(s*Math.sqrt(T));return ic?ncdf(d1):ncdf(d1)-1;}
 function dGC(){var cc=new Set();DTCC_G10.concat(DTCC_EM).forEach(function(p){cc.add(p.slice(0,3));cc.add(p.slice(3));});cc.delete('USD');return Array.from(cc).join(',');}
@@ -591,12 +591,58 @@ async function dtccFetch(){var dot=document.getElementById('dd'),txt=document.ge
 function dProcTrades(trades){dAT={};dPM={};DTCC_G10.concat(DTCC_EM).forEach(function(p){dAT[p]=[];});
     trades.forEach(function(t){try{var pk=DPA[t.pair];if(!pk||!dAT[pk])return;var iv=null;if(t.iv!=null&&t.iv!=='\u2014'&&t.iv!==''){iv=parseFloat(String(t.iv).replace('%',''));if(isNaN(iv)||iv<=0)return;}else return;
     var days=parseInt(t.days)||0;if(days<=0)return;var notl=parseFloat(t.usd_amt)||0,spot=parseFloat(t.spot)||0,strike=parseFloat(t.strike)||0,fwd=parseFloat(t.fwd_rate)||spot,ic=(t.opt_type==='CALL');
-    var delta=dCD(fwd,strike,iv/100,days/365,ic);if(spot>0&&(!dPM[pk]||t.time>(dPM[pk].lt||'')))dPM[pk]={spot:spot,lt:t.time};
+    var delta=dCD(fwd,strike,iv/100,days/365,ic);
+    // Reject sub-7 delta (deep OTM with inflated smile premium)
+    if(Math.abs(delta)<0.07)return;
+    // Reject absurd IVs (absolute bounds)
+    if(iv>60||iv<0.5)return;
+    // Delta-aware vol cap for 10d bucket
+    var dBucket=dDB(delta);
+    if(dBucket===0||dBucket===4){
+        var ti=dTB(days);
+        // If broker surface exists, reject 10d prints > 3 vols from expected 10d level
+        var base=dtccGetBase(pk,DT[ti]);
+        if(base&&base.vols[dBucket]>0){
+            if(Math.abs(iv-base.vols[dBucket])>3.5)return;
+        }else{
+            // No base: reject if 10d vol > 1.7x the pair's median vol so far
+            var pairTrades=dAT[pk];
+            if(pairTrades.length>5){
+                var allIV=pairTrades.map(function(x){return x.iv;}).sort(function(a,b){return a-b;});
+                var medIV=allIV[Math.floor(allIV.length/2)];
+                if(iv>medIV*1.7)return;
+            }
+        }
+    }
+    if(spot>0&&(!dPM[pk]||t.time>(dPM[pk].lt||'')))dPM[pk]={spot:spot,lt:t.time};
     dAT[pk].push({time:t.time||'',type:t.opt_type||'?',strike:strike,spot:spot,fwd:fwd,days:days,iv:iv,notl:notl,expiry:t.expiry||'',ic:ic,delta:delta});}catch(e){}});}
 
 function dBuildSurf(){dCS={};DTCC_G10.concat(DTCC_EM).forEach(function(pair){
     var trades=dAT[pair]||[],acc=[];for(var ti=0;ti<DT.length;ti++){acc[ti]=[];for(var di=0;di<5;di++)acc[ti][di]={sumIV:0,sumW:0,count:0};}
-    trades.forEach(function(t){var ti=dTB(t.days),di=dDB(t.delta);var w=Math.max(t.notl,1);acc[ti][di].sumIV+=t.iv*w;acc[ti][di].sumW+=w;acc[ti][di].count++;});
+    // Pass 1: collect raw IVs per bucket for outlier detection
+    var raw=[];for(var ti=0;ti<DT.length;ti++){raw[ti]=[];for(var di=0;di<5;di++)raw[ti][di]=[];}
+    trades.forEach(function(t){var di=dDB(t.delta);if(di<0)return;var ti=dTB(t.days);raw[ti][di].push({iv:t.iv,w:Math.max(t.notl,1)});});
+    // Pass 2: base-aware pre-filter + MAD outlier removal
+    function median(arr){if(!arr.length)return null;var s=arr.slice().sort(function(a,b){return a-b;});var m=Math.floor(s.length/2);return s.length%2?s[m]:(s[m-1]+s[m])/2;}
+    for(var ti=0;ti<DT.length;ti++){for(var di=0;di<5;di++){
+        var ivs=raw[ti][di];if(!ivs.length)continue;
+        // Base-aware pre-filter: delta-dependent threshold
+        var base=dtccGetBase(pair,DT[ti]);
+        if(base&&base.vols[di]){
+            var expected=base.vols[di];
+            // ATM: ±3 vols, 25d: ±3.5 vols, 10d: ±4 vols
+            var maxDev=(di===2)?3.0:(di===1||di===3)?3.5:4.0;
+            ivs=ivs.filter(function(r){return Math.abs(r.iv-expected)<=maxDev;});
+        }
+        if(!ivs.length)continue;
+        // Single print: accept if passes base filter above (or no base)
+        if(ivs.length<3){ivs.forEach(function(r){acc[ti][di].sumIV+=r.iv*r.w;acc[ti][di].sumW+=r.w;acc[ti][di].count++;});continue;}
+        // Multiple prints: MAD-based filter (3x MAD, floor at 1.5 vols)
+        var med=median(ivs.map(function(r){return r.iv;}));
+        var mads=ivs.map(function(r){return Math.abs(r.iv-med);});var madVal=median(mads);
+        var threshold=Math.max(1.5,madVal*3);
+        ivs.forEach(function(r){if(Math.abs(r.iv-med)<=threshold){acc[ti][di].sumIV+=r.iv*r.w;acc[ti][di].sumW+=r.w;acc[ti][di].count++;}});
+    }}
     var surf=[];for(var ti=0;ti<DT.length;ti++){var any=false;for(var di=0;di<5;di++){if(acc[ti][di].count>0){any=true;break;}}
         var base=dtccGetBase(pair,DT[ti]);
         if(base&&any){var sh=dtccShifts(base,acc[ti]);surf[ti]=dtccApply(base,sh);}
