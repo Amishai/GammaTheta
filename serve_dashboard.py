@@ -34,6 +34,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     """Serves static files + proxies /api/ requests to the DTCC upstream."""
 
     def do_GET(self):
+        if self.path == '/favicon.ico':
+            self.send_response(204)
+            self.end_headers()
+            return
         if self.path.startswith('/api/'):
             self._proxy_request()
         else:
@@ -62,9 +66,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.send_error(500, f'Proxy error: {str(e)}')
 
     def log_message(self, format, *args):
-        status = str(args[1]) if len(args) > 1 else ''
-        if self.path.startswith('/api/') or (status and int(status) >= 400):
-            sys.stderr.write(f"  [{time.strftime('%H:%M:%S')}] {self.path} -> {status}\n")
+        # args vary by caller: normal requests give (request, status_code, size)
+        # send_error gives (code, message) — don't crash on either
+        try:
+            status = int(args[1]) if len(args) > 1 else 0
+        except (ValueError, TypeError):
+            status = 0
+        if self.path.startswith('/api/') or status >= 400:
+            sys.stderr.write(f"  [{time.strftime('%H:%M:%S')}] {self.path} -> {args[1] if len(args)>1 else ''}\n")
 
 
 def regenerate_dashboard():
@@ -75,9 +84,8 @@ def regenerate_dashboard():
         importlib.reload(fxg)
 
         if os.path.exists('fx_gamma_inputs.xlsx'):
-            mkt = fxg.load_data('fx_gamma_inputs.xlsx')
-            df, fwd_df, p5, p95 = fxg.build_surface(mkt)
-            fxg.create_dashboard(df, fwd_df, mkt, p5, p95)
+            positions = fxg.load_positions('fx_gamma_inputs.xlsx')
+            fxg.create_dashboard(positions)
             print(f"  [refresh] Dashboard regenerated at {time.strftime('%H:%M:%S')}")
         else:
             print("  [refresh] fx_gamma_inputs.xlsx not found, skipping")

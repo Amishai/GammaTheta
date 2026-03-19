@@ -153,7 +153,10 @@ th{background:#1F4E79;color:white}td:first-child{text-align:left;font-weight:600
 .dtcc-summary-row{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
 .dtcc-summary-badge{background:#2d2d2d;border:1px solid #555;border-radius:6px;padding:8px 12px;min-width:130px}
 .dtcc-summary-badge .dl{font-size:9px;color:#888;text-transform:uppercase}.dtcc-summary-badge .dv{font-size:18px;font-weight:700;margin-top:2px;color:#90caf9}.dtcc-summary-badge .ds{font-size:11px;color:#aaa}
-.js-plotly-plot .plotly .modebar{display:none!important}'''
+.js-plotly-plot .plotly .modebar{display:none!important}
+.drill-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:1000;justify-content:center;align-items:center}
+.drill-overlay.show{display:flex}
+.drill-box{background:#3d3d3d;border-radius:8px;padding:20px;min-width:500px;max-width:800px;max-height:80vh;box-shadow:0 8px 32px rgba(0,0,0,0.5)}'''
 
 def create_dashboard(positions, output='fx_gamma_trading.html'):
     pos_json = json.dumps(positions)
@@ -163,6 +166,7 @@ def create_dashboard(positions, output='fx_gamma_trading.html'):
     html = f'''<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>FX Options Analytics</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>{CSS}</style></head><body>
 <h1>FX Options Analytics</h1>
 <div class="tab-bar">
@@ -177,9 +181,15 @@ def create_dashboard(positions, output='fx_gamma_trading.html'):
 <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
 <div style="display:flex;gap:4px;flex-wrap:wrap" id="mkt-pair-tabs"></div>
 <div class="add-pair-btn" onclick="addNewPair()">+ Add Pair</div>
-<span style="margin-left:auto;font-size:11px;color:#888" id="mkt-status"></span>
+<div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+<label class="btn btn-primary" style="cursor:pointer;position:relative;overflow:hidden">Load JSON<input type="file" accept=".json" onchange="loadMktJson(this)" style="position:absolute;left:-9999px"></label>
+<label class="btn btn-primary" style="cursor:pointer;position:relative;overflow:hidden">Upload Excel<input type="file" accept=".xlsx,.xls,.csv" onchange="loadMktExcel(this)" style="position:absolute;left:-9999px"></label>
+<button class="btn btn-primary" onclick="exportMktJson()">Export JSON</button>
+<span style="font-size:11px;color:#888" id="mkt-status"></span>
+</div>
 </div>
 <div id="mkt-pair-content"><div style="text-align:center;padding:40px;color:#888">Select or add a pair above to begin marking</div></div>
+<div class="help" style="margin-top:8px">Upload vol surfaces from Excel (one sheet per pair, or single sheet with Pair column) or JSON. Export saves your marks.</div>
 </div>
 '''
     # Tab 1: Surface Analysis
@@ -207,7 +217,13 @@ def create_dashboard(positions, output='fx_gamma_trading.html'):
 '''
     # Tab 2: Portfolio
     html += '''<div id="tab-portfolio" class="tab-content">
-<div id="port-pair-bar" style="margin-bottom:12px"></div>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+<div id="port-pair-bar" style="display:flex;gap:4px;align-items:center;flex-wrap:wrap"></div>
+<div style="display:flex;gap:8px;align-items:center">
+<label class="btn btn-primary" style="cursor:pointer;position:relative;overflow:hidden">Upload Positions<input type="file" accept=".xlsx,.xls,.csv" onchange="loadPortExcel(this)" style="position:absolute;left:-9999px"></label>
+<span style="font-size:11px;color:#888" id="port-status"></span>
+</div>
+</div>
 <div class="summary-grid">
 <div class="summary-box"><div class="summary-label">Total Gamma ($M)</div><div class="summary-value" id="sg">-</div></div>
 <div class="summary-box"><div class="summary-label">Total Theta ($K/day)</div><div class="summary-value" id="st">-</div></div>
@@ -240,7 +256,18 @@ def create_dashboard(positions, output='fx_gamma_trading.html'):
 <button class="btn-toggle" onclick="setTv('vega')" id="tv-vega">Vega</button>
 <button class="btn-toggle" onclick="setTv('cumDecay')" id="tv-cumDecay">Cum Decay</button>
 </div><div id="time-chart" style="height:350px"></div></div>
-</div></div>
+</div>
+<!-- Drill-down modal -->
+<div id="drill-modal" class="drill-overlay" onclick="if(event.target===this)closeDrillDown()">
+<div class="drill-box">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+<h3 style="margin:0;color:#90caf9" id="drill-title">Drill Down</h3>
+<button onclick="closeDrillDown()" style="background:none;border:none;color:#aaa;font-size:20px;cursor:pointer">&times;</button>
+</div>
+<div id="drill-content" style="max-height:400px;overflow-y:auto"></div>
+</div>
+</div>
+</div>
 '''
     # Tab 3: DTCC
     html += '''<div id="tab-dtcc" class="tab-content">
@@ -377,6 +404,163 @@ function renderMktContent(){
 function onVolC(el){var f=el.getAttribute('data-f'),i=parseInt(el.getAttribute('data-i')),v=parseFloat(el.value);if(!isNaN(v))mktSurfaces[activeMktPair].tenors[i][f]=v;}
 function onMktP(){var pd=mktSurfaces[activeMktPair];pd.spot=parseFloat(document.getElementById('mkt-spot').value)||pd.spot;pd.r_d=(parseFloat(document.getElementById('mkt-rd').value)||0)/100;pd.r_f=(parseFloat(document.getElementById('mkt-rf').value)||0)/100;}
 
+function loadMktJson(input){
+    if(!input.files||!input.files[0])return;
+    var reader=new FileReader();
+    reader.onload=function(e){
+        try{
+            var data=JSON.parse(e.target.result);
+            var surfs=data.surfaces||data;
+            var count=0;
+            Object.keys(surfs).forEach(function(pair){
+                var s=surfs[pair];if(!s.spot&&!s.tenors)return;
+                mktSurfaces[pair]={spot:s.spot||1.0,r_d:s.r_d||0.04,r_f:s.r_f||0.02,tenors:[]};
+                var tnList=s.tenors||[];
+                TENORS.forEach(function(tn,ti){
+                    var src=tnList.find(function(t){return t.tenor===tn;})||{};
+                    mktSurfaces[pair].tenors.push({tenor:tn,T:TENOR_T[ti],
+                        atm:src.atm||0,rr25:src.rr25||0,rr10:src.rr10||0,
+                        fly25:src.fly25||0,fly10:src.fly10||0,fwdPts:src.fwdPts||0});
+                });
+                count++;
+            });
+            if(count>0){activeMktPair=Object.keys(mktSurfaces)[0];renderMktTabs();renderMktContent();}
+            document.getElementById('mkt-status').textContent='Loaded '+count+' pairs'+(data.source?' from '+data.source:'');
+        }catch(err){alert('Invalid JSON: '+err.message);}
+    };
+    reader.readAsText(input.files[0]);
+    input.value='';  // reset so same file can be reloaded
+}
+
+function exportMktJson(){
+    var output={source:'dashboard_export',timestamp:new Date().toISOString(),surfaces:{}};
+    Object.keys(mktSurfaces).forEach(function(pair){
+        var pd=mktSurfaces[pair];
+        output.surfaces[pair]={spot:pd.spot,r_d:pd.r_d,r_f:pd.r_f,
+            tenors:pd.tenors.map(function(t){return{tenor:t.tenor,T:t.T,atm:t.atm,rr25:t.rr25,rr10:t.rr10,fly25:t.fly25,fly10:t.fly10,fwdPts:t.fwdPts};})};
+    });
+    var blob=new Blob([JSON.stringify(output,null,2)],{type:'application/json'});
+    var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='mkt_data.json';a.click();
+    document.getElementById('mkt-status').textContent='Exported '+Object.keys(mktSurfaces).length+' pairs';
+}
+
+// Excel upload: supports two formats
+// FORMAT A (multi-sheet): each sheet named after pair (EURUSD, USDJPY, etc.)
+//   Row 1: Spot | <value> | TermsRate | <value> | BaseRate | <value>
+//   Row 3: Tenor | ATM | RR25 | RR10 | FLY25 | FLY10 | FwdPts
+//   Rows 4+: O/N | 7.5 | -0.3 | ...
+//
+// FORMAT B (single-sheet): one sheet with Pair column
+//   Pair | Tenor | Spot | TermsRate | BaseRate | ATM | RR25 | RR10 | FLY25 | FLY10 | FwdPts
+function loadMktExcel(input){
+    if(!input.files||!input.files[0])return;
+    if(typeof XLSX==='undefined'){alert('SheetJS library not loaded. Check internet connection.');return;}
+    var reader=new FileReader();
+    reader.onload=function(e){
+        try{
+            var wb=XLSX.read(e.target.result,{type:'array'});
+            var count=0;
+            // Detect format: if first sheet has a "Pair" column header, it's Format B
+            var firstSheet=wb.Sheets[wb.SheetNames[0]];
+            var firstData=XLSX.utils.sheet_to_json(firstSheet,{defval:''});
+            var hasPC=firstData.length>0&&firstData[0].hasOwnProperty('Pair');
+
+            if(hasPC){
+                // FORMAT B: single sheet, Pair column
+                var byPair={};
+                firstData.forEach(function(row){
+                    var p=String(row.Pair||'').toUpperCase().replace('/','').trim();
+                    if(!p||p.length!==6)return;
+                    if(!byPair[p])byPair[p]={spot:0,r_d:0.04,r_f:0.02,rows:[]};
+                    if(row.Spot)byPair[p].spot=parseFloat(row.Spot)||0;
+                    if(row.TermsRate!=null&&row.TermsRate!=='')byPair[p].r_d=parseFloat(row.TermsRate)/100||0.04;
+                    if(row.BaseRate!=null&&row.BaseRate!=='')byPair[p].r_f=parseFloat(row.BaseRate)/100||0.02;
+                    var tn=String(row.Tenor||'').trim();
+                    if(!tn)return;
+                    byPair[p].rows.push({tenor:tn,atm:parseFloat(row.ATM)||0,rr25:parseFloat(row.RR25)||0,
+                        rr10:parseFloat(row.RR10)||0,fly25:parseFloat(row.FLY25)||0,fly10:parseFloat(row.FLY10)||0,
+                        fwdPts:parseFloat(row.FwdPts)||0});
+                });
+                Object.keys(byPair).forEach(function(pair){
+                    var d=byPair[pair];
+                    mktSurfaces[pair]={spot:d.spot,r_d:d.r_d,r_f:d.r_f,tenors:[]};
+                    TENORS.forEach(function(tn,ti){
+                        var match=d.rows.find(function(r){return r.tenor===tn;});
+                        mktSurfaces[pair].tenors.push({tenor:tn,T:TENOR_T[ti],
+                            atm:match?match.atm:0,rr25:match?match.rr25:0,rr10:match?match.rr10:0,
+                            fly25:match?match.fly25:0,fly10:match?match.fly10:0,fwdPts:match?match.fwdPts:0});
+                    });
+                    count++;
+                });
+            }else{
+                // FORMAT A: each sheet is a pair
+                wb.SheetNames.forEach(function(sn){
+                    var pair=sn.toUpperCase().replace('/','').trim();
+                    if(pair.length!==6||pair==='POSITIONS')return;
+                    var sheet=wb.Sheets[sn];
+                    var raw=XLSX.utils.sheet_to_json(sheet,{defval:'',header:1});
+                    if(raw.length<4)return;
+                    // Row 0: look for Spot, TermsRate, BaseRate
+                    var spot=0,rd=0.04,rf=0.02;
+                    var r0=raw[0]||[];
+                    for(var c=0;c<r0.length-1;c++){
+                        var lbl=String(r0[c]).toLowerCase().replace(/[^a-z]/g,'');
+                        var val=parseFloat(r0[c+1]);
+                        if(lbl==='spot'&&!isNaN(val))spot=val;
+                        else if((lbl==='termsrate'||lbl==='rd')&&!isNaN(val))rd=val>1?val/100:val;
+                        else if((lbl==='baserate'||lbl==='rf')&&!isNaN(val))rf=val>1?val/100:val;
+                    }
+                    // Find header row (contains "ATM" or "Tenor")
+                    var hIdx=-1;
+                    for(var ri=0;ri<Math.min(5,raw.length);ri++){
+                        var rowStr=JSON.stringify(raw[ri]).toUpperCase();
+                        if(rowStr.indexOf('ATM')>=0||rowStr.indexOf('TENOR')>=0){hIdx=ri;break;}
+                    }
+                    if(hIdx<0)return;
+                    // Map column indices
+                    var hdr=raw[hIdx];var ci={};
+                    for(var c=0;c<hdr.length;c++){
+                        var h=String(hdr[c]).toUpperCase().replace(/[^A-Z0-9]/g,'');
+                        if(h==='TENOR')ci.tenor=c;
+                        else if(h==='ATM')ci.atm=c;
+                        else if(h==='RR25'||h==='25DRR')ci.rr25=c;
+                        else if(h==='RR10'||h==='10DRR')ci.rr10=c;
+                        else if(h==='FLY25'||h==='25DFLY'||h==='BF25')ci.fly25=c;
+                        else if(h==='FLY10'||h==='10DFLY'||h==='BF10')ci.fly10=c;
+                        else if(h==='FWDPTS'||h==='FWD'||h==='PTS'||h==='FORWARDPOINTS')ci.fwdPts=c;
+                    }
+                    if(ci.tenor==null||ci.atm==null)return;
+                    // Parse data rows
+                    var tenorRows=[];
+                    for(var ri=hIdx+1;ri<raw.length;ri++){
+                        var r=raw[ri];if(!r||!r[ci.tenor])continue;
+                        var tn=String(r[ci.tenor]).trim();
+                        tenorRows.push({tenor:tn,atm:parseFloat(r[ci.atm])||0,
+                            rr25:ci.rr25!=null?parseFloat(r[ci.rr25])||0:0,
+                            rr10:ci.rr10!=null?parseFloat(r[ci.rr10])||0:0,
+                            fly25:ci.fly25!=null?parseFloat(r[ci.fly25])||0:0,
+                            fly10:ci.fly10!=null?parseFloat(r[ci.fly10])||0:0,
+                            fwdPts:ci.fwdPts!=null?parseFloat(r[ci.fwdPts])||0:0});
+                    }
+                    if(!tenorRows.length)return;
+                    mktSurfaces[pair]={spot:spot,r_d:rd,r_f:rf,tenors:[]};
+                    TENORS.forEach(function(tn,ti){
+                        var match=tenorRows.find(function(r){return r.tenor===tn;});
+                        mktSurfaces[pair].tenors.push({tenor:tn,T:TENOR_T[ti],
+                            atm:match?match.atm:0,rr25:match?match.rr25:0,rr10:match?match.rr10:0,
+                            fly25:match?match.fly25:0,fly10:match?match.fly10:0,fwdPts:match?match.fwdPts:0});
+                    });
+                    count++;
+                });
+            }
+            if(count>0){activeMktPair=Object.keys(mktSurfaces)[0];renderMktTabs();renderMktContent();}
+            document.getElementById('mkt-status').textContent='Loaded '+count+' pairs from Excel';
+        }catch(err){alert('Excel parse error: '+err.message);}
+    };
+    reader.readAsArrayBuffer(input.files[0]);
+    input.value='';
+}
+
 // ============================================================
 // TAB 1: SURFACE ANALYSIS
 // ============================================================
@@ -384,7 +568,8 @@ function renderSurfTab(){
     if(!activeAnPair)activeAnPair=Object.keys(mktSurfaces)[0];
     var pd=mktSurfaces[activeAnPair];if(!pd)return;
     var cs=buildSurf(pd);
-    // Market bar
+    // Market bar — preserve notional value
+    var curN=getN();
     var barH='<div class="market-item"><div class="label">Pair</div><select onchange="activeAnPair=this.value;renderSurfTab()" style="font-size:14px;font-weight:bold;color:#90caf9;background:#3d3d3d;border:1px solid #555;border-radius:4px;padding:4px 8px">';
     Object.keys(mktSurfaces).forEach(function(p){barH+='<option'+(p===activeAnPair?' selected':'')+'>'+p+'</option>';});
     barH+='</select></div>';
@@ -392,10 +577,14 @@ function renderSurfTab(){
     barH+='<div class="market-item"><div class="label">Spot</div><div class="value">'+cs.spot.toFixed(4)+'</div></div>';
     barH+='<div class="market-item"><div class="label">Terms Rate</div><div class="value">'+(cs.rd*100).toFixed(2)+'%</div></div>';
     barH+='<div class="market-item"><div class="label">O/N Fwd Pts</div><div class="value">'+(onF?onF.fwdPts.toFixed(2):'—')+'</div></div>';
-    barH+='<div class="market-item"><div class="label">Notional ($M)</div><input type="number" id="notional" class="notional-input" value="1" min="0.1" step="0.1" onchange="renderSurfTab()"></div>';
+    barH+='<div class="market-item"><div class="label">Notional ($M)</div><input type="number" id="notional" class="notional-input" value="'+curN+'" min="0.1" step="0.1" onchange="onNotionalChange()"></div>';
     document.getElementById('surface-bar').innerHTML=barH;
-    // Heatmap
     renderHm(cs);renderTbls(cs);renderFwd(cs);popCalc();
+}
+function onNotionalChange(){
+    // Re-render just the heatmap and tables, not the whole bar
+    var pd=mktSurfaces[activeAnPair];if(!pd)return;
+    var cs=buildSurf(pd);renderHm(cs);renderTbls(cs);
 }
 function getN(){return parseFloat((document.getElementById('notional')||{}).value)||1;}
 function setHmView(v){currentHm=v;['richness','theta','vega'].forEach(function(k){document.getElementById('hm-btn-'+k).className='btn-toggle'+(k===v?' active':'');});document.getElementById('hm-title').textContent={richness:'Richness Score',theta:'Theta ($K/day)',vega:'Vega ($K)'}[v];renderSurfTab();}
@@ -421,6 +610,51 @@ function calcGreeks(){var pd=mktSurfaces[activeAnPair];if(!pd)return;var cs=buil
 // ============================================================
 // TAB 2: PORTFOLIO
 // ============================================================
+// Upload positions from Excel — columns: Pair, Strike, Expiry, Vol, Notional, Type
+function loadPortExcel(input){
+    if(!input.files||!input.files[0])return;
+    if(typeof XLSX==='undefined'){alert('SheetJS not loaded');return;}
+    var reader=new FileReader();
+    reader.onload=function(e){
+        try{
+            var wb=XLSX.read(e.target.result,{type:'array',cellDates:true});
+            var sheet=wb.Sheets[wb.SheetNames.find(function(s){return s.toUpperCase().indexOf('POSITION')>=0;})||wb.SheetNames[0]];
+            var rows=XLSX.utils.sheet_to_json(sheet,{defval:''});
+            var newPos=[],today=new Date();
+            rows.forEach(function(r){
+                var pair=String(r.Pair||r.pair||r.PAIR||'').toUpperCase().replace('/','').trim();
+                var strike=parseFloat(r.Strike||r.strike||r.STRIKE);
+                var vol=parseFloat(r.Vol||r.vol||r.VOL||r.IV||r.iv);
+                var notional=parseFloat(r.Notional||r.notional||r.NOTIONAL||r.Notl||r.notl);
+                var type=String(r.Type||r.type||r.TYPE||r.CP||'C').toUpperCase().trim();
+                var expiryRaw=r.Expiry||r.expiry||r.EXPIRY||r.Exp||r.exp;
+                if(!pair||pair.length!==6||isNaN(strike)||isNaN(notional))return;
+                var expiry;
+                if(expiryRaw instanceof Date)expiry=expiryRaw;
+                else expiry=new Date(expiryRaw);
+                if(isNaN(expiry.getTime()))return;
+                var days=Math.max(1,Math.round((expiry-today)/(864e5)));
+                var T=days/365;
+                if(isNaN(vol)||vol<=0)vol=8;  // default vol if missing
+                newPos.push({pair:pair,strike:strike,expiry:expiry.toISOString().slice(0,10),vol:vol,notional:notional,type:type.charAt(0),T:T,days:days});
+            });
+            if(newPos.length>0){
+                excelPositions=newPos;
+                pairsInPositions=[];
+                var ps={};newPos.forEach(function(p){ps[p.pair]=1;});
+                pairsInPositions=Object.keys(ps);
+                // Ensure surfaces exist for new pairs
+                pairsInPositions.forEach(function(p){if(!mktSurfaces[p])mktSurfaces[p]={spot:1.0,r_d:0.04,r_f:0.02,tenors:TENORS.map(function(t,i){return{tenor:t,T:TENOR_T[i],atm:8,rr25:0,rr10:0,fly25:0.2,fly10:0.5,fwdPts:0};})};});
+                activePortPair=pairsInPositions[0];
+                renderPortTab();
+                document.getElementById('port-status').textContent=newPos.length+' positions loaded ('+pairsInPositions.join(', ')+')';
+            }else{alert('No valid positions found. Expected columns: Pair, Strike, Expiry, Vol, Notional, Type');}
+        }catch(err){alert('Excel parse error: '+err.message);}
+    };
+    reader.readAsArrayBuffer(input.files[0]);
+    input.value='';
+}
+
 function renderPortTab(){
     if(!activePortPair)activePortPair=pairsInPositions[0]||Object.keys(mktSurfaces)[0];
     var bh='<span style="font-size:12px;color:#aaa;margin-right:8px">Pair:</span>';
@@ -486,7 +720,7 @@ function renderPortHm(){
     Plotly.react('port-hm',[{z:M,x:portHmData.labels,y:TENORS,type:'heatmap',colorscale:cs2,text:txt,texttemplate:'%{text}',textfont:{size:9,color:'black'},colorbar:{title:{text:bt,font:{color:'#e0e0e0'}},tickfont:{color:'#e0e0e0'},len:.9},zmin:z1,zmax:z5,hoverongaps:false}],
     {margin:{t:20,b:80,l:60,r:50},xaxis:{title:'Strike',tickangle:45,color:'#e0e0e0',type:'category'},yaxis:{title:'Tenor',color:'#e0e0e0'},paper_bgcolor:'#3d3d3d',plot_bgcolor:'#3d3d3d'},{displayModeBar:false,responsive:true});
     var hm=document.getElementById('port-hm');if(hm.removeAllListeners)hm.removeAllListeners('plotly_click');
-    hm.on('plotly_click',function(data){var pt=data.points[0],ti=TENORS.indexOf(pt.y),si=pt.pointIndex[1];if(ti>=0&&si>=0)showDrill(ti,si);});
+    hm.on('plotly_click',function(data){var pt=data.points[0],ti=TENORS.indexOf(pt.y),si=portHmData.labels.indexOf(String(pt.x));if(ti>=0&&si>=0)showDrill(ti,si);});
 }
 
 function showDrill(ti,si){
@@ -544,26 +778,97 @@ JS_DTCC = r'''
 // ============================================================
 var DTCC_G10=['EURUSD','USDJPY','GBPUSD','USDCHF','AUDUSD','NZDUSD','USDCAD','USDSEK','USDNOK','EURGBP','EURJPY','GBPJPY'];
 var DTCC_EM=['USDMXN','USDBRL','USDTRY','USDZAR','USDCNH','USDINR','USDKRW','USDSGD','USDTWD','USDIDR','USDPHP','USDCLP','USDCOP','USDPEN'];
-var DT=['O/N','1W','2W','1M','2M','3M','6M','9M','1Y','2Y'],DTM=[2,9,18,45,75,120,225,315,450,1500],DDL=['10\u0394P','25\u0394P','ATM','25\u0394C','10\u0394C'];
-var DPA={'EUR/USD':'EURUSD','USD/EUR':'EURUSD','USD/JPY':'USDJPY','JPY/USD':'USDJPY','GBP/USD':'GBPUSD','USD/GBP':'GBPUSD','USD/CHF':'USDCHF','AUD/USD':'AUDUSD','USD/AUD':'AUDUSD','NZD/USD':'NZDUSD','USD/NZD':'NZDUSD','USD/CAD':'USDCAD','USD/SEK':'USDSEK','USD/NOK':'USDNOK','EUR/GBP':'EURGBP','EUR/JPY':'EURJPY','GBP/JPY':'GBPJPY','USD/MXN':'USDMXN','USD/BRL':'USDBRL','USD/TRY':'USDTRY','USD/ZAR':'USDZAR','USD/CNH':'USDCNH','USD/CNY':'USDCNH','USD/INR':'USDINR','USD/KRW':'USDKRW','USD/SGD':'USDSGD','USD/TWD':'USDTWD','USD/IDR':'USDIDR','USD/PHP':'USDPHP','USD/CLP':'USDCLP','USD/COP':'USDCOP','USD/PEN':'USDPEN','CHF/USD':'USDCHF','CAD/USD':'USDCAD','SEK/USD':'USDSEK','NOK/USD':'USDNOK','GBP/EUR':'EURGBP','JPY/EUR':'EURJPY','JPY/GBP':'GBPJPY','MXN/USD':'USDMXN','BRL/USD':'USDBRL','TRY/USD':'USDTRY','ZAR/USD':'USDZAR','CNH/USD':'USDCNH','INR/USD':'USDINR','KRW/USD':'USDKRW','SGD/USD':'USDSGD','TWD/USD':'USDTWD','IDR/USD':'USDIDR','PHP/USD':'USDPHP','CLP/USD':'USDCLP','COP/USD':'USDCOP','PEN/USD':'USDPEN'};
-var dAP='EURUSD',dAT={},dCS={},dSS=null,dST=null,dSV='vol',dTV='atm',dTimer=null,dInited=false,dPM={};
+var DT=['O/N','1W','2W','1M','2M','3M','6M','9M','1Y','2Y'];
+var DT_DAYS=[1,7,14,30,60,90,180,270,365,730];
+var DDL=['10\u0394P','25\u0394P','ATM','25\u0394C','10\u0394C'];
+
+// Pair alias: map DTCC pair label to our surface key
+// The API already normalizes spot/strike/fwd/call-put to market convention
+// so we only need name mapping, NO data inversion
+var DPA={};
+(function(){
+var pairs={'EUR/USD':'EURUSD','USD/EUR':'EURUSD','GBP/USD':'GBPUSD','USD/GBP':'GBPUSD',
+    'AUD/USD':'AUDUSD','USD/AUD':'AUDUSD','NZD/USD':'NZDUSD','USD/NZD':'NZDUSD',
+    'USD/JPY':'USDJPY','JPY/USD':'USDJPY','USD/CHF':'USDCHF','CHF/USD':'USDCHF',
+    'USD/CAD':'USDCAD','CAD/USD':'USDCAD','USD/SEK':'USDSEK','SEK/USD':'USDSEK',
+    'USD/NOK':'USDNOK','NOK/USD':'USDNOK','EUR/GBP':'EURGBP','GBP/EUR':'EURGBP',
+    'EUR/JPY':'EURJPY','JPY/EUR':'EURJPY','GBP/JPY':'GBPJPY','JPY/GBP':'GBPJPY',
+    'USD/MXN':'USDMXN','MXN/USD':'USDMXN','USD/BRL':'USDBRL','BRL/USD':'USDBRL',
+    'USD/TRY':'USDTRY','TRY/USD':'USDTRY','USD/ZAR':'USDZAR','ZAR/USD':'USDZAR',
+    'USD/CNH':'USDCNH','CNH/USD':'USDCNH','USD/CNY':'USDCNH',
+    'USD/INR':'USDINR','INR/USD':'USDINR','USD/KRW':'USDKRW','KRW/USD':'USDKRW',
+    'USD/SGD':'USDSGD','SGD/USD':'USDSGD','USD/TWD':'USDTWD','TWD/USD':'USDTWD',
+    'USD/IDR':'USDIDR','IDR/USD':'USDIDR','USD/PHP':'USDPHP','PHP/USD':'USDPHP',
+    'USD/CLP':'USDCLP','CLP/USD':'USDCLP','USD/COP':'USDCOP','COP/USD':'USDCOP',
+    'USD/PEN':'USDPEN','PEN/USD':'USDPEN'};
+Object.keys(pairs).forEach(function(k){DPA[k]=pairs[k];});
+})();
+
+var dAP='EURUSD',dAT={},dCS={},dSS=null,dST=null,dPrevCS=null,dSV='vol',dTV='atm',dTimer=null,dInited=false,dPM={};
 
 function dtccGetBase(pair,tn){var pd=mktSurfaces[pair];if(!pd)return null;var tr=pd.tenors.find(function(t){return t.tenor===tn;});if(!tr)return null;var a=tr.atm,r25=tr.rr25||0,r10=tr.rr10||0,f25=Math.max(0,tr.fly25||0),f10=Math.max(0,tr.fly10||0);return{atm:a,rr25:r25,rr10:r10,fly25:f25,fly10:f10,vols:[a+f10-r10/2,a+f25-r25/2,a,a+f25+r25/2,a+f10+r10/2]};}
 function dtccGenBase(a){var f25=Math.max(0.1,a*0.025),f10=Math.max(0.25,a*0.07);return{atm:a,rr25:0,rr10:0,fly25:f25,fly10:f10,vols:[a+f10,a+f25,a,a+f25,a+f10]};}
-function dtccShifts(b,acc){var sh={dA:0,dR25:0,dR10:0,dF25:0,dF10:0},h=[],o=[];for(var i=0;i<5;i++){h[i]=acc[i].count>0;o[i]=h[i]?acc[i].sumIV/acc[i].sumW:null;}
+
+function dtccShifts(b,acc){
+    var sh={dA:0,dR25:0,dR10:0,dF25:0,dF10:0},h=[],o=[];
+    for(var i=0;i<5;i++){h[i]=acc[i].count>0;o[i]=h[i]?acc[i].sumIV/acc[i].sumW:null;}
     if(h[2])sh.dA=o[2]-b.atm;else{var n=0,d=0;for(var i=0;i<5;i++){if(!h[i])continue;n+=(o[i]-b.vols[i])*acc[i].sumW;d+=acc[i].sumW;}if(d>0)sh.dA=n/d;}
-    if(h[1]&&h[3])sh.dR25=(o[3]-o[1])-b.rr25;else if(h[1]||h[3]){var ref=h[2]?o[2]:(b.atm+sh.dA);if(h[3])sh.dR25=2*(o[3]-ref-b.fly25)-b.rr25;else sh.dR25=2*(ref+b.fly25-o[1])-b.rr25;}
-    if(h[0]&&h[4])sh.dR10=(o[4]-o[0])-b.rr10;else if(h[0]||h[4]){var ref=h[2]?o[2]:(b.atm+sh.dA);if(h[4])sh.dR10=2*(o[4]-ref-b.fly10)-b.rr10;else sh.dR10=2*(ref+b.fly10-o[0])-b.rr10;}
-    if(sh.dR25!==0&&sh.dR10===0&&b.rr25!==0)sh.dR10=sh.dR25*(b.rr10/b.rr25);else if(sh.dR10!==0&&sh.dR25===0&&b.rr10!==0)sh.dR25=sh.dR10*(b.rr25/b.rr10);
-    if(h[1]&&h[3]&&h[2])sh.dF25=(o[3]+o[1])/2-o[2]-b.fly25;if(h[0]&&h[4]&&h[2])sh.dF10=(o[4]+o[0])/2-o[2]-b.fly10;
-    if(sh.dF25!==0&&sh.dF10===0&&b.fly25>0)sh.dF10=sh.dF25*(b.fly10/b.fly25);else if(sh.dF10!==0&&sh.dF25===0&&b.fly10>0)sh.dF25=sh.dF10*(b.fly25/b.fly10);
-    return sh;}
+    var ref=h[2]?o[2]:(b.atm+sh.dA);
+    if(h[1]&&h[3])sh.dR25=(o[3]-o[1])-b.rr25;
+    else if(h[3]&&!h[1])sh.dR25=2*(o[3]-ref-b.fly25)-b.rr25;
+    else if(h[1]&&!h[3])sh.dR25=2*(ref+b.fly25-o[1])-b.rr25;
+    if(h[0]&&h[4])sh.dR10=(o[4]-o[0])-b.rr10;
+    else if(h[4]&&!h[0])sh.dR10=2*(o[4]-ref-b.fly10)-b.rr10;
+    else if(h[0]&&!h[4])sh.dR10=2*(ref+b.fly10-o[0])-b.rr10;
+    if(sh.dR25!==0&&sh.dR10===0&&b.rr25!==0){var r=Math.max(-3,Math.min(3,b.rr10/b.rr25));sh.dR10=sh.dR25*r;}
+    else if(sh.dR10!==0&&sh.dR25===0&&b.rr10!==0){var r=Math.max(-3,Math.min(3,b.rr25/b.rr10));sh.dR25=sh.dR10*r;}
+    if(h[1]&&h[3]&&h[2])sh.dF25=(o[3]+o[1])/2-o[2]-b.fly25;
+    if(h[0]&&h[4]&&h[2])sh.dF10=(o[4]+o[0])/2-o[2]-b.fly10;
+    if(sh.dF25!==0&&sh.dF10===0&&b.fly25>0)sh.dF10=sh.dF25*(b.fly10/b.fly25);
+    else if(sh.dF10!==0&&sh.dF25===0&&b.fly10>0)sh.dF25=sh.dF10*(b.fly25/b.fly10);
+    sh.dA=Math.max(-5,Math.min(5,sh.dA));sh.dR25=Math.max(-3,Math.min(3,sh.dR25));sh.dR10=Math.max(-5,Math.min(5,sh.dR10));
+    sh.dF25=Math.max(-1,Math.min(1,sh.dF25));sh.dF10=Math.max(-2,Math.min(2,sh.dF10));
+    return sh;
+}
 function dtccApply(b,sh){var nA=b.atm+sh.dA,nR25=b.rr25+sh.dR25,nR10=b.rr10+sh.dR10,nF25=Math.max(0,b.fly25+sh.dF25),nF10=Math.max(0,b.fly10+sh.dF10);if(nF10<nF25)nF10=nF25;
     var r=[nA+nF10-nR10/2,nA+nF25-nR25/2,nA,nA+nF25+nR25/2,nA+nF10+nR10/2];for(var i=0;i<5;i++){if(i!==2&&r[i]<r[2])r[i]=r[2]+0.01;}return r;}
-function dDB(d){var a=Math.abs(d);if(a<0.07)return-1;if(a<0.175)return d<0?0:4;if(a<0.375)return d<0?1:3;return 2;}
-function dTB(d){for(var i=0;i<DTM.length;i++){if(d<=DTM[i])return i;}return DT.length-1;}
+
+function dDB(d){var a=Math.abs(d);if(a<0.15)return d<0?0:4;if(a<0.375)return d<0?1:3;return 2;}
 function dCD(F,K,s,T,ic){if(T<=0||s<=0||F<=0||K<=0)return ic?0.5:-0.5;var d1=(Math.log(F/K)+0.5*s*s*T)/(s*Math.sqrt(T));return ic?ncdf(d1):ncdf(d1)-1;}
 function dGC(){var cc=new Set();DTCC_G10.concat(DTCC_EM).forEach(function(p){cc.add(p.slice(0,3));cc.add(p.slice(3));});cc.delete('USD');return Array.from(cc).join(',');}
+
+function b76SolveIV(F,K,T,rd,ic,mktP){
+    if(T<=0||mktP<=0||F<=0||K<=0)return null;
+    var lo=0.001,hi=3.0;
+    var pLo=b76P(F,K,T,lo,rd,ic),pHi=b76P(F,K,T,hi,rd,ic);
+    if(mktP<pLo*0.5||mktP>pHi*1.5)return null;
+    for(var i=0;i<60;i++){var mid=(lo+hi)/2;if(b76P(F,K,T,mid,rd,ic)>mktP)hi=mid;else lo=mid;if(hi-lo<1e-8)break;}
+    var iv=(lo+hi)/2*100;return(iv<0.1||iv>200)?null:iv;
+}
+
+// Weighted tenor interpolation
+// O/N is special: only trades <=2 days go there. 3-6 day trades snap to 1W.
+// All other pillars interpolate linearly by days.
+function tenorWeights(days){
+    // O/N bucket: only truly overnight/tom trades
+    if(days<=2)return[{ti:0,w:1}];
+    // 3-6 days: snap to 1W (don't bleed into O/N)
+    if(days<DT_DAYS[1])return[{ti:1,w:1}];
+    // Beyond last pillar
+    if(days>=DT_DAYS[DT_DAYS.length-1])return[{ti:DT_DAYS.length-1,w:1}];
+    // Normal interpolation between pillars (starting from 1W onward)
+    for(var i=1;i<DT_DAYS.length-1;i++){
+        if(days>=DT_DAYS[i]&&days<=DT_DAYS[i+1]){
+            var span=DT_DAYS[i+1]-DT_DAYS[i];
+            var wLo=(DT_DAYS[i+1]-days)/span,wHi=(days-DT_DAYS[i])/span;
+            // Snap if very close to a pillar
+            if(wLo>0.85)return[{ti:i,w:1}];
+            if(wHi>0.85)return[{ti:i+1,w:1}];
+            return[{ti:i,w:wLo},{ti:i+1,w:wHi}];
+        }
+    }
+    return[{ti:DT_DAYS.length-1,w:1}];
+}
 
 function dtccInit(){
     if(!dInited){dInited=true;var root=document.getElementById('dtcc-root');root.innerHTML=dtccHTML();dtccBuildPB();}
@@ -571,7 +876,7 @@ function dtccInit(){
 }
 function dtccPause(){if(dTimer){clearInterval(dTimer);dTimer=null;}}
 
-function dtccHTML(){return '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px"><div style="display:flex;align-items:center;gap:4px;font-size:12px;color:#aaa"><span class="dtcc-dot loading" id="dd"></span><span id="dt">Connecting...</span></div><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span style="font-size:11px;color:#888">Lookback</span><select style="padding:4px 8px;background:#3d3d3d;color:#e0e0e0;border:1px solid #555;border-radius:4px;font-size:12px" id="dlb" onchange="dtccFetch()"><option value="60">1h</option><option value="120">2h</option><option value="240" selected>4h</option><option value="480">8h</option><option value="1440">Day</option></select><span style="font-size:11px;color:#888">Min</span><select style="padding:4px 8px;background:#3d3d3d;color:#e0e0e0;border:1px solid #555;border-radius:4px;font-size:12px" id="dms" onchange="dtccFetch()"><option value="0">All</option><option value="5000000">$5M+</option><option value="10000000" selected>$10M+</option><option value="20000000">$20M+</option><option value="50000000">$50M+</option></select><button class="btn-toggle" onclick="dtccSnap()">Snap</button><button class="btn-toggle" onclick="dtccClrSnap()" style="color:#ef5350">Clear</button><label style="font-size:11px;color:#888;display:flex;align-items:center;gap:3px"><input type="checkbox" id="dtcc-auto" checked style="accent-color:#90caf9">Auto</label></div></div><div class="dtcc-pair-bar" id="dpb"></div><div class="dtcc-summary-row"><div class="dtcc-summary-badge"><div class="dl">Trades</div><div class="dv" id="ds-t">&mdash;</div><div class="ds" id="ds-p">&mdash;</div></div><div class="dtcc-summary-badge"><div class="dl">Points</div><div class="dv" id="ds-pt">&mdash;</div></div><div class="dtcc-summary-badge"><div class="dl">ATM Front</div><div class="dv" id="ds-af">&mdash;</div><div class="ds" id="ds-afc">&mdash;</div></div><div class="dtcc-summary-badge"><div class="dl">ATM 1Y</div><div class="dv" id="ds-a1">&mdash;</div><div class="ds" id="ds-a1c">&mdash;</div></div></div><div class="dtcc-grid"><div><div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><h2 style="margin:0;font-size:16px">Vol Surface</h2><div><button class="btn-toggle active" id="dsv-vol" onclick="dSetSV(\'vol\')">Vol</button><button class="btn-toggle" id="dsv-chg" onclick="dSetSV(\'chg\')">Chg</button><span class="dtcc-snap-badge" id="dsn">No snap</span></div></div><div id="dsp" style="height:320px"></div></div><div class="card" style="margin-top:12px"><h2 style="margin:0;font-size:16px;margin-bottom:8px">ATM / RR / Fly</h2><div style="overflow-x:auto"><table class="dtcc-strat-table"><thead><tr><th style="text-align:left">Tenor</th><th>ATM</th><th>&Delta;</th><th>25dRR</th><th>&Delta;</th><th>10dRR</th><th>&Delta;</th><th>25dFly</th><th>&Delta;</th><th>10dFly</th><th>&Delta;</th><th>#</th></tr></thead><tbody id="dsb"></tbody></table></div></div><div class="card" style="margin-top:12px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><h2 style="margin:0;font-size:16px">Term Structure</h2><div><button class="btn-toggle active" id="dtv-atm" onclick="dSetTV(\'atm\')">ATM</button><button class="btn-toggle" id="dtv-rr25" onclick="dSetTV(\'rr25\')">25dRR</button><button class="btn-toggle" id="dtv-fly25" onclick="dSetTV(\'fly25\')">25dFly</button></div></div><div id="dtp" style="height:200px"></div></div></div><div><div class="card" style="height:100%;display:flex;flex-direction:column"><div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:8px;border-bottom:1px solid #555"><h2 style="margin:0;font-size:16px">Prints: <span id="dfp">EUR/USD</span></h2><span style="font-size:11px;color:#888" id="dfc">0</span></div><div class="dtcc-feed-header"><span>Time</span><span>Type</span><span>Tenor</span><span>Vol</span><span>Notl</span><span>&Delta;</span></div><div class="dtcc-feed-panel" id="dfl" style="flex:1"></div></div></div></div>';}
+function dtccHTML(){return '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px"><div style="display:flex;align-items:center;gap:4px;font-size:12px;color:#aaa"><span class="dtcc-dot loading" id="dd"></span><span id="dt">Connecting...</span></div><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span style="font-size:11px;color:#888">Lookback</span><select style="padding:4px 8px;background:#3d3d3d;color:#e0e0e0;border:1px solid #555;border-radius:4px;font-size:12px" id="dlb" onchange="dtccFetch()"><option value="60">1h</option><option value="120">2h</option><option value="240" selected>4h</option><option value="480">8h</option><option value="1440">Day</option></select><span style="font-size:11px;color:#888">Min</span><select style="padding:4px 8px;background:#3d3d3d;color:#e0e0e0;border:1px solid #555;border-radius:4px;font-size:12px" id="dms" onchange="dtccFetch()"><option value="0">All</option><option value="5000000">$5M+</option><option value="10000000" selected>$10M+</option><option value="20000000">$20M+</option><option value="50000000">$50M+</option></select><button class="btn-toggle" onclick="dtccSnap()">Snap</button><button class="btn-toggle" onclick="dtccClrSnap()" style="color:#ef5350">Clear</button><label style="font-size:11px;color:#888;display:flex;align-items:center;gap:3px"><input type="checkbox" id="dtcc-auto" checked style="accent-color:#90caf9">Auto</label></div></div><div class="dtcc-pair-bar" id="dpb"></div><div class="dtcc-summary-row"><div class="dtcc-summary-badge"><div class="dl">Trades</div><div class="dv" id="ds-t">&mdash;</div><div class="ds" id="ds-p">&mdash;</div></div><div class="dtcc-summary-badge"><div class="dl">Points</div><div class="dv" id="ds-pt">&mdash;</div></div><div class="dtcc-summary-badge"><div class="dl">ATM Front</div><div class="dv" id="ds-af">&mdash;</div><div class="ds" id="ds-afc">&mdash;</div></div><div class="dtcc-summary-badge"><div class="dl">ATM 1Y</div><div class="dv" id="ds-a1">&mdash;</div><div class="ds" id="ds-a1c">&mdash;</div></div></div><div class="dtcc-grid"><div><div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><h2 style="margin:0;font-size:16px">Vol Surface</h2><div><button class="btn-toggle active" id="dsv-vol" onclick="dSetSV(\'vol\')">Vol</button><button class="btn-toggle" id="dsv-chg" onclick="dSetSV(\'chg\')">Chg</button><span class="dtcc-snap-badge" id="dsn">No snap</span></div></div><div id="dsp" style="height:320px"></div></div><div class="card" style="margin-top:12px"><h2 style="margin:0;font-size:16px;margin-bottom:8px">ATM / RR / Fly</h2><div style="overflow-x:auto"><table class="dtcc-strat-table"><thead><tr><th style="text-align:left">Tenor</th><th>ATM</th><th>&Delta;</th><th>25dRR</th><th>&Delta;</th><th>10dRR</th><th>&Delta;</th><th>25dFly</th><th>&Delta;</th><th>10dFly</th><th>&Delta;</th><th>#</th></tr></thead><tbody id="dsb"></tbody></table></div></div><div class="card" style="margin-top:12px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><h2 style="margin:0;font-size:16px">Term Structure</h2><div><button class="btn-toggle active" id="dtv-atm" onclick="dSetTV(\'atm\')">ATM</button><button class="btn-toggle" id="dtv-rr25" onclick="dSetTV(\'rr25\')">25dRR</button><button class="btn-toggle" id="dtv-fly25" onclick="dSetTV(\'fly25\')">25dFly</button></div></div><div id="dtp" style="height:220px"></div></div></div><div><div class="card" style="height:100%;display:flex;flex-direction:column"><div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:8px;border-bottom:1px solid #555"><h2 style="margin:0;font-size:16px">Prints: <span id="dfp">EUR/USD</span></h2><span style="font-size:11px;color:#888" id="dfc">0</span></div><div class="dtcc-feed-header"><span>Time</span><span>Type</span><span>Tenor</span><span>Vol</span><span>Notl</span><span>&Delta;</span></div><div class="dtcc-feed-panel" id="dfl" style="flex:1"></div></div></div></div>';}
 
 function dtccBuildPB(){var bar=document.getElementById('dpb');if(!bar)return;var h='<span class="dtcc-pair-label">G10</span>';
     DTCC_G10.forEach(function(p){var hm=mktSurfaces[p]?'border-bottom:2px solid #66bb6a':'';h+='<div class="dtcc-pair-chip'+(p===dAP?' active':'')+'" onclick="dSP(\''+p+'\')" style="'+hm+'">'+p.slice(0,3)+'/'+p.slice(3)+'</div>';});
@@ -585,76 +890,198 @@ async function dtccFetch(){var dot=document.getElementById('dd'),txt=document.ge
     var urls=['/api/optionflow?'+qs,'https://dtcc.ericlanalytics.com/api/optionflow?'+qs];var data=null;
     for(var i=0;i<urls.length;i++){try{var r=await fetch(urls[i]);if(!r.ok)throw new Error('HTTP '+r.status);data=await r.json();break;}catch(e){if(i===urls.length-1){dot.className='dtcc-dot err';txt.textContent='No connection';return;}}}
     if(!data||!data.trades){dot.className='dtcc-dot err';txt.textContent='Bad data';return;}
-    dot.className='dtcc-dot ok';txt.textContent=(data.count||data.trades.length)+' trades';
+    dot.className='dtcc-dot ok';
+    dPrevCS=dCS&&Object.keys(dCS).length?JSON.parse(JSON.stringify(dCS)):null;
     dProcTrades(data.trades);dBuildSurf();dRA();}
 
 function dProcTrades(trades){dAT={};dPM={};DTCC_G10.concat(DTCC_EM).forEach(function(p){dAT[p]=[];});
-    trades.forEach(function(t){try{var pk=DPA[t.pair];if(!pk||!dAT[pk])return;var iv=null;if(t.iv!=null&&t.iv!=='\u2014'&&t.iv!==''){iv=parseFloat(String(t.iv).replace('%',''));if(isNaN(iv)||iv<=0)return;}else return;
-    var days=parseInt(t.days)||0;if(days<=0)return;var notl=parseFloat(t.usd_amt)||0,spot=parseFloat(t.spot)||0,strike=parseFloat(t.strike)||0,fwd=parseFloat(t.fwd_rate)||spot,ic=(t.opt_type==='CALL');
-    var delta=dCD(fwd,strike,iv/100,days/365,ic);
-    // Reject sub-7 delta (deep OTM with inflated smile premium)
-    if(Math.abs(delta)<0.07)return;
-    // Reject absurd IVs (absolute bounds)
-    if(iv>60||iv<0.5)return;
-    // Delta-aware vol cap for 10d bucket
-    var dBucket=dDB(delta);
-    if(dBucket===0||dBucket===4){
-        var ti=dTB(days);
-        // If broker surface exists, reject 10d prints > 3 vols from expected 10d level
-        var base=dtccGetBase(pk,DT[ti]);
-        if(base&&base.vols[dBucket]>0){
-            if(Math.abs(iv-base.vols[dBucket])>3.5)return;
+    var solved=0,fallback=0,skipped=0;
+    trades.forEach(function(t){try{
+        var pk=DPA[t.pair];if(!pk||!dAT[pk])return;
+        var days=parseInt(t.days)||0;if(days<=0){skipped++;return;}
+        var notl=parseFloat(t.usd_amt)||0;
+        var spot=parseFloat(t.spot)||0,strike=parseFloat(t.strike)||0;
+        // Forward = spot + forward points. Fall back to fwd_rate column, then spot.
+        var fwdPtsRaw=t.fwd_pts?parseFloat(String(t.fwd_pts).replace(/[^0-9.\-+eE]/g,'')):NaN;
+        var fwdRateRaw=parseFloat(t.fwd_rate);
+        var fwd;
+        if(!isNaN(fwdPtsRaw)&&spot>0){
+            fwd=spot+fwdPtsRaw;  // spot + signed fwd points
+        }else if(fwdRateRaw>0){
+            fwd=fwdRateRaw;  // pre-computed fwd rate from API
         }else{
-            // No base: reject if 10d vol > 1.7x the pair's median vol so far
-            var pairTrades=dAT[pk];
-            if(pairTrades.length>5){
-                var allIV=pairTrades.map(function(x){return x.iv;}).sort(function(a,b){return a-b;});
-                var medIV=allIV[Math.floor(allIV.length/2)];
-                if(iv>medIV*1.7)return;
-            }
+            fwd=spot;  // last resort
         }
-    }
-    if(spot>0&&(!dPM[pk]||t.time>(dPM[pk].lt||'')))dPM[pk]={spot:spot,lt:t.time};
-    dAT[pk].push({time:t.time||'',type:t.opt_type||'?',strike:strike,spot:spot,fwd:fwd,days:days,iv:iv,notl:notl,expiry:t.expiry||'',ic:ic,delta:delta});}catch(e){}});}
+        if(spot<=0||strike<=0){skipped++;return;}
+        var T=days/365;
+        // API's reported type — needed for IV solver (premium matches this type)
+        var apiIsCall=(t.opt_type==='CALL');
+        // OTM classification — strike vs FORWARD determines call/put
+        // Strike >= fwd = OTM call, strike < fwd = OTM put
+        var ic=(strike>=fwd);
+        // Compute IV from premium using the API's type (premium corresponds to it)
+        var iv=null,premRaw=t.premium?Number(String(t.premium).replace(/,/g,'')):0;
+        if(premRaw>0&&notl>0){
+            var rd=0.045;
+            var mktP=premRaw*spot/(notl*1e6);
+            var solvedIV=b76SolveIV(fwd,strike,T,rd,apiIsCall,mktP);  // IV solver uses fwd too
+            if(solvedIV!==null){iv=solvedIV;solved++;}
+        }
+        if(iv===null&&t.iv!=null&&t.iv!=='\u2014'&&t.iv!==''){
+            var siteIV=parseFloat(String(t.iv).replace('%',''));
+            if(!isNaN(siteIV)&&siteIV>0){iv=siteIV;fallback++;}
+        }
+        if(iv===null){skipped++;return;}
+        var delta=dCD(fwd,strike,iv/100,T,ic);
+        // All options are OTM by construction (strike vs spot determines C/P)
+        // Only reject deep OTM (|delta| < 0.05) and bad vol
+        if(Math.abs(delta)<0.05||iv>60||iv<0.5){skipped++;return;}
+        var dBucket=dDB(delta);
+        if(dBucket===0||dBucket===4){
+            var tw=tenorWeights(days);var ti=tw[0].ti;
+            var base=dtccGetBase(pk,DT[ti]);
+            if(base&&base.vols[dBucket]>0&&Math.abs(iv-base.vols[dBucket])>3.5){skipped++;return;}
+        }
+        if(spot>0&&(!dPM[pk]||t.time>(dPM[pk].lt||'')))dPM[pk]={spot:spot,lt:t.time};
+        dAT[pk].push({time:t.time||'',type:ic?'CALL':'PUT',strike:strike,spot:spot,fwd:fwd,days:days,iv:iv,notl:notl,expiry:t.expiry||'',ic:ic,delta:delta,ivSrc:solved>fallback?'calc':'site'});
+    }catch(e){skipped++;}});
+    var dot=document.getElementById('dd'),txt=document.getElementById('dt');
+    if(dot&&dot.className.indexOf('ok')>=0){txt.textContent=(solved+fallback)+' trades ('+solved+' solved, '+fallback+' site IV)';}
+}
 
 function dBuildSurf(){dCS={};DTCC_G10.concat(DTCC_EM).forEach(function(pair){
-    var trades=dAT[pair]||[],acc=[];for(var ti=0;ti<DT.length;ti++){acc[ti]=[];for(var di=0;di<5;di++)acc[ti][di]={sumIV:0,sumW:0,count:0};}
-    // Pass 1: collect raw IVs per bucket for outlier detection
-    var raw=[];for(var ti=0;ti<DT.length;ti++){raw[ti]=[];for(var di=0;di<5;di++)raw[ti][di]=[];}
-    trades.forEach(function(t){var di=dDB(t.delta);if(di<0)return;var ti=dTB(t.days);raw[ti][di].push({iv:t.iv,w:Math.max(t.notl,1)});});
-    // Pass 2: base-aware pre-filter + MAD outlier removal
-    function median(arr){if(!arr.length)return null;var s=arr.slice().sort(function(a,b){return a-b;});var m=Math.floor(s.length/2);return s.length%2?s[m]:(s[m-1]+s[m])/2;}
-    for(var ti=0;ti<DT.length;ti++){for(var di=0;di<5;di++){
-        var ivs=raw[ti][di];if(!ivs.length)continue;
-        // Base-aware pre-filter: delta-dependent threshold
+    var trades=dAT[pair]||[];
+    var acc=[];for(var ti=0;ti<DT.length;ti++){acc[ti]=[];for(var di=0;di<5;di++)acc[ti][di]={sumIV:0,sumW:0,count:0};}
+    // Weighted tenor interpolation
+    trades.forEach(function(t){var di=dDB(t.delta);var tw=tenorWeights(t.days);
+        tw.forEach(function(wt){var w=Math.max(t.notl,1)*wt.w;acc[wt.ti][di].sumIV+=t.iv*w;acc[wt.ti][di].sumW+=w;acc[wt.ti][di].count+=wt.w;});});
+    var surf=[];
+    for(var ti=0;ti<DT.length;ti++){var any=false;for(var di=0;di<5;di++){if(acc[ti][di].count>0){any=true;break;}}
         var base=dtccGetBase(pair,DT[ti]);
-        if(base&&base.vols[di]){
-            var expected=base.vols[di];
-            // ATM: ±3 vols, 25d: ±3.5 vols, 10d: ±4 vols
-            var maxDev=(di===2)?3.0:(di===1||di===3)?3.5:4.0;
-            ivs=ivs.filter(function(r){return Math.abs(r.iv-expected)<=maxDev;});
+        if(base&&any){
+            // O/N: blend aggressively toward observed (80/20) — very responsive
+            // Other tenors: standard shift mechanism
+            if(ti===0){
+                var r=[];for(var di=0;di<5;di++){
+                    if(acc[ti][di].count>0){
+                        var obs=acc[ti][di].sumIV/acc[ti][di].sumW;
+                        r[di]=obs*0.8+base.vols[di]*0.2;  // 80% print, 20% base
+                    }else{r[di]=base.vols[di];}
+                }
+                // Apply level shift to unfilled deltas from filled ones
+                var obsATM=(acc[ti][2].count>0)?acc[ti][2].sumIV/acc[ti][2].sumW:null;
+                if(obsATM){var ls=obsATM-base.atm;for(var di=0;di<5;di++){if(acc[ti][di].count===0)r[di]=base.vols[di]+ls*0.8;}}
+                surf[ti]=r;
+            }else{
+                var sh=dtccShifts(base,acc[ti]);surf[ti]=dtccApply(base,sh);
+            }
         }
-        if(!ivs.length)continue;
-        // Single print: accept if passes base filter above (or no base)
-        if(ivs.length<3){ivs.forEach(function(r){acc[ti][di].sumIV+=r.iv*r.w;acc[ti][di].sumW+=r.w;acc[ti][di].count++;});continue;}
-        // Multiple prints: MAD-based filter (3x MAD, floor at 1.5 vols)
-        var med=median(ivs.map(function(r){return r.iv;}));
-        var mads=ivs.map(function(r){return Math.abs(r.iv-med);});var madVal=median(mads);
-        var threshold=Math.max(1.5,madVal*3);
-        ivs.forEach(function(r){if(Math.abs(r.iv-med)<=threshold){acc[ti][di].sumIV+=r.iv*r.w;acc[ti][di].sumW+=r.w;acc[ti][di].count++;}});
-    }}
-    var surf=[];for(var ti=0;ti<DT.length;ti++){var any=false;for(var di=0;di<5;di++){if(acc[ti][di].count>0){any=true;break;}}
-        var base=dtccGetBase(pair,DT[ti]);
-        if(base&&any){var sh=dtccShifts(base,acc[ti]);surf[ti]=dtccApply(base,sh);}
         else if(base&&!any){surf[ti]=base.vols.slice();}
-        else if(!base&&any){var ae=null;if(acc[ti][2].count>0)ae=acc[ti][2].sumIV/acc[ti][2].sumW;else{var s=0,w=0;for(var di=0;di<5;di++){if(acc[ti][di].count>0){s+=acc[ti][di].sumIV;w+=acc[ti][di].sumW;}}if(w>0)ae=s/w;}
+        else if(!base&&any){var ae=null;if(acc[ti][2].count>0)ae=acc[ti][2].sumIV/acc[ti][2].sumW;
+            else{var s=0,w=0;for(var di=0;di<5;di++){if(acc[ti][di].count>0){s+=acc[ti][di].sumIV;w+=acc[ti][di].sumW;}}if(w>0)ae=s/w;}
             if(ae){var gb=dtccGenBase(ae);var sh=dtccShifts(gb,acc[ti]);surf[ti]=dtccApply(gb,sh);}else surf[ti]=[null,null,null,null,null];}
         else surf[ti]=[null,null,null,null,null];}
-    // Cross-tenor interp
     for(var di=0;di<5;di++){var kn=[];for(var ti=0;ti<DT.length;ti++){if(surf[ti][di]!==null)kn.push({ti:ti,v:surf[ti][di]});}if(!kn.length)continue;
         for(var ti=0;ti<DT.length;ti++){if(surf[ti][di]!==null)continue;var bl=null,ab=null;for(var k=0;k<kn.length;k++){if(kn[k].ti<ti)bl=kn[k];if(kn[k].ti>ti&&!ab)ab=kn[k];}
             if(bl&&ab){var w=(ti-bl.ti)/(ab.ti-bl.ti);surf[ti][di]=bl.v+(ab.v-bl.v)*w;}else if(bl)surf[ti][di]=bl.v;else if(ab)surf[ti][di]=ab.v;}}
+    // Smooth term structure — linked zones move together
+    surf=smoothTermStructure(surf,acc);
     dCS[pair]=surf;});}
+
+// Term structure smoother — ensures neighboring tenors don't diverge unreasonably
+// Zones: front (O/N-2W), belly (1M-3M), back (6M-2Y)
+// Within each zone, shifts from the base bleed to neighbors with decay
+// Tenors with more trade data anchor the zone; sparse tenors follow
+function smoothTermStructure(surf,acc){
+    // Max vol gap between adjacent tenors (starting from 1W, O/N is exempt)
+    // idx 0=O/N->1W (unused), 1=1W->2W, 2=2W->1M, etc.
+    var maxGap=[1.5,1.0,0.8,0.6,0.5,0.5,0.4,0.4,0.4];
+
+    for(var di=0;di<5;di++){
+        // Iterate forward+backward passes until gaps converge (max 5 rounds)
+        // Start at ti=1 (1W) — O/N is never touched by smoothing
+        for(var round=0;round<5;round++){
+            var changed=false;
+            // Forward pass: 1W onward
+            for(var ti=1;ti<DT.length-1;ti++){
+                if(surf[ti][di]===null||surf[ti+1][di]===null)continue;
+                var gap=surf[ti+1][di]-surf[ti][di];
+                var mg=maxGap[ti];
+                if(Math.abs(gap)<=mg)continue;
+                changed=true;
+                var w0=acc[ti][di].count||0.1,w1=acc[ti+1][di].count||0.1;
+                var target;
+                if(w1<w0){
+                    target=surf[ti][di]+(gap>0?mg:-mg);
+                    surf[ti+1][di]=surf[ti+1][di]*0.3+target*0.7;
+                }else if(w0<w1){
+                    target=surf[ti+1][di]-(gap>0?mg:-mg);
+                    surf[ti][di]=surf[ti][di]*0.3+target*0.7;
+                }else{
+                    var mid=(surf[ti][di]+surf[ti+1][di])/2;
+                    surf[ti][di]=mid-(gap>0?mg/2:-mg/2);
+                    surf[ti+1][di]=mid+(gap>0?mg/2:-mg/2);
+                }
+            }
+            // Backward pass: down to 1W (never touch O/N)
+            for(var ti=DT.length-2;ti>=1;ti--){
+                if(surf[ti][di]===null||surf[ti+1][di]===null)continue;
+                var gap=surf[ti+1][di]-surf[ti][di];
+                var mg=maxGap[ti];
+                if(Math.abs(gap)<=mg)continue;
+                changed=true;
+                var w0=acc[ti][di].count||0.1,w1=acc[ti+1][di].count||0.1;
+                if(w0<w1){
+                    var target=surf[ti+1][di]-(gap>0?mg:-mg);
+                    surf[ti][di]=surf[ti][di]*0.3+target*0.7;
+                }else if(w1<w0){
+                    var target=surf[ti][di]+(gap>0?mg:-mg);
+                    surf[ti+1][di]=surf[ti+1][di]*0.3+target*0.7;
+                }else{
+                    var mid=(surf[ti][di]+surf[ti+1][di])/2;
+                    surf[ti][di]=mid-(gap>0?mg/2:-mg/2);
+                    surf[ti+1][di]=mid+(gap>0?mg/2:-mg/2);
+                }
+            }
+            if(!changed)break;
+        }
+    }
+    // Enforce RR/Fly ratio constraints per tenor
+    // surf[ti] = [10P, 25P, ATM, 25C, 10C]
+    // RR25 = 25C - 25P, RR10 should be ~1.925x RR25
+    // Fly25 = (25C+25P)/2 - ATM, Fly10 should be ~3.6x Fly25
+    for(var ti=0;ti<DT.length;ti++){
+        var s=surf[ti];if(s[2]===null)continue;
+        var atm=s[2];
+        // Only adjust if we have 25d data
+        if(s[1]!==null&&s[3]!==null){
+            var rr25=s[3]-s[1];
+            var fly25=Math.max(0,(s[3]+s[1])/2-atm);
+            // Enforce 10d from 25d ratios if 10d exists
+            if(s[0]!==null&&s[4]!==null){
+                var targetRR10=rr25*1.925;  // midpoint of 1.85-2x
+                var targetFly10=Math.max(0,fly25*3.6);
+                // Recompute 10d wings from constrained RR10 and Fly10
+                // 10P = ATM + fly10 - rr10/2
+                // 10C = ATM + fly10 + rr10/2
+                var new10P=atm+targetFly10-targetRR10/2;
+                var new10C=atm+targetFly10+targetRR10/2;
+                // Blend: 70% ratio-constrained, 30% original (don't fully override data)
+                s[0]=s[0]*0.3+new10P*0.7;
+                s[4]=s[4]*0.3+new10C*0.7;
+            }
+        }
+    }
+    // Re-enforce smile convexity: wings >= ATM
+    for(var ti=0;ti<DT.length;ti++){
+        if(surf[ti][2]===null)continue;
+        for(var di=0;di<5;di++){
+            if(di!==2&&surf[ti][di]!==null&&surf[ti][di]<surf[ti][2])
+                surf[ti][di]=surf[ti][2]+0.01;
+        }
+    }
+    return surf;
+}
 
 function dtccSnap(){dSS={};DTCC_G10.concat(DTCC_EM).forEach(function(p){if(dCS[p])dSS[p]=dCS[p].map(function(r){return r.slice();});});dST=new Date();document.getElementById('dsn').textContent='Snap '+dST.toLocaleTimeString('en-US',{hour12:false});dRA();}
 function dtccClrSnap(){dSS=null;dST=null;document.getElementById('dsn').textContent='No snap';dRA();}
@@ -665,57 +1092,116 @@ function dSetTV(v){dTV=v;['atm','rr25','fly25'].forEach(function(k){document.get
 function dRSum(){var tr=dAT[dAP]||[],sf=dCS[dAP],sn=dSS?dSS[dAP]:null;document.getElementById('ds-t').textContent=tr.length;
     var ac=0;Object.values(dAT).forEach(function(a){ac+=a.length;});document.getElementById('ds-p').textContent=ac+' | '+Object.keys(mktSurfaces).length+' marked';
     var pts=0;if(sf)sf.forEach(function(r){r.forEach(function(v){if(v!==null)pts++;});});document.getElementById('ds-pt').textContent=pts+'/'+DT.length*5;
-    if(sf){for(var t=0;t<DT.length;t++){if(sf[t][2]!==null){document.getElementById('ds-af').textContent=sf[t][2].toFixed(2)+'%';document.getElementById('ds-afc').textContent=sn&&sn[t][2]!==null?((sf[t][2]-sn[t][2]>0?'+':'')+((sf[t][2]-sn[t][2]).toFixed(2))):DT[t];break;}}
-        if(sf[8]&&sf[8][2]!==null){document.getElementById('ds-a1').textContent=sf[8][2].toFixed(2)+'%';document.getElementById('ds-a1c').textContent=sn&&sn[8][2]!==null?((sf[8][2]-sn[8][2]>0?'+':'')+((sf[8][2]-sn[8][2]).toFixed(2))):'1Y';}}}
+    if(sf){for(var t=0;t<DT.length;t++){if(sf[t][2]!==null){document.getElementById('ds-af').textContent=sf[t][2].toFixed(2)+'%';document.getElementById('ds-afc').textContent=(sn&&sn[t][2]!==null?((sf[t][2]-sn[t][2]>0?'+':'')+((sf[t][2]-sn[t][2]).toFixed(2))):DT[t]);break;}}
+        if(sf[8]&&sf[8][2]!==null){document.getElementById('ds-a1').textContent=sf[8][2].toFixed(2)+'%';document.getElementById('ds-a1c').textContent=(sn&&sn[8][2]!==null?((sf[8][2]-sn[8][2]>0?'+':'')+((sf[8][2]-sn[8][2]).toFixed(2))):'1Y');}}}
 
-function dRSurf(){var sf=dCS[dAP],sn=dSS?dSS[dAP]:null;if(!sf||sf.every(function(r){return r.every(function(v){return v===null;});})){var hm=mktSurfaces[dAP]?'Marks loaded \u2014 waiting for DTCC':'No marks for '+dAP+' \u2014 add in Market Data';document.getElementById('dsp').innerHTML='<div style="text-align:center;padding:80px 20px;color:#888">'+hm+'</div>';return;}
-    var z,cs;if(dSV==='chg'&&sn){z=sf.map(function(r,t){return r.map(function(v,d){return v!==null&&sn[t][d]!==null?parseFloat((v-sn[t][d]).toFixed(3)):null;});});cs=[[0,'#1565c0'],[0.5,'#3d3d3d'],[1,'#c62828']];}
+function dRSurf(){var sf=dCS[dAP],sn=dSS?dSS[dAP]:null,prev=dPrevCS?dPrevCS[dAP]:null;
+    if(!sf||sf.every(function(r){return r.every(function(v){return v===null;});})){var hm=mktSurfaces[dAP]?'Marks loaded \u2014 waiting for DTCC':'No marks for '+dAP;document.getElementById('dsp').innerHTML='<div style="text-align:center;padding:80px 20px;color:#888">'+hm+'</div>';return;}
+    var z,cs;
+    if(dSV==='chg'&&sn){z=sf.map(function(r,t){return r.map(function(v,d){return v!==null&&sn[t][d]!==null?parseFloat((v-sn[t][d]).toFixed(3)):null;});});cs=[[0,'#1565c0'],[0.5,'#3d3d3d'],[1,'#c62828']];}
     else{z=sf.map(function(r){return r.map(function(v){return v!==null?parseFloat(v.toFixed(2)):null;});});cs=[[0,'#0d47a1'],[0.5,'#fff59d'],[1,'#b71c1c']];}
-    var txt=z.map(function(r){return r.map(function(v){return v!==null?v.toFixed(2):'';});});
+    var txt=z.map(function(row,ti){return row.map(function(v,di){
+        if(v===null)return'';var arrow='';
+        if(prev&&prev[ti]&&prev[ti][di]!==null&&sf[ti][di]!==null){
+            var diff=sf[ti][di]-prev[ti][di];
+            if(diff>0.02)arrow=' \u25b2';else if(diff<-0.02)arrow=' \u25bc';
+        }
+        return v.toFixed(2)+arrow;
+    });});
     Plotly.react('dsp',[{z:z,x:DDL,y:DT,type:'heatmap',colorscale:cs,text:txt,texttemplate:'%{text}',textfont:{size:10,color:'black'},hovertemplate:'%{y} %{x}<br>%{z:.2f}%<extra></extra>',connectgaps:false,colorbar:{thickness:12,len:0.85,tickfont:{size:10,color:'#aaa'}}}],{margin:{l:50,r:60,t:10,b:45},paper_bgcolor:'transparent',plot_bgcolor:'transparent',xaxis:{color:'#aaa',gridcolor:'#555',tickfont:{size:11}},yaxis:{color:'#aaa',gridcolor:'#555',tickfont:{size:11},autorange:'reversed'},font:{color:'#ccc'}},{displayModeBar:false,responsive:true});}
 
 function dCC(v){if(v==null)return'<td class="dtcc-chg-flat">&mdash;</td>';var c=v>0.005?'dtcc-chg-up':v<-0.005?'dtcc-chg-dn':'dtcc-chg-flat';return'<td class="'+c+'">'+(v>0?'+':'')+v.toFixed(2)+'</td>';}
 function dRStrat(){var sf=dCS[dAP],sn=dSS?dSS[dAP]:null,tr=dAT[dAP]||[];if(!sf){document.getElementById('dsb').innerHTML='';return;}
-    var tc=Array(DT.length).fill(0);tr.forEach(function(t){tc[dTB(t.days)]++;});var rows=[];
+    var tc=Array(DT.length).fill(0);tr.forEach(function(t){var tw=tenorWeights(t.days);tw.forEach(function(wt){tc[wt.ti]+=wt.w;});});
+    var rows=[];
     for(var t=0;t<DT.length;t++){var v=sf[t];if(v[2]===null)continue;var a=v[2],r25=(v[3]!=null&&v[1]!=null)?v[3]-v[1]:null,r10=(v[4]!=null&&v[0]!=null)?v[4]-v[0]:null,f25=(v[3]!=null&&v[1]!=null)?(v[3]+v[1])/2-a:null,f10=(v[4]!=null&&v[0]!=null)?(v[4]+v[0])/2-a:null;
-        var da=null,dr25=null,dr10=null,df25=null,df10=null;if(sn&&sn[t]){var s=sn[t];if(s[2]!=null)da=a-s[2];if(s[3]!=null&&s[1]!=null&&r25!=null)dr25=r25-(s[3]-s[1]);if(s[4]!=null&&s[0]!=null&&r10!=null)dr10=r10-(s[4]-s[0]);if(s[3]!=null&&s[1]!=null&&f25!=null)df25=f25-((s[3]+s[1])/2-s[2]);if(s[4]!=null&&s[0]!=null&&f10!=null)df10=f10-((s[4]+s[0])/2-s[2]);}
-        rows.push('<tr><td>'+DT[t]+'</td><td>'+a.toFixed(2)+'</td>'+dCC(da)+'<td>'+(r25!=null?r25.toFixed(2):'&mdash;')+'</td>'+dCC(dr25)+'<td>'+(r10!=null?r10.toFixed(2):'&mdash;')+'</td>'+dCC(dr10)+'<td>'+(f25!=null?f25.toFixed(2):'&mdash;')+'</td>'+dCC(df25)+'<td>'+(f10!=null?f10.toFixed(2):'&mdash;')+'</td>'+dCC(df10)+'<td style="color:#888">'+tc[t]+'</td></tr>');}
+        var da=null,dr25=null,dr10=null,df25=null,df10=null;
+        if(sn&&sn[t]){var s=sn[t];if(s[2]!=null)da=a-s[2];if(s[3]!=null&&s[1]!=null&&r25!=null)dr25=r25-(s[3]-s[1]);if(s[4]!=null&&s[0]!=null&&r10!=null)dr10=r10-(s[4]-s[0]);if(s[3]!=null&&s[1]!=null&&f25!=null)df25=f25-((s[3]+s[1])/2-s[2]);if(s[4]!=null&&s[0]!=null&&f10!=null)df10=f10-((s[4]+s[0])/2-s[2]);}
+        rows.push('<tr><td>'+DT[t]+'</td><td>'+a.toFixed(2)+'</td>'+dCC(da)+'<td>'+(r25!=null?r25.toFixed(2):'&mdash;')+'</td>'+dCC(dr25)+'<td>'+(r10!=null?r10.toFixed(2):'&mdash;')+'</td>'+dCC(dr10)+'<td>'+(f25!=null?f25.toFixed(2):'&mdash;')+'</td>'+dCC(df25)+'<td>'+(f10!=null?f10.toFixed(2):'&mdash;')+'</td>'+dCC(df10)+'<td style="color:#888">'+Math.round(tc[t])+'</td></tr>');}
     document.getElementById('dsb').innerHTML=rows.join('');}
 
-function dRTerm(){var sf=dCS[dAP],sn=dSS?dSS[dAP]:null;if(!sf){Plotly.purge('dtp');return;}var y=[],ys=[],lb='',vt=[];
+// Term structure: numeric x-axis (days), spline fit, tenor labels
+function dRTerm(){
+    var sf=dCS[dAP],sn=dSS?dSS[dAP]:null;if(!sf){Plotly.purge('dtp');return;}
+    var y=[],ys=[],xs=[],lbls=[];
     for(var t=0;t<DT.length;t++){var v=sf[t],val=null,sv=null;
-        if(dTV==='atm'){val=v[2];lb='ATM (%)';if(sn&&sn[t])sv=sn[t][2];}
-        else if(dTV==='rr25'){if(v[3]!=null&&v[1]!=null)val=v[3]-v[1];lb='25\u0394 RR';if(sn&&sn[t]&&sn[t][3]!=null&&sn[t][1]!=null)sv=sn[t][3]-sn[t][1];}
-        else{if(v[3]!=null&&v[1]!=null&&v[2]!=null)val=(v[3]+v[1])/2-v[2];lb='25\u0394 Fly';if(sn&&sn[t]&&sn[t][3]!=null&&sn[t][1]!=null&&sn[t][2]!=null)sv=(sn[t][3]+sn[t][1])/2-sn[t][2];}
-        if(val!=null){vt.push(DT[t]);y.push(parseFloat(val.toFixed(3)));if(sv!=null)ys.push(parseFloat(sv.toFixed(3)));}}
-    var traces=[{x:vt,y:y,type:'scatter',mode:'lines+markers',line:{color:'#90caf9',width:2.5},marker:{size:6,color:'#90caf9'},name:'Current'}];
-    if(sn&&ys.length===y.length)traces.push({x:vt,y:ys,type:'scatter',mode:'lines+markers',line:{color:'#666',width:1.5,dash:'dot'},marker:{size:4,color:'#666'},name:'Snap'});
-    Plotly.react('dtp',traces,{margin:{l:45,r:15,t:5,b:30},paper_bgcolor:'transparent',plot_bgcolor:'transparent',xaxis:{color:'#aaa',gridcolor:'#555',tickfont:{size:10}},yaxis:{color:'#aaa',gridcolor:'#555',tickfont:{size:10},title:{text:lb,font:{size:10,color:'#aaa'}}},showlegend:sn?true:false,legend:{orientation:'h',y:1.12,font:{size:10,color:'#aaa'},bgcolor:'transparent'}},{displayModeBar:false,responsive:true});}
+        if(dTV==='atm'){val=v[2];if(sn&&sn[t])sv=sn[t][2];}
+        else if(dTV==='rr25'){if(v[3]!=null&&v[1]!=null)val=v[3]-v[1];if(sn&&sn[t]&&sn[t][3]!=null&&sn[t][1]!=null)sv=sn[t][3]-sn[t][1];}
+        else{if(v[3]!=null&&v[1]!=null&&v[2]!=null)val=(v[3]+v[1])/2-v[2];if(sn&&sn[t]&&sn[t][3]!=null&&sn[t][1]!=null&&sn[t][2]!=null)sv=(sn[t][3]+sn[t][1])/2-sn[t][2];}
+        if(val!=null){xs.push(DT_DAYS[t]);y.push(parseFloat(val.toFixed(3)));lbls.push(DT[t]);if(sv!=null)ys.push(parseFloat(sv.toFixed(3)));}}
+    var yLbl={atm:'ATM Vol (%)',rr25:'25\u0394 RR',fly25:'25\u0394 Fly'}[dTV];
+    var traces=[{x:xs,y:y,text:lbls,type:'scatter',mode:'lines+markers+text',textposition:'top center',textfont:{size:9,color:'#888'},line:{color:'#90caf9',width:2.5,shape:'spline'},marker:{size:6,color:'#90caf9'},name:'Current'}];
+    if(sn&&ys.length===y.length)traces.push({x:xs,y:ys,type:'scatter',mode:'lines+markers',line:{color:'#666',width:1.5,dash:'dot',shape:'spline'},marker:{size:4,color:'#666'},name:'Snap'});
+    Plotly.react('dtp',traces,{margin:{l:45,r:15,t:25,b:35},paper_bgcolor:'transparent',plot_bgcolor:'transparent',
+        xaxis:{color:'#aaa',gridcolor:'#555',tickfont:{size:10},type:'linear',title:{text:'Days',font:{size:10,color:'#888'}},tickvals:DT_DAYS,ticktext:DT},
+        yaxis:{color:'#aaa',gridcolor:'#555',tickfont:{size:10},title:{text:yLbl,font:{size:10,color:'#aaa'}}},
+        showlegend:sn?true:false,legend:{orientation:'h',y:1.12,font:{size:10,color:'#aaa'},bgcolor:'transparent'}},
+    {displayModeBar:false,responsive:true});}
 
 function dRFeed(){var tr=(dAT[dAP]||[]).slice().sort(function(a,b){return a.time>b.time?-1:a.time<b.time?1:0;});document.getElementById('dfc').textContent=tr.length+' prints';var list=document.getElementById('dfl');
     if(!tr.length){list.innerHTML='<div style="padding:2rem;text-align:center;color:#888">No prints</div>';return;}
-    var h='';tr.slice(0,200).forEach(function(t,i){var tn=DT[dTB(t.days)],tc=t.ic?'color:#66bb6a':'color:#ef5350',vc=t.iv>=15?'color:#ffa726;font-weight:700':t.iv>=10?'color:#90caf9;font-weight:600':'color:#aaa',sc=t.notl>=50?'color:#ffa726;font-weight:700':t.notl>=20?'color:#90caf9;font-weight:600':'color:#888';
-        h+='<div class="dtcc-feed-item'+(i<3?' fresh':'')+'"><span style="color:#888;font-variant-numeric:tabular-nums">'+t.time+'</span><span style="'+tc+';font-weight:700;font-size:10px">'+t.type+'</span><span style="color:#90caf9;font-weight:600">'+tn+'</span><span style="'+vc+'">'+t.iv.toFixed(1)+'</span><span style="'+sc+'">$'+t.notl+'M</span><span style="color:#888">'+Math.round(Math.abs(t.delta)*100)+'\u0394</span></div>';});
+    var h='';tr.slice(0,200).forEach(function(t,i){
+        var tw=tenorWeights(t.days);var tn=DT[tw[0].ti];
+        var tc=t.ic?'color:#66bb6a':'color:#ef5350',vc=t.iv>=15?'color:#ffa726;font-weight:700':t.iv>=10?'color:#90caf9;font-weight:600':'color:#aaa',sc=t.notl>=50?'color:#ffa726;font-weight:700':t.notl>=20?'color:#90caf9;font-weight:600':'color:#888';
+        var ivTxt=t.iv.toFixed(1)+(t.ivSrc==='calc'?'*':'');
+        h+='<div class="dtcc-feed-item'+(i<3?' fresh':'')+'"><span style="color:#888;font-variant-numeric:tabular-nums">'+t.time+'</span><span style="'+tc+';font-weight:700;font-size:10px">'+t.type+'</span><span style="color:#90caf9;font-weight:600">'+tn+'</span><span style="'+vc+'">'+ivTxt+'</span><span style="'+sc+'">$'+t.notl+'M</span><span style="color:#888">'+Math.round(Math.abs(t.delta)*100)+'\u0394</span></div>';});
     list.innerHTML=h;}
+
 '''
 
 # Combine JS_ENGINE and JS_DTCC 
 JS_ENGINE = JS_ENGINE + JS_DTCC
 
 # === MAIN ===
+def create_vol_template(fp='vol_surface_template.xlsx'):
+    """Create a template Excel file for vol surface upload."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+    wb=Workbook()
+    hf=Font(bold=True,color='FFFFFF',size=11);hfill=PatternFill('solid',fgColor='1F4E79')
+    lf=Font(bold=True,color='1F4E79',size=11);lfill=PatternFill('solid',fgColor='D6EAF8')
+    bord=Border(left=Side('thin'),right=Side('thin'),top=Side('thin'),bottom=Side('thin'))
+    tenors=['O/N','1W','2W','1M','2M','3M','6M','9M','1Y','2Y']
+    for pi,(pair,sd) in enumerate(DEFAULT_SURFACES.items()):
+        ws=wb.active if pi==0 else wb.create_sheet(pair)
+        if pi==0:ws.title=pair
+        params=[('Spot',sd['spot']),('TermsRate',sd['r_d']*100),('BaseRate',sd['r_f']*100)]
+        col=1
+        for label,val in params:
+            ws.cell(row=1,column=col,value=label).font=lf;ws.cell(row=1,column=col,value=label).fill=lfill;ws.cell(row=1,column=col,value=label).border=bord
+            c=ws.cell(row=1,column=col+1,value=val);c.font=Font(bold=True,size=11,color='1F4E79');c.fill=lfill;c.border=bord
+            col+=2
+        headers=['Tenor','ATM','RR25','RR10','FLY25','FLY10','FwdPts']
+        for ci,h in enumerate(headers,1):
+            c=ws.cell(row=3,column=ci,value=h);c.font=hf;c.fill=hfill;c.border=bord;c.alignment=Alignment(horizontal='center')
+        for ri,tn in enumerate(sd['tenors'],4):
+            for ci,f in enumerate(['tenor','atm','rr25','rr10','fly25','fly10','fwdPts'],1):
+                c=ws.cell(row=ri,column=ci,value=tn[f]);c.border=bord
+                if ci==1:c.font=Font(bold=True,color='1F4E79')
+                else:c.alignment=Alignment(horizontal='center')
+        for ci,w in enumerate([8,8,8,8,8,8,10],1):ws.column_dimensions[chr(64+ci)].width=w
+    wb.save(fp)
+
 def main():
     fp = 'fx_gamma_inputs.xlsx'
+    vfp = 'vol_surface_template.xlsx'
     print("\n" + "="*50 + "\n   FX OPTIONS ANALYTICS v2\n" + "="*50 + "\n")
     if not os.path.exists(fp):
         create_template(fp)
-        print(f"  Created: {fp}\n  Add positions and re-run.\n")
+        create_vol_template(vfp)
+        print(f"  Created: {fp} (positions)")
+        print(f"  Created: {vfp} (vol surface template)")
+        print(f"  Add positions to {fp} and re-run.\n")
         return
+    if not os.path.exists(vfp):
+        create_vol_template(vfp)
+        print(f"  Created: {vfp}")
     positions = load_positions(fp)
     pairs = list(set(p['pair'] for p in positions))
     print(f"  {len(positions)} positions across {len(pairs)} pairs: {pairs}")
     out = create_dashboard(positions)
     print(f"\n  -> {out}")
-    print(f"  -> Mark surfaces in Market Data tab")
+    print(f"  -> Upload {vfp} or edit surfaces in Market Data tab")
     print(f"  -> Run: python serve_dashboard.py\n")
 
 if __name__ == '__main__':
