@@ -273,13 +273,3 @@ DTCC tab → fetch via proxy → JS processes → shifts applied to mktSurfaces 
 | favicon.ico errors | Fixed in latest `serve_dashboard.py` |
 | Bloomberg loader fails | Install `blpapi`, ensure Terminal is running |
 
----
-
-## File Locations (Windows)
-
-Default working directory:
-```
-C:\Users\matan\Documents\Internships, Resumes, Etc\Finance Python Projects\Python Trading Test\New folder\
-```
-
-All files should be in the same directory. Run both Python scripts from this directory.
