@@ -1402,6 +1402,17 @@ def generate_html(html_file='fx_gamma_trading.html', excel_file='fx_gamma_inputs
     """Generate the dashboard HTML from embedded generator."""
     log("Generating dashboard HTML from embedded generator...")
     fxg = _extract_generator()
+    # Generate Excel template if it doesn't exist
+    if not os.path.exists(excel_file):
+        log(f"Creating positions template: {excel_file}")
+        fxg.create_template(excel_file)
+        log(f"  -> {excel_file} (edit this with your positions)")
+    # Generate vol surface template if it doesn't exist
+    vol_tpl = 'vol_surface_template.xlsx'
+    if not os.path.exists(vol_tpl) and hasattr(fxg, 'create_vol_template'):
+        log(f"Creating vol surface template: {vol_tpl}")
+        fxg.create_vol_template(vol_tpl)
+        log(f"  -> {vol_tpl}")
     positions = []
     if os.path.exists(excel_file):
         try:
@@ -1411,6 +1422,25 @@ def generate_html(html_file='fx_gamma_trading.html', excel_file='fx_gamma_inputs
             log(f"Could not load positions: {e}")
     fxg.create_dashboard(positions, output=html_file)
     log(f"Generated {html_file}")
+
+
+def _ensure_templates():
+    """Create Excel templates if they don't exist."""
+    excel_file = 'fx_gamma_inputs.xlsx'
+    vol_tpl = 'vol_surface_template.xlsx'
+    need = not os.path.exists(excel_file) or not os.path.exists(vol_tpl)
+    if not need:
+        return
+    try:
+        fxg = _extract_generator()
+        if not os.path.exists(excel_file):
+            fxg.create_template(excel_file)
+            log(f"Created positions template: {excel_file}")
+        if not os.path.exists(vol_tpl) and hasattr(fxg, 'create_vol_template'):
+            fxg.create_vol_template(vol_tpl)
+            log(f"Created vol surface template: {vol_tpl}")
+    except Exception as e:
+        log(f"Template creation error: {e}")
 
 
 # ==============================================================
@@ -1452,6 +1482,9 @@ def main():
 
     if not os.path.exists(html_file) or args.generate:
         generate_html(html_file)
+
+    # Always ensure Excel templates exist
+    _ensure_templates()
 
     patch_html(html_file)
     _dtcc = DTCCReader()
