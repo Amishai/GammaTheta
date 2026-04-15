@@ -12,7 +12,7 @@ Features:
 Just run:  python serve_dashboard.py
 """
 
-SCRIPT_VER = "v3.1-20260327"
+SCRIPT_VER = "v3.2-20260327"
 
 import argparse, csv, io, json, os, sys, threading, time, traceback, webbrowser, zipfile
 import urllib.request, urllib.parse, urllib.error
@@ -251,49 +251,69 @@ dRFeed = function() {
     list.innerHTML = h;
 };
 
-// Bloomberg live spot polling — auto-creates mktSurfaces entries for new pairs
+// Bloomberg live data polling — spots + fwd points + derived rates
 (function() {
     var DEFAULT_RD = {USD:0.045,EUR:0.025,GBP:0.044,JPY:0.005,CHF:0.015,AUD:0.035,NZD:0.04,CAD:0.035,
                       SEK:0.03,NOK:0.035,MXN:0.1,BRL:0.12,TRY:0.4,ZAR:0.08,CNH:0.025,
                       INR:0.065,KRW:0.03,SGD:0.03,TWD:0.015,IDR:0.06,PHP:0.055,THB:0.02,
                       HKD:0.045,CLP:0.06,COP:0.1,PEN:0.06,ILS:0.045};
-    function pollSpots() {
+    var TN_LABELS = ['O/N','1W','2W','1M','2M','3M','6M','9M','1Y','2Y'];
+    function pollBBG() {
         fetch('/api/bbg_spots')
         .then(function(r) { return r.json(); })
         .then(function(data) {
-            if (!data || !data.spots || Object.keys(data.spots).length === 0) return;
-            var n = 0;
-            Object.keys(data.spots).forEach(function(pair) {
-                var s = parseFloat(data.spots[pair]);
+            if (!data) return;
+            var spots = data.spots || {};
+            var fwdPts = data.fwd_pts || {};
+            var rates = data.rates || {};
+
+            Object.keys(spots).forEach(function(pair) {
+                var s = parseFloat(spots[pair]);
                 if (s <= 0) return;
-                // Auto-create mktSurfaces entry if pair doesn't exist
+
                 if (!mktSurfaces[pair]) {
                     var base = pair.slice(0,3), terms = pair.slice(3);
+                    var rd = (rates[pair] && rates[pair].r_d) ? rates[pair].r_d : (DEFAULT_RD[terms] || 0.04);
+                    var rf = (rates[pair] && rates[pair].r_f) ? rates[pair].r_f : (DEFAULT_RD[base] || 0.03);
                     mktSurfaces[pair] = {
-                        spot: s, _pair: pair,
-                        r_d: DEFAULT_RD[terms] || 0.04,
-                        r_f: DEFAULT_RD[base] || 0.03,
-                        tenors: TENORS.map(function(tn, ti) {
+                        spot: s, _pair: pair, r_d: rd, r_f: rf,
+                        tenors: TN_LABELS.map(function(tn, ti) {
                             return {tenor: tn, T: TENOR_T[ti], atm: 8, rr25: 0, rr10: 0, fly25: 0.2, fly10: 0.5, fwdPts: 0};
                         })
                     };
-                    n++;
-                } else if (mktSurfaces[pair].spot !== s) {
+                } else {
                     mktSurfaces[pair].spot = s;
-                    n++;
+                }
+
+                // Apply CIP-derived rates
+                if (rates[pair]) {
+                    if (rates[pair].r_d) mktSurfaces[pair].r_d = rates[pair].r_d;
+                    if (rates[pair].r_f) mktSurfaces[pair].r_f = rates[pair].r_f;
+                }
+
+                // Apply fwd points per tenor
+                if (fwdPts[pair] && mktSurfaces[pair].tenors) {
+                    mktSurfaces[pair].tenors.forEach(function(tn) {
+                        var fp = fwdPts[pair][tn.tenor];
+                        if (fp !== undefined && fp !== null) tn.fwdPts = fp;
+                    });
                 }
             });
+
             var el = document.getElementById('mkt-status');
             if (el) {
-                var cnt = Object.keys(data.spots).length;
-                el.textContent = 'BBG: ' + cnt + ' spots live';
+                var parts = [];
+                if (Object.keys(spots).length > 0) parts.push(Object.keys(spots).length + ' spots');
+                if (Object.keys(fwdPts).length > 0) parts.push(Object.keys(fwdPts).length + ' fwd curves');
+                if (Object.keys(rates).length > 0) parts.push('rates');
+                el.textContent = parts.length ? 'BBG: ' + parts.join(', ') : '';
                 el.style.color = '#66bb6a';
             }
         })
         .catch(function() {});
     }
-    setInterval(pollSpots, 5000);
-    setTimeout(pollSpots, 1500);
+    setInterval(pollBBG, 5000);
+    setTimeout(pollBBG, 1500);
 })();
 
 // === DAMPER: blend DTCC prints with your marks ===
@@ -847,6 +867,7 @@ BBG_PAIRS = {
 DEFAULT_RATES = {'USD':0.045,'EUR':0.025,'GBP':0.044,'JPY':0.005,'CHF':0.015,'AUD':0.035,'NZD':0.04,'CAD':0.035,'ILS':0.045}
 
 def pull_bbg_surfaces(pairs=None):
+    import math
     if not pairs: pairs = ['EURUSD','USDJPY','GBPUSD']
     try: import blpapi
     except ImportError: return {'error':'blpapi not installed','surfaces':{}}
@@ -855,6 +876,28 @@ def pull_bbg_surfaces(pairs=None):
     if not session.start(): return {'error':'Cannot connect to Bloomberg','surfaces':{}}
     if not session.openService("//blp/refdata"): session.stop(); return {'error':'Cannot open refdata','surfaces':{}}
     svc = session.getService("//blp/refdata"); surfaces = {}
+
+    # First: pull USD policy rate as anchor
+    usd_rate = 0.045  # fallback
+    try:
+        req0 = svc.createRequest("ReferenceDataRequest")
+        req0.getElement("securities").appendValue("FEDL01 Index")  # Fed Funds effective
+        req0.getElement("fields").appendValue("PX_LAST")
+        session.sendRequest(req0)
+        while True:
+            ev = session.nextEvent(3000)
+            for msg in ev:
+                if msg.hasElement("securityData"):
+                    arr = msg.getElement("securityData")
+                    for i in range(arr.numValues()):
+                        flds = arr.getValueAsElement(i).getElement("fieldData")
+                        if flds.hasElement("PX_LAST"):
+                            usd_rate = flds.getElementAsFloat("PX_LAST") / 100  # BBG quotes as %
+            if ev.eventType() == blpapi.Event.RESPONSE: break
+        log(f"BBG USD rate (FEDL01): {usd_rate*100:.2f}%")
+    except Exception as e:
+        log(f"BBG USD rate pull failed ({e}), using {usd_rate*100:.1f}%")
+
     for pair in pairs:
         pair = pair.upper().replace('/','')
         cfg = BBG_PAIRS.get(pair)
@@ -882,6 +925,13 @@ def pull_bbg_surfaces(pairs=None):
             if ev.eventType() == blpapi.Event.RESPONSE: break
         spot = data.get(cfg['spot'],0)
         if spot <= 0: continue
+
+        # Derive r_d and r_f from forward points via covered interest parity
+        # F = S + fwdPts/scale  and  F = S × exp((r_d - r_f) × T)
+        # Therefore: r_d - r_f = ln(F/S) / T
+        # USD is always one side — use pulled USD rate as anchor
+        scale = 100 if 'JPY' in pair or 'KRW' in pair or 'INR' in pair else 10000
+        rate_diffs = []
         td = []
         for tn in BBG_TENORS:
             b = tn['bbg']
@@ -895,17 +945,45 @@ def pull_bbg_surfaces(pairs=None):
                 td.append({'tenor':tn['label'],'T':round(tn['T'],6),'atm':round(atm,4),
                     'rr25':round(rr25,4),'rr10':round(rr10,4),'fly25':round(fly25,4),
                     'fly10':round(fly10,4),'fwdPts':round(fwdPts,4)})
+            # Collect rate diff from tenors >= 1M for stability
+            if fwdPts != 0 and tn['T'] >= 1/12:
+                fwd = spot + fwdPts / scale
+                if fwd > 0:
+                    rate_diffs.append(math.log(fwd / spot) / tn['T'])
+
+        # Compute r_d and r_f
+        if rate_diffs:
+            avg_diff = sum(rate_diffs) / len(rate_diffs)  # r_d - r_f
+        else:
+            avg_diff = 0
+
+        if terms == 'USD':
+            # e.g. EURUSD: terms=USD, base=EUR. r_d = USD rate, r_f = EUR rate
+            r_d = usd_rate
+            r_f = r_d - avg_diff
+        elif base == 'USD':
+            # e.g. USDJPY: base=USD, terms=JPY. r_f = USD rate, r_d = JPY rate
+            r_f = usd_rate
+            r_d = r_f + avg_diff
+        else:
+            # Cross pair (e.g. EURGBP) — use DEFAULT_RATES as fallback
+            r_d = DEFAULT_RATES.get(terms, 0.04)
+            r_f = DEFAULT_RATES.get(base, 0.03)
+
+        r_d = max(0, min(0.5, r_d))  # clamp to reasonable range
+        r_f = max(0, min(0.5, r_f))
+
         if td:
-            surfaces[pair] = {'spot':round(spot,6),'r_d':DEFAULT_RATES.get(terms,0.04),
-                              'r_f':DEFAULT_RATES.get(base,0.03),'tenors':td}
+            surfaces[pair] = {'spot':round(spot,6),'r_d':round(r_d,5),'r_f':round(r_f,5),'tenors':td}
+            log(f"BBG {pair}: spot={spot:.4f}, r_d={r_d*100:.2f}%, r_f={r_f*100:.2f}%, {len(td)} tenors")
+
     session.stop()
     return {'source':'Bloomberg','timestamp':datetime.now().isoformat(),'surfaces':surfaces}
 
 
 class BBGSpotStreamer:
-    """Background Bloomberg subscription for live FX spots — ALL pairs."""
+    """Background Bloomberg: live spots + fwd points + derived deposit rates."""
 
-    # All pairs we might see from DTCC
     ALL_FX_PAIRS = [
         'EURUSD','USDJPY','GBPUSD','USDCHF','AUDUSD','NZDUSD','USDCAD',
         'USDSEK','USDNOK','EURGBP','EURJPY','GBPJPY','EURCHF','AUDJPY','AUDNZD',
@@ -915,8 +993,40 @@ class BBGSpotStreamer:
         'USDILS','EURILS',
     ]
 
+    # Forward point ticker prefix: {prefix}{tenor} Curncy
+    # USD/XXX: use terms ccy, XXX/USD: use base ccy, crosses: use full pair
+    FWD_PREFIX = {
+        'EURUSD':'EUR','USDJPY':'JPY','GBPUSD':'GBP','USDCHF':'CHF',
+        'AUDUSD':'AUD','NZDUSD':'NZD','USDCAD':'CAD',
+        'USDSEK':'SEK','USDNOK':'NOK',
+        'EURGBP':'EURGBP','EURJPY':'EURJPY','GBPJPY':'GBPJPY',
+        'EURCHF':'EURCHF','AUDJPY':'AUDJPY','AUDNZD':'AUDNZD',
+        'USDMXN':'MXN','USDBRL':'BRL','USDTRY':'TRY','USDZAR':'ZAR',
+        'USDCNH':'CNH','USDINR':'INR','USDKRW':'KRW',
+        'USDSGD':'SGD','USDTWD':'TWD','USDPHP':'PHP','USDTHB':'THB',
+        'USDIDR':'IDR','USDHKD':'HKD',
+        'USDCLP':'CLP','USDCOP':'COP','USDPEN':'PEN',
+        'USDILS':'ILS','EURILS':'EURILS',
+    }
+
+    # Tenors to pull fwd points for
+    FWD_TENORS = [
+        {'label':'O/N','bbg':'ON','T':1/365},
+        {'label':'1W','bbg':'1W','T':7/365},
+        {'label':'2W','bbg':'2W','T':14/365},
+        {'label':'1M','bbg':'1M','T':1/12},
+        {'label':'2M','bbg':'2M','T':2/12},
+        {'label':'3M','bbg':'3M','T':3/12},
+        {'label':'6M','bbg':'6M','T':6/12},
+        {'label':'9M','bbg':'9M','T':9/12},
+        {'label':'1Y','bbg':'1Y','T':1.0},
+        {'label':'2Y','bbg':'2Y','T':2.0},
+    ]
+
     def __init__(self):
-        self.spots = {}
+        self.spots = {}       # pair -> spot
+        self.fwd_pts = {}     # pair -> {tenor_label: pts}
+        self.rates = {}       # pair -> {r_d, r_f}
         self._running = False
 
     def start(self):
@@ -924,30 +1034,51 @@ class BBGSpotStreamer:
             import blpapi
             self._blpapi = blpapi
         except ImportError:
-            log("BBG spots: blpapi not installed, will use static marks only")
+            log("BBG: blpapi not installed, will use static marks only")
             return False
         self._running = True
         threading.Thread(target=self._run, daemon=True).start()
         return True
 
     def _run(self):
+        import math
         blpapi = self._blpapi
         opts = blpapi.SessionOptions()
         opts.setServerHost("localhost"); opts.setServerPort(8194)
         session = blpapi.Session(opts)
         if not session.start():
-            log("BBG spots: cannot connect"); self._running = False; return
+            log("BBG: cannot connect"); self._running = False; return
         if not session.openService("//blp/refdata"):
-            log("BBG spots: cannot open refdata"); session.stop(); self._running = False; return
+            log("BBG: cannot open refdata"); session.stop(); self._running = False; return
 
-        # One-shot: pull ALL spots immediately via reference data
-        log("BBG spots: pulling initial spots for all pairs...")
         svc = session.getService("//blp/refdata")
+
+        # ---- One-shot: pull spots + fwd points for all pairs ----
+        log("BBG: pulling spots + fwd points for all pairs...")
         req = svc.createRequest("ReferenceDataRequest")
+
+        # Spot tickers
         for pair in self.ALL_FX_PAIRS:
             req.getElement("securities").appendValue(f"{pair} Curncy")
+
+        # Forward point tickers
+        fwd_ticker_map = {}  # "EUR1M Curncy" -> (pair, tenor_label)
+        for pair in self.ALL_FX_PAIRS:
+            prefix = self.FWD_PREFIX.get(pair)
+            if not prefix:
+                continue
+            for tn in self.FWD_TENORS:
+                tk = f"{prefix}{tn['bbg']} Curncy"
+                req.getElement("securities").appendValue(tk)
+                fwd_ticker_map[tk] = (pair, tn['label'])
+
+        # USD deposit rate (anchor for CIP)
+        req.getElement("securities").appendValue("US0003M Index")
+
         req.getElement("fields").appendValue("PX_LAST")
         session.sendRequest(req)
+
+        data = {}
         while True:
             ev = session.nextEvent(5000)
             for msg in ev:
@@ -958,23 +1089,74 @@ class BBGSpotStreamer:
                         tk = sec.getElementAsString("security")
                         flds = sec.getElement("fieldData")
                         if flds.hasElement("PX_LAST"):
-                            px = flds.getElementAsFloat("PX_LAST")
-                            # "EURUSD Curncy" -> "EURUSD"
-                            pair = tk.split()[0]
-                            self.spots[pair] = px
+                            data[tk] = flds.getElementAsFloat("PX_LAST")
             if ev.eventType() == blpapi.Event.RESPONSE:
                 break
-        log(f"BBG spots: got {len(self.spots)} initial spots")
 
-        # Now switch to streaming subscriptions for real-time updates
+        # Parse spots
+        for pair in self.ALL_FX_PAIRS:
+            px = data.get(f"{pair} Curncy")
+            if px and px > 0:
+                self.spots[pair] = px
+
+        # Parse fwd points
+        for tk, (pair, tenor) in fwd_ticker_map.items():
+            pts = data.get(tk)
+            if pts is not None:
+                if pair not in self.fwd_pts:
+                    self.fwd_pts[pair] = {}
+                self.fwd_pts[pair][tenor] = pts
+
+        # USD 3M rate (anchor)
+        usd_3m = data.get("US0003M Index", 4.5) / 100  # Bloomberg gives in %, convert to decimal
+
+        # Derive rd/rf from 3M fwd points + spot using CIP
+        for pair in self.ALL_FX_PAIRS:
+            spot = self.spots.get(pair, 0)
+            if spot <= 0:
+                continue
+            fp = self.fwd_pts.get(pair, {}).get('3M', None)
+            if fp is None:
+                continue
+            scale = 100 if 'JPY' in pair else 10000
+            fwd = spot + fp / scale
+            T = 0.25  # 3M
+
+            base, terms = pair[:3], pair[3:]
+            try:
+                # CIP: F/S = exp((rd - rf) * T)
+                # rd = terms rate, rf = base rate
+                rate_diff = math.log(fwd / spot) / T  # rd - rf
+
+                if terms == 'USD':
+                    # XXX/USD: terms=USD, rd=USD rate
+                    rd = usd_3m
+                    rf = rd - rate_diff
+                elif base == 'USD':
+                    # USD/XXX: base=USD, rf=USD rate
+                    rf = usd_3m
+                    rd = rf + rate_diff
+                else:
+                    # Cross: use DEFAULT_RATES as fallback anchor
+                    rd = DEFAULT_RATES.get(terms, 0.04)
+                    rf = rd - rate_diff
+
+                self.rates[pair] = {'r_d': round(rd, 5), 'r_f': round(rf, 5)}
+            except (ValueError, ZeroDivisionError):
+                pass
+
+        log(f"BBG: {len(self.spots)} spots, {len(self.fwd_pts)} fwd curves, "
+            f"{len(self.rates)} rate pairs, USD 3M={usd_3m*100:.2f}%")
+
+        # ---- Switch to streaming for spot updates ----
         if not session.openService("//blp/mktdata"):
-            log("BBG spots: cannot open mktdata for streaming, using static spots")
+            log("BBG: cannot open mktdata for streaming")
             return
         subs = blpapi.SubscriptionList()
         for pair in self.ALL_FX_PAIRS:
             subs.add(f"{pair} Curncy", "LAST_PRICE", "", blpapi.CorrelationId(pair))
         session.subscribe(subs)
-        log(f"BBG spots: streaming {len(self.ALL_FX_PAIRS)} pairs")
+        log(f"BBG: streaming {len(self.ALL_FX_PAIRS)} spots")
 
         while self._running:
             try:
@@ -1037,8 +1219,15 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json({'error':str(e),'surfaces':{}})
 
         elif p.path == '/api/bbg_spots':
-            spots = _bbg_spots.spots if _bbg_spots else {}
-            self._json({'spots': spots, 'streaming': bool(_bbg_spots and _bbg_spots._running)})
+            if _bbg_spots:
+                self._json({
+                    'spots': _bbg_spots.spots,
+                    'fwd_pts': _bbg_spots.fwd_pts,
+                    'rates': _bbg_spots.rates,
+                    'streaming': _bbg_spots._running
+                })
+            else:
+                self._json({'spots': {}, 'fwd_pts': {}, 'rates': {}, 'streaming': False})
 
         elif p.path == '/api/status' and _dtcc:
             self._json(_dtcc.stats)
@@ -1505,6 +1694,7 @@ def main():
   Math fixes:      /api/mathfix.js (fwd pts scaling, spot delta)
   DTCC:            background downloading
   Bloomberg spots: {'enabled (polling every 5s)' if not args.no_bbg_spots else 'disabled'}
+  Bloomberg fwds:  {'all tenors on startup, rates derived via CIP' if not args.no_bbg_spots else 'disabled'}
   Bloomberg vols:  orange button in header
 
   Press Ctrl+C to stop
