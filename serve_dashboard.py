@@ -317,14 +317,14 @@ dRFeed = function() {
 })();
 
 // === DAMPER: blend DTCC prints with your marks ===
-// Alpha = 0 means 100% your marks, alpha = 1 means 100% DTCC prints
-var DTCC_DAMPER = 0.25;  // default 25% DTCC influence
+var DTCC_DAMPER = 0.25;
+var dCS_raw = {};  // raw DTCC surface BEFORE damping (for alerts)
+var dStratView = 'marks';  // 'marks' or 'adjusted'
 
-// Inject damper slider into DTCC tab controls (once DOM is ready)
+// Inject damper slider
 (function injectDamper() {
     var dpb = document.getElementById('dpb');
     if (!dpb) { setTimeout(injectDamper, 500); return; }
-    // Find the controls row (lookback/min selects area)
     var ctrls = dpb.parentElement.querySelector('div[style*="gap:10px"]');
     if (!ctrls) { setTimeout(injectDamper, 500); return; }
     var d = document.createElement('span');
@@ -338,13 +338,17 @@ var DTCC_DAMPER = 0.25;  // default 25% DTCC influence
     ctrls.appendChild(d);
 })();
 
-// Override dBuildSurf: apply damper to blend DTCC surface with marks
+// Override dBuildSurf: save raw, then apply damper
 var _origDBuildSurf = typeof dBuildSurf === 'function' ? dBuildSurf : null;
 if (_origDBuildSurf) {
     dBuildSurf = function() {
-        // First build the raw DTCC surface as before
         _origDBuildSurf();
-        // Now blend each cell: displayed = marks*(1-alpha) + dtcc_raw*alpha
+        // Save raw DTCC surface before damping
+        dCS_raw = {};
+        DTCC_G10.concat(DTCC_EM).forEach(function(pair) {
+            if (dCS[pair]) dCS_raw[pair] = dCS[pair].map(function(r) { return r.slice(); });
+        });
+        // Apply damper: displayed = marks*(1-alpha) + dtcc_raw*alpha
         var alpha = DTCC_DAMPER;
         DTCC_G10.concat(DTCC_EM).forEach(function(pair) {
             var raw = dCS[pair];
@@ -355,7 +359,6 @@ if (_origDBuildSurf) {
                 if (!base) continue;
                 for (var di = 0; di < 5; di++) {
                     if (raw[ti][di] === null) continue;
-                    // Blend: marks*(1-alpha) + dtcc*alpha
                     raw[ti][di] = base.vols[di] * (1 - alpha) + raw[ti][di] * alpha;
                 }
             }
@@ -363,8 +366,138 @@ if (_origDBuildSurf) {
     };
 }
 
-// Override dRFeed: show diff from marks for each print
-var _origDRFeed2 = typeof dRFeed === 'function' ? dRFeed : null;
+// === HEATMAP: show MY MARKS with alert emojis where DTCC prints deviate ===
+dRSurf = function() {
+    var pk = dAP;
+    var raw = dCS_raw[pk];  // raw DTCC-derived surface
+    var pd = mktSurfaces[pk];
+    if (!pd || !pd.tenors) {
+        document.getElementById('dsp').innerHTML = '<div style="text-align:center;padding:80px 20px;color:#888">No marks for ' + pk + '</div>';
+        return;
+    }
+
+    // Build marks surface [ti][di] and track which cells have DTCC data
+    var marks = [], alerts = [];
+    for (var ti = 0; ti < DT.length; ti++) {
+        var base = dtccGetBase(pk, DT[ti]);
+        marks[ti] = base ? base.vols.slice() : [null, null, null, null, null];
+        alerts[ti] = [0, 0, 0, 0, 0];  // 0=none, 1=yellow(>0.5), 2=red(>1.0)
+        if (base && raw && raw[ti]) {
+            for (var di = 0; di < 5; di++) {
+                if (raw[ti][di] !== null && marks[ti][di] !== null) {
+                    var diff = Math.abs(raw[ti][di] - marks[ti][di]);
+                    if (diff >= 1.0) alerts[ti][di] = 2;
+                    else if (diff >= 0.5) alerts[ti][di] = 1;
+                }
+            }
+        }
+    }
+
+    // Z values = marks, text = marks + alert emoji
+    var z = marks.map(function(r) { return r.map(function(v) { return v !== null ? parseFloat(v.toFixed(2)) : null; }); });
+    var txt = marks.map(function(r, ti) {
+        return r.map(function(v, di) {
+            if (v === null) return '';
+            var s = v.toFixed(2);
+            if (alerts[ti][di] === 2) s += ' ' + String.fromCodePoint(0x1F534);  // red circle
+            else if (alerts[ti][di] === 1) s += ' ' + String.fromCodePoint(0x1F7E1);  // yellow circle
+            return s;
+        });
+    });
+
+    var cs = [[0, '#0d47a1'], [0.5, '#fff59d'], [1, '#b71c1c']];
+    Plotly.react('dsp', [{
+        z: z, x: DDL, y: DT, type: 'heatmap', colorscale: cs,
+        text: txt, texttemplate: '%{text}', textfont: {size: 10, color: 'black'},
+        hovertemplate: '%{y} %{x}<br>Mark: %{z:.2f}%<extra></extra>',
+        connectgaps: false, colorbar: {thickness: 12, len: 0.85, tickfont: {size: 10, color: '#aaa'}}
+    }], {
+        margin: {l: 50, r: 60, t: 10, b: 45}, paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+        xaxis: {color: '#aaa', gridcolor: '#555', tickfont: {size: 11}},
+        yaxis: {color: '#aaa', gridcolor: '#555', tickfont: {size: 11}, autorange: 'reversed'},
+        font: {color: '#ccc'}
+    }, {displayModeBar: false, responsive: true});
+};
+
+// === ATM/RR/FLY TABLE: toggle between My Marks and Adjusted ===
+// Inject toggle buttons (once DOM is ready)
+(function injectStratToggle() {
+    var dsb = document.getElementById('dsb');
+    if (!dsb) { setTimeout(injectStratToggle, 500); return; }
+    var card = dsb.closest('.card');
+    if (!card) { setTimeout(injectStratToggle, 500); return; }
+    var h2 = card.querySelector('h2');
+    if (!h2 || h2.querySelector('#strat-toggle-marks')) return;
+    var wrap = document.createElement('div');
+    wrap.style.cssText = 'float:right';
+    wrap.innerHTML = '<button class="btn-toggle active" id="strat-toggle-marks" onclick="dStratView=\'marks\';document.getElementById(\'strat-toggle-marks\').className=\'btn-toggle active\';document.getElementById(\'strat-toggle-adj\').className=\'btn-toggle\';dRStrat();">My Marks</button>'
+        + '<button class="btn-toggle" id="strat-toggle-adj" onclick="dStratView=\'adjusted\';document.getElementById(\'strat-toggle-adj\').className=\'btn-toggle active\';document.getElementById(\'strat-toggle-marks\').className=\'btn-toggle\';dRStrat();">Adjusted</button>';
+    h2.appendChild(wrap);
+})();
+
+function dCC2(v) {
+    if (v == null) return '<td class="dtcc-chg-flat">&mdash;</td>';
+    var c = v > 0.005 ? 'dtcc-chg-up' : v < -0.005 ? 'dtcc-chg-dn' : 'dtcc-chg-flat';
+    return '<td class="' + c + '">' + (v > 0 ? '+' : '') + v.toFixed(2) + '</td>';
+}
+
+dRStrat = function() {
+    var pk = dAP;
+    var raw = dCS_raw[pk];     // raw DTCC surface
+    var damped = dCS[pk];      // damped surface
+    var tr = dAT[pk] || [];
+    var pd = mktSurfaces[pk];
+    if (!pd || !pd.tenors) { document.getElementById('dsb').innerHTML = ''; return; }
+
+    // Count trades per tenor
+    var tc = Array(DT.length).fill(0);
+    tr.forEach(function(t) { var tw = tenorWeights(t.days); tw.forEach(function(wt) { tc[wt.ti] += wt.w; }); });
+
+    var rows = [];
+    for (var t = 0; t < DT.length; t++) {
+        var base = dtccGetBase(pk, DT[t]);
+        if (!base) continue;
+
+        // Marks values
+        var mA = base.atm, mR25 = base.rr25, mR10 = base.rr10, mF25 = base.fly25, mF10 = base.fly10;
+
+        // DTCC raw values (for computing deltas)
+        var dA = null, dR25 = null, dR10 = null, dF25 = null, dF10 = null;
+        if (raw && raw[t] && raw[t][2] !== null) {
+            dA = raw[t][2];
+            if (raw[t][3] !== null && raw[t][1] !== null) dR25 = raw[t][3] - raw[t][1];
+            if (raw[t][4] !== null && raw[t][0] !== null) dR10 = raw[t][4] - raw[t][0];
+            if (raw[t][3] !== null && raw[t][1] !== null) dF25 = (raw[t][3] + raw[t][1]) / 2 - raw[t][2];
+            if (raw[t][4] !== null && raw[t][0] !== null) dF10 = (raw[t][4] + raw[t][0]) / 2 - raw[t][2];
+        }
+
+        // Deltas = DTCC - Marks (how much to adjust marks to match DTCC)
+        var chgA = dA !== null ? dA - mA : null;
+        var chgR25 = dR25 !== null ? dR25 - mR25 : null;
+        var chgR10 = dR10 !== null ? dR10 - mR10 : null;
+        var chgF25 = dF25 !== null ? dF25 - mF25 : null;
+        var chgF10 = dF10 !== null ? dF10 - mF10 : null;
+
+        // Display values depend on toggle
+        var showA, showR25, showR10, showF25, showF10;
+        if (dStratView === 'adjusted' && dA !== null) {
+            showA = dA; showR25 = dR25; showR10 = dR10; showF25 = dF25; showF10 = dF10;
+        } else {
+            showA = mA; showR25 = mR25; showR10 = mR10; showF25 = mF25; showF10 = mF10;
+        }
+
+        rows.push('<tr><td>' + DT[t] + '</td>'
+            + '<td>' + showA.toFixed(2) + '</td>' + dCC2(chgA)
+            + '<td>' + (showR25 !== null ? showR25.toFixed(2) : '&mdash;') + '</td>' + dCC2(chgR25)
+            + '<td>' + (showR10 !== null ? showR10.toFixed(2) : '&mdash;') + '</td>' + dCC2(chgR10)
+            + '<td>' + (showF25 !== null ? showF25.toFixed(2) : '&mdash;') + '</td>' + dCC2(chgF25)
+            + '<td>' + (showF10 !== null ? showF10.toFixed(2) : '&mdash;') + '</td>' + dCC2(chgF10)
+            + '<td style="color:#888">' + Math.round(tc[t]) + '</td></tr>');
+    }
+    document.getElementById('dsb').innerHTML = rows.join('');
+};
+
+// Override dRFeed: show Strike, Time, Expiry, Notl, Vol, vs Mark, Delta
 dRFeed = function() {
     var tr = (dAT[dAP] || []).slice().sort(function(a,b) {
         return a.time > b.time ? -1 : a.time < b.time ? 1 : 0;
@@ -375,7 +508,6 @@ dRFeed = function() {
 
     var hdr = document.querySelector('.dtcc-feed-header');
     if (hdr) hdr.innerHTML = '<span>Strike</span><span>Time</span><span>Expiry</span><span>Notl</span><span>Vol</span><span>vs Mark</span><span>\u0394</span>';
-    // Adjust grid for 7 columns
     if (hdr) hdr.style.gridTemplateColumns = '62px 42px 50px 48px 42px 50px 36px';
 
     var h = '';
@@ -389,30 +521,24 @@ dRFeed = function() {
         var kTxt = t.strike >= 1000 ? t.strike.toFixed(0) : t.strike < 10 ? t.strike.toFixed(4) : t.strike.toFixed(2);
         var expTxt = t.expiry ? t.expiry.slice(5) : '';
         var dTxt = Math.round(Math.abs(t.delta) * 100) + '\u0394';
-
-        // Compute diff from marks
         var diffTxt = '', diffStyle = 'color:#555';
         var pk = dAP;
         if (pk && mktSurfaces[pk] && mktSurfaces[pk].tenors) {
-            // Find closest tenor
             var tnrs = mktSurfaces[pk].tenors, bestTi = 0, bestDist = 9999;
             for (var ti = 0; ti < tnrs.length; ti++) {
                 var dist = Math.abs(tnrs[ti].T * 365 - t.days);
                 if (dist < bestDist) { bestDist = dist; bestTi = ti; }
             }
-            // Get base vol at this delta bucket
             var base = dtccGetBase(pk, tnrs[bestTi].tenor);
             if (base) {
                 var di = dDB(t.delta);
-                var markVol = base.vols[di];
-                var diff = t.iv - markVol;
+                var diff = t.iv - base.vols[di];
                 diffTxt = (diff >= 0 ? '+' : '') + diff.toFixed(1);
                 if (Math.abs(diff) >= 1.5) diffStyle = diff > 0 ? 'color:#ffa726;font-weight:700' : 'color:#42a5f5;font-weight:700';
                 else if (Math.abs(diff) >= 0.5) diffStyle = diff > 0 ? 'color:#ffcc80' : 'color:#90caf9';
                 else diffStyle = 'color:#666';
             }
         }
-
         h += '<div class="dtcc-feed-item' + (i < 3 ? ' fresh' : '') + '" style="grid-template-columns:62px 42px 50px 48px 42px 50px 36px">'
             + '<span style="' + tc + ';font-weight:700;font-size:10px">' + kTxt + '</span>'
             + '<span style="color:#888;font-variant-numeric:tabular-nums">' + t.time + '</span>'
@@ -420,11 +546,466 @@ dRFeed = function() {
             + '<span style="' + sc + '">$' + notlTxt + '</span>'
             + '<span style="' + vc + '">' + ivTxt + '</span>'
             + '<span style="' + diffStyle + ';font-size:10px">' + diffTxt + '</span>'
-            + '<span style="color:#888">' + dTxt + '</span>'
-            + '</div>';
+            + '<span style="color:#888">' + dTxt + '</span></div>';
     });
     list.innerHTML = h;
 };
+
+// === PORTFOLIO TAB OVERRIDES ===
+// Delta in tables, written Greek names, gamma/notional heatmap toggles
+
+// Inject gamma + notional toggle buttons
+(function injectPortToggles() {
+    var btn = document.getElementById('ph-btn-decay');
+    if (!btn) { setTimeout(injectPortToggles, 500); return; }
+    if (document.getElementById('ph-btn-gamma')) return;
+    var g = document.createElement('button');
+    g.id = 'ph-btn-gamma'; g.className = 'btn-toggle';
+    g.textContent = 'Gamma'; g.onclick = function() { setPhView('gamma'); };
+    btn.parentNode.insertBefore(g, btn.nextSibling);
+    var n = document.createElement('button');
+    n.id = 'ph-btn-notional'; n.className = 'btn-toggle';
+    n.textContent = 'Notional'; n.onclick = function() { setPhView('notional'); };
+    g.parentNode.insertBefore(n, g.nextSibling);
+})();
+
+setPhView = function(v) {
+    currentPh = v;
+    ['richness','vega','decay','gamma','notional'].forEach(function(k) {
+        var el = document.getElementById('ph-btn-' + k);
+        if (el) el.className = 'btn-toggle' + (k === v ? ' active' : '');
+    });
+    var titles = {richness:'Portfolio Richness (1-5)', vega:'Portfolio Vega ($K)',
+                  decay:'Portfolio Decay ($K/day)', gamma:'Portfolio Gamma ($M)',
+                  notional:'Total Notional ($M)'};
+    document.getElementById('ph-title').textContent = titles[v] || v;
+    renderPortHm();
+};
+
+var _origBuildPortHm = typeof buildPortHm === 'function' ? buildPortHm : null;
+buildPortHm = function(cs, comp) {
+    _origBuildPortHm(cs, comp);
+    if (!portHmData) return;
+    var nb = portHmData.strikes.length;
+    portHmData.gamma = TENORS.map(function() { return portHmData.strikes.map(function() { return 0; }); });
+    portHmData.notional = TENORS.map(function() { return portHmData.strikes.map(function() { return 0; }); });
+    function getSI(k) {
+        if (!portHmData.bw) return portHmData.strikes.indexOf(k);
+        return Math.max(0, Math.min(Math.floor((k - portHmData.strikes[0]) / portHmData.bw), nb - 1));
+    }
+    function getTI(days) {
+        var bk = [['O/N',1],['1W',7],['2W',14],['1M',30],['2M',61],['3M',91],['6M',182],['9M',274],['1Y',365],['2Y',730]];
+        for (var i = bk.length - 1; i >= 0; i--) { if (days >= bk[i][1] * 0.7) return TENORS.indexOf(bk[i][0]); }
+        return 0;
+    }
+    comp.forEach(function(p) {
+        var ti = getTI(p.days), si = getSI(p.strike); if (ti < 0 || si < 0) return;
+        portHmData.gamma[ti][si] += p.gamma;
+        portHmData.notional[ti][si] += p.notional;
+    });
+};
+
+var _origRenderPortHm = typeof renderPortHm === 'function' ? renderPortHm : null;
+renderPortHm = function() {
+    if (!portHmData) return;
+    if (currentPh !== 'gamma' && currentPh !== 'notional') { _origRenderPortHm(); return; }
+    var M = (currentPh === 'gamma' ? portHmData.gamma : portHmData.notional)
+        .map(function(r) { return r.map(function(v) { return v === 0 ? null : v; }); });
+    var bt = '$M';
+    var cs2 = [[0,'#1565c0'],[0.5,'#e0e0e0'],[1,'#c62828']];
+    var fl = M.flat().filter(function(v) { return v !== null; });
+    var mx = fl.length > 0 ? Math.max(Math.abs(Math.min.apply(null, fl)), Math.abs(Math.max.apply(null, fl))) : 1;
+    var txt = M.map(function(r) { return r.map(function(v) {
+        if (v === null) return '';
+        return (v >= 0 ? '+' : '') + v.toFixed(currentPh === 'notional' ? 1 : 4);
+    }); });
+    Plotly.react('port-hm', [{z: M, x: portHmData.labels, y: TENORS, type: 'heatmap', colorscale: cs2,
+        text: txt, texttemplate: '%{text}', textfont: {size: 9, color: 'black'},
+        colorbar: {title: {text: bt, font: {color:'#e0e0e0'}}, tickfont: {color:'#e0e0e0'}, len: .9},
+        zmin: -mx, zmax: mx, hoverongaps: false}],
+    {margin: {t:20,b:80,l:60,r:50}, xaxis: {title:'Strike',tickangle:45,color:'#e0e0e0',type:'category'},
+     yaxis: {title:'Tenor',color:'#e0e0e0'}, paper_bgcolor:'#3d3d3d', plot_bgcolor:'#3d3d3d'},
+    {displayModeBar: false, responsive: true});
+    document.getElementById('port-hm').on('plotly_click', function(data) {
+        var pt = data.points[0], ti = TENORS.indexOf(pt.y), si = portHmData.labels.indexOf(String(pt.x));
+        if (ti >= 0 && si >= 0) showDrill(ti, si);
+    });
+};
+
+// Override renderPortTab: add delta column, written Greek names
+var _origRenderPortTab = typeof renderPortTab === 'function' ? renderPortTab : null;
+renderPortTab = function() {
+    _origRenderPortTab();
+    if (!portComp || !portComp.length) return;
+    var h = '<table><tr><th>#</th><th>Strike</th><th>Expiry</th><th>Days</th><th>Vol</th><th>Notl</th><th>Type</th><th>Delta</th><th>Gamma</th><th>Theta</th><th>Vega</th><th>Rich</th></tr>';
+    portComp.forEach(function(p) {
+        h += '<tr class="' + (p.notional >= 0 ? 'cheap' : 'rich') + '"><td>' + p.id + '</td><td>' + p.strike.toFixed(3) + '</td><td>' + p.expiry + '</td><td>' + p.days + '</td><td>' + p.vol.toFixed(1) + '</td><td>' + (p.notional >= 0 ? '+' : '') + p.notional.toFixed(1) + '</td><td>' + p.type + '</td><td>' + p.delta.toFixed(4) + '</td><td>' + p.gamma.toFixed(4) + '</td><td>' + p.theta.toFixed(2) + '</td><td>' + p.vega.toFixed(1) + '</td><td><span class="richness-badge" style="background:' + richColor(p.rich) + '">' + p.rich.toFixed(2) + '</span></td></tr>';
+    });
+    h += '</table>'; document.getElementById('pos-tbl').innerHTML = h;
+};
+
+showDrill = function(ti, si) {
+    if (!portHmData) return;
+    var pos = portHmData.byBucket[ti][si];
+    var bw = portHmData.bw, sk = portHmData.strikes[si];
+    var skL = bw > 0 ? sk.toFixed(3) + '-' + (sk + bw).toFixed(3) : sk.toFixed(3);
+    document.getElementById('drill-title').textContent = TENORS[ti] + ' / ' + skL + ' (' + pos.length + ')';
+    if (!pos.length) { document.getElementById('drill-content').innerHTML = '<p style="text-align:center;color:#aaa">No positions</p>'; }
+    else {
+        var h = '<table><tr><th>#</th><th>Strike</th><th>Expiry</th><th>Vol</th><th>Notl</th><th>Type</th><th>Delta</th><th>Gamma</th><th>Theta</th><th>Vega</th><th>Rich</th></tr>';
+        pos.forEach(function(p) {
+            h += '<tr class="' + (p.notional >= 0 ? 'cheap' : 'rich') + '"><td>' + p.id + '</td><td>' + p.strike.toFixed(3) + '</td><td>' + p.expiry + '</td><td>' + p.vol.toFixed(1) + '</td><td>' + (p.notional >= 0 ? '+' : '') + p.notional.toFixed(1) + '</td><td>' + p.type + '</td><td>' + p.delta.toFixed(4) + '</td><td>' + p.gamma.toFixed(4) + '</td><td>' + p.theta.toFixed(2) + '</td><td>' + p.vega.toFixed(1) + '</td><td><span class="richness-badge" style="background:' + richColor(p.rich) + '">' + p.rich.toFixed(2) + '</span></td></tr>';
+        });
+        h += '</table>'; document.getElementById('drill-content').innerHTML = h;
+    }
+    document.getElementById('drill-modal').classList.add('show');
+};
+
+renderIneff = function() {
+    if (!portComp) return;
+    var filtered = currentIneff === 'long' ? portComp.filter(function(p) { return p.notional > 0; }) : portComp.filter(function(p) { return p.notional < 0; });
+    var sorted = filtered.sort(function(a, b) { return b.rich - a.rich; });
+    if (!sorted.length) { document.getElementById('ineff-tbl').innerHTML = '<p style="text-align:center;color:#aaa">No ' + currentIneff + ' positions</p>'; return; }
+    var h = '<table><tr><th>#</th><th>Strike</th><th>Expiry</th><th>Days</th><th>Notl</th><th>Type</th><th>Delta</th><th>Gamma</th><th>Theta</th><th>Decay</th><th>Rich</th></tr>';
+    sorted.forEach(function(p) {
+        h += '<tr class="' + (p.notional >= 0 ? 'cheap' : 'rich') + '"><td>' + p.id + '</td><td>' + p.strike.toFixed(3) + '</td><td>' + p.expiry + '</td><td>' + p.days + '</td><td>' + (p.notional >= 0 ? '+' : '') + p.notional.toFixed(1) + '</td><td>' + p.type + '</td><td>' + p.delta.toFixed(4) + '</td><td>' + p.gamma.toFixed(4) + '</td><td>' + p.theta.toFixed(2) + '</td><td>' + p.decay.toFixed(1) + '</td><td><span class="richness-badge" style="background:' + richColor(p.rich) + '">' + p.rich.toFixed(2) + '</span></td></tr>';
+    });
+    h += '</table>'; document.getElementById('ineff-tbl').innerHTML = h;
+};
+
+// === DTCC HEATMAP DRILLDOWN ===
+// Click any cell on the marks heatmap to see contributing trades
+(function setupDtccDrill() {
+    var check = function() {
+        var el = document.getElementById('dsp');
+        if (!el) { setTimeout(check, 1000); return; }
+        el.on('plotly_click', function(data) {
+            if (!data || !data.points || !data.points.length) return;
+            var pt = data.points[0], ti = DT.indexOf(pt.y), di = DDL.indexOf(pt.x);
+            if (ti < 0 || di < 0) return;
+            var pk = dAP, trades = (dAT[pk] || []).filter(function(t) {
+                var tw = tenorWeights(t.days), tdi = dDB(t.delta);
+                return tw.some(function(wt) { return wt.ti === ti; }) && tdi === di;
+            });
+            if (!trades.length) return;
+            var base = dtccGetBase(pk, DT[ti]);
+            var markVol = base ? base.vols[di] : null;
+            var title = pk + ' ' + DT[ti] + ' ' + DDL[di] + ' \u2014 ' + trades.length + ' trades';
+            if (markVol) title += ' (mark: ' + markVol.toFixed(2) + ')';
+            document.getElementById('drill-title').textContent = title;
+            var h = '<table style="width:100%"><tr><th>Time</th><th>Strike</th><th>Expiry</th><th>Type</th><th>Vol</th><th>vs Mark</th><th>Delta</th><th>Notl</th><th>Spot</th></tr>';
+            trades.sort(function(a, b) { return a.time > b.time ? -1 : 1; }).forEach(function(t) {
+                var diff = markVol ? t.iv - markVol : 0;
+                var dc = Math.abs(diff) >= 1.0 ? 'color:#ef5350;font-weight:700' : Math.abs(diff) >= 0.5 ? 'color:#ffa726' : 'color:#aaa';
+                var kTxt = t.strike >= 1000 ? t.strike.toFixed(0) : t.strike < 10 ? t.strike.toFixed(4) : t.strike.toFixed(2);
+                h += '<tr><td>' + t.time + '</td><td>' + kTxt + '</td><td>' + (t.expiry||'').slice(5) + '</td><td style="' + (t.ic ? 'color:#66bb6a' : 'color:#ef5350') + '">' + t.type + '</td><td>' + t.iv.toFixed(1) + '</td><td style="' + dc + '">' + (diff >= 0 ? '+' : '') + diff.toFixed(1) + '</td><td>' + Math.round(Math.abs(t.delta)*100) + '</td><td>$' + t.notl.toFixed(1) + 'M</td><td>' + (t.spot > 0 ? t.spot.toFixed(4) : '-') + '</td></tr>';
+            });
+            h += '</table>';
+            document.getElementById('drill-content').innerHTML = h;
+            document.getElementById('drill-modal').classList.add('show');
+        });
+    };
+    setTimeout(check, 2000);
+})();
+
+// === DTCC EDIT MODE ===
+var dtccEditMode = false;
+(function injectEditToggle() {
+    var dpb = document.getElementById('dpb');
+    if (!dpb) { setTimeout(injectEditToggle, 500); return; }
+    var ctrls = dpb.parentElement.querySelector('div[style*="gap:10px"]');
+    if (!ctrls || document.getElementById('dtcc-edit-btn')) return;
+    var wrap = document.createElement('span');
+    wrap.style.cssText = 'display:flex;align-items:center;gap:4px;margin-left:12px';
+    wrap.innerHTML = '<button class="btn-toggle" id="dtcc-edit-btn" onclick="toggleDtccEdit()" style="border-color:#e65100;color:#e65100">Edit Mode</button>'
+        + '<button class="btn" id="dtcc-publish-btn" onclick="publishDtccEdits()" style="display:none;background:#2e7d32;color:white;font-size:11px;padding:5px 12px;border-radius:4px">Publish</button>';
+    ctrls.appendChild(wrap);
+})();
+
+function toggleDtccEdit() {
+    dtccEditMode = !dtccEditMode;
+    var btn = document.getElementById('dtcc-edit-btn');
+    var pub = document.getElementById('dtcc-publish-btn');
+    if (dtccEditMode) {
+        btn.className = 'btn-toggle active'; btn.style.borderColor = '#e65100'; btn.style.background = '#e65100'; btn.style.color = 'white';
+        if (pub) pub.style.display = 'inline-block';
+        renderDtccEditTable();
+    } else {
+        btn.className = 'btn-toggle'; btn.style.borderColor = '#e65100'; btn.style.background = ''; btn.style.color = '#e65100';
+        if (pub) pub.style.display = 'none';
+        document.getElementById('dsp').innerHTML = '';
+        Plotly.purge('dsp');
+        dRSurf();
+    }
+}
+
+function renderDtccEditTable() {
+    var pk = dAP, pd = mktSurfaces[pk];
+    if (!pd || !pd.tenors) return;
+    var h = '<div style="overflow-x:auto"><table class="vol-table"><tr><th>Tenor</th><th>ATM</th><th>25d RR</th><th>10d RR</th><th>25d Fly</th><th>10d Fly</th><th>Fwd Pts</th></tr>';
+    pd.tenors.forEach(function(t, i) {
+        h += '<tr><td>' + t.tenor + '</td>';
+        ['atm','rr25','rr10','fly25','fly10','fwdPts'].forEach(function(f) {
+            h += '<td><input type="number" step="0.01" value="' + (t[f] || 0).toFixed(2)
+                + '" data-pair="' + pk + '" data-ti="' + i + '" data-f="' + f
+                + '" onchange="dtccEditCell(this)" style="width:65px"></td>';
+        });
+        h += '</tr>';
+    });
+    h += '</table></div>';
+    document.getElementById('dsp').innerHTML = h;
+}
+
+function dtccEditCell(el) {
+    var pair = el.getAttribute('data-pair');
+    var ti = parseInt(el.getAttribute('data-ti'));
+    var f = el.getAttribute('data-f');
+    var v = parseFloat(el.value);
+    if (!isNaN(v) && mktSurfaces[pair] && mktSurfaces[pair].tenors[ti]) {
+        mktSurfaces[pair].tenors[ti][f] = v;
+    }
+}
+
+function publishDtccEdits() {
+    saveMarks();
+    dtccEditMode = false;
+    var btn = document.getElementById('dtcc-edit-btn');
+    var pub = document.getElementById('dtcc-publish-btn');
+    btn.className = 'btn-toggle'; btn.style.background = ''; btn.style.color = '#e65100';
+    if (pub) pub.style.display = 'none';
+    // Clear the edit table and restore Plotly div
+    document.getElementById('dsp').innerHTML = '';
+    Plotly.purge('dsp');
+    dBuildSurf(); dRA();
+    var st = document.getElementById('mkt-status');
+    if (st) st.textContent = 'Surface edits published at ' + new Date().toLocaleTimeString();
+}
+
+// === SAVE / LOAD MARKS ===
+// Inject Save Marks button next to Bloomberg button
+(function injectSaveBtn() {
+    var bbgBtn = document.getElementById('bbg-btn');
+    if (!bbgBtn) { setTimeout(injectSaveBtn, 500); return; }
+    if (document.getElementById('save-marks-btn')) return;
+    var btn = document.createElement('button');
+    btn.id = 'save-marks-btn';
+    btn.className = 'btn';
+    btn.style.cssText = 'background:#2e7d32;color:white;font-size:13px;padding:8px 18px;border-radius:6px;white-space:nowrap;margin-left:8px';
+    btn.textContent = '\uD83D\uDCBE Save Marks';
+    btn.onclick = saveMarks;
+    bbgBtn.parentNode.insertBefore(btn, bbgBtn.nextSibling);
+})();
+
+function saveMarks() {
+    var btn = document.getElementById('save-marks-btn');
+    var st = document.getElementById('mkt-status');
+    if (btn) { btn.disabled = true; btn.textContent = 'Saving...'; btn.style.opacity = '0.6'; }
+    var output = {source: 'dashboard_marks', timestamp: new Date().toISOString(), surfaces: {}};
+    Object.keys(mktSurfaces).forEach(function(pair) {
+        var pd = mktSurfaces[pair];
+        if (!pd || !pd.tenors) return;
+        output.surfaces[pair] = {
+            spot: pd.spot, r_d: pd.r_d, r_f: pd.r_f,
+            tenors: pd.tenors.map(function(t) {
+                return {tenor: t.tenor, T: t.T, atm: t.atm, rr25: t.rr25, rr10: t.rr10,
+                        fly25: t.fly25, fly10: t.fly10, fwdPts: t.fwdPts};
+            })
+        };
+    });
+    fetch('/api/save_marks', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(output)
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        if (st) st.textContent = 'Marks saved (' + Object.keys(output.surfaces).length + ' pairs) at ' + new Date().toLocaleTimeString();
+        if (btn) { btn.disabled = false; btn.textContent = '\uD83D\uDCBE Save Marks'; btn.style.opacity = '1'; }
+    })
+    .catch(function(err) {
+        if (st) st.textContent = 'Save failed: ' + err.message;
+        if (btn) { btn.disabled = false; btn.textContent = '\uD83D\uDCBE Save Marks'; btn.style.opacity = '1'; }
+    });
+}
+
+// Auto-load saved marks on startup
+(function loadSavedMarks() {
+    fetch('/api/load_marks')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        var surfs = data.surfaces || {};
+        var count = 0;
+        Object.keys(surfs).forEach(function(pair) {
+            var s = surfs[pair];
+            if (!s.spot && !s.tenors) return;
+            mktSurfaces[pair] = {spot: s.spot || 1.0, r_d: s.r_d || 0.04, r_f: s.r_f || 0.02, _pair: pair, tenors: []};
+            var tnList = s.tenors || [];
+            TENORS.forEach(function(tn, ti) {
+                var src = tnList.find(function(t) { return t.tenor === tn; }) || {};
+                mktSurfaces[pair].tenors.push({
+                    tenor: tn, T: TENOR_T[ti], atm: src.atm || 0, rr25: src.rr25 || 0,
+                    rr10: src.rr10 || 0, fly25: src.fly25 || 0, fly10: src.fly10 || 0, fwdPts: src.fwdPts || 0
+                });
+            });
+            count++;
+        });
+        if (count > 0) {
+            activeMktPair = Object.keys(mktSurfaces)[0];
+            renderMktTabs(); renderMktContent();
+            var st = document.getElementById('mkt-status');
+            if (st) st.textContent = 'Loaded ' + count + ' saved marks';
+            console.log('Loaded ' + count + ' saved marks from server');
+        }
+    })
+    .catch(function() { console.log('No saved marks found'); });
+})();
+
+// === TOAST ALERTS for trades > 1 vol off marks ===
+(function injectToastCSS() {
+    var style = document.createElement('style');
+    style.textContent = '#toast-container{position:fixed;top:60px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:350px}'
+        + '.toast{background:#2d2d2d;border-left:4px solid #ef5350;border-radius:6px;padding:10px 14px;color:#e0e0e0;font-size:12px;box-shadow:0 4px 12px rgba(0,0,0,0.5);pointer-events:auto;animation:toastIn 0.3s ease-out;opacity:1;transition:opacity 0.5s}'
+        + '.toast.warn{border-left-color:#ffa726}'
+        + '.toast .toast-pair{font-weight:700;color:#90caf9;margin-right:6px}'
+        + '.toast .toast-vol{font-weight:700}'
+        + '.toast .toast-vol.rich{color:#ef5350}.toast .toast-vol.cheap{color:#42a5f5}'
+        + '@keyframes toastIn{from{transform:translateX(100px);opacity:0}to{transform:translateX(0);opacity:1}}';
+    document.head.appendChild(style);
+    var c = document.createElement('div');
+    c.id = 'toast-container';
+    document.body.appendChild(c);
+})();
+
+var _toastSeen = {};  // track dissem IDs to avoid repeat toasts
+function showToast(html, ttl) {
+    var c = document.getElementById('toast-container');
+    if (!c) return;
+    var t = document.createElement('div');
+    t.className = 'toast';
+    t.innerHTML = html;
+    c.appendChild(t);
+    setTimeout(function() { t.style.opacity = '0'; setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 500); }, ttl || 8000);
+    // Keep max 5 toasts
+    while (c.children.length > 5) c.removeChild(c.firstChild);
+}
+
+// Wrap dProcTrades to detect new alerts
+var _dProcTradesForToast = typeof dProcTrades === 'function' ? dProcTrades : null;
+dProcTrades = function(trades) {
+    _dProcTradesForToast(trades);
+    // Check for trades with large vol diff from marks
+    trades.forEach(function(t) {
+        var did = t._did || t.dissem_id || (t.pair + t.strike + t.time);
+        if (_toastSeen[did]) return;
+        var pk = DPA[t.pair]; if (!pk) return;
+        var pd = mktSurfaces[pk]; if (!pd || !pd.tenors) return;
+        var days = parseInt(t.days) || 0; if (days <= 0) return;
+        // Find matching trade in dAT to get its IV
+        var matches = (dAT[pk] || []).filter(function(at) {
+            return Math.abs(at.strike - parseFloat(t.strike)) < 0.001 && at.time === t.time;
+        });
+        if (!matches.length) return;
+        var mt = matches[0];
+        // Find closest tenor mark
+        var tnrs = pd.tenors, bestTi = 0, bestDist = 9999;
+        for (var ti = 0; ti < tnrs.length; ti++) {
+            var dist = Math.abs(tnrs[ti].T * 365 - days);
+            if (dist < bestDist) { bestDist = dist; bestTi = ti; }
+        }
+        var base = dtccGetBase(pk, tnrs[bestTi].tenor);
+        if (!base) return;
+        var di = dDB(mt.delta);
+        var markVol = base.vols[di];
+        var diff = mt.iv - markVol;
+        if (Math.abs(diff) >= 1.0) {
+            _toastSeen[did] = true;
+            var dir = diff > 0 ? 'RICH' : 'CHEAP';
+            var cls = diff > 0 ? 'rich' : 'cheap';
+            var kTxt = mt.strike >= 1000 ? mt.strike.toFixed(0) : mt.strike < 10 ? mt.strike.toFixed(4) : mt.strike.toFixed(2);
+            var notlR = Math.round(mt.notl * 2) / 2;
+            showToast(
+                '<span class="toast-pair">' + pk + '</span>'
+                + mt.type + ' ' + kTxt + ' ' + (mt.expiry || '').slice(5)
+                + ' $' + notlR.toFixed(1) + 'M'
+                + '<br><span class="toast-vol ' + cls + '">'
+                + mt.iv.toFixed(1) + '% (' + (diff > 0 ? '+' : '') + diff.toFixed(1) + ' ' + dir + ')</span>'
+                + ' vs mark ' + markVol.toFixed(1) + '%',
+                10000
+            );
+        }
+    });
+};
+
+// === TOAST ALERTS for trades >1 vol off marks ===
+(function initToasts() {
+    // Inject toast container CSS
+    var style = document.createElement('style');
+    style.textContent = '#toast-container{position:fixed;top:60px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:6px;max-height:50vh;overflow-y:auto;pointer-events:none}'
+        + '.toast{pointer-events:auto;background:#3d3d3d;border-left:4px solid #ef5350;border-radius:4px;padding:8px 14px;box-shadow:0 4px 12px rgba(0,0,0,0.4);font-size:12px;color:#e0e0e0;min-width:260px;max-width:360px;animation:toastIn 0.3s ease;cursor:pointer}'
+        + '.toast:hover{background:#4a4a4a}'
+        + '.toast .t-pair{font-weight:700;color:#90caf9}.toast .t-vol{font-weight:700}.toast .t-rich{color:#ef5350}.toast .t-cheap{color:#42a5f5}'
+        + '@keyframes toastIn{from{opacity:0;transform:translateX(80px)}to{opacity:1;transform:translateX(0)}}';
+    document.head.appendChild(style);
+    // Create container
+    var c = document.createElement('div');
+    c.id = 'toast-container';
+    document.body.appendChild(c);
+})();
+
+var _lastToastTrades = {};  // track by _did to avoid re-alerting
+function showTradeToast(pair, trade, diff, markVol) {
+    var did = trade.time + trade.strike;
+    if (_lastToastTrades[did]) return;
+    _lastToastTrades[did] = true;
+    var container = document.getElementById('toast-container');
+    if (!container) return;
+    var dir = diff > 0 ? 'RICH' : 'CHEAP';
+    var cls = diff > 0 ? 't-rich' : 't-cheap';
+    var kTxt = trade.strike >= 1000 ? trade.strike.toFixed(0) : trade.strike < 10 ? trade.strike.toFixed(4) : trade.strike.toFixed(2);
+    var toast = document.createElement('div');
+    toast.className = 'toast';
+    toast.innerHTML = '<span class="t-pair">' + pair + '</span> '
+        + '<span class="' + cls + '">' + dir + ' ' + (diff > 0 ? '+' : '') + diff.toFixed(1) + 'v</span><br>'
+        + '<span style="color:#aaa">K=' + kTxt + ' ' + trade.type + ' '
+        + trade.iv.toFixed(1) + '% (mark ' + markVol.toFixed(1) + '%) $' + trade.notl.toFixed(0) + 'M '
+        + trade.time + '</span>';
+    toast.onclick = function() { toast.remove(); };
+    container.appendChild(toast);
+    // Auto-remove after 12 seconds
+    setTimeout(function() { if (toast.parentNode) toast.remove(); }, 12000);
+    // Keep max 8 toasts
+    while (container.children.length > 8) container.removeChild(container.firstChild);
+}
+
+// Hook into dProcTrades to fire toasts for big deviations
+var _origDProcTradesForToast = typeof dProcTrades === 'function' ? dProcTrades : null;
+if (_origDProcTradesForToast) {
+    var _wrappedDProcTrades = dProcTrades;
+    dProcTrades = function(trades) {
+        _wrappedDProcTrades(trades);
+        // After processing, check all trades for big diffs and toast
+        var allPairs = DTCC_G10.concat(DTCC_EM);
+        allPairs.forEach(function(pk) {
+            var tr = dAT[pk] || [];
+            if (!tr.length || !mktSurfaces[pk] || !mktSurfaces[pk].tenors) return;
+            tr.forEach(function(t) {
+                var tnrs = mktSurfaces[pk].tenors, bestTi = 0, bestDist = 9999;
+                for (var ti = 0; ti < tnrs.length; ti++) {
+                    var dist = Math.abs(tnrs[ti].T * 365 - t.days);
+                    if (dist < bestDist) { bestDist = dist; bestTi = ti; }
+                }
+                var base = dtccGetBase(pk, tnrs[bestTi].tenor);
+                if (!base) return;
+                var di = dDB(t.delta);
+                var markVol = base.vols[di];
+                var diff = t.iv - markVol;
+                if (Math.abs(diff) >= 1.0) {
+                    showTradeToast(pk, t, diff, markVol);
+                }
+            });
+        });
+    };
+}
 
 console.log('mathfix.js: all overrides applied');
 """
@@ -847,13 +1428,19 @@ class DTCCReader:
 # BLOOMBERG SURFACES + LIVE SPOTS
 # ==============================================================
 BBG_TENORS = [
-    {'label':'O/N','bbg':'ON','T':1/365},{'label':'1W','bbg':'1W','T':7/365},
-    {'label':'2W','bbg':'2W','T':14/365},{'label':'1M','bbg':'1M','T':1/12},
-    {'label':'2M','bbg':'2M','T':2/12},{'label':'3M','bbg':'3M','T':3/12},
-    {'label':'6M','bbg':'6M','T':6/12},{'label':'9M','bbg':'9M','T':9/12},
-    {'label':'1Y','bbg':'1Y','T':1.0},{'label':'2Y','bbg':'2Y','T':2.0},
+    {'label':'O/N','bbg':'ON','bbg_fwd':'ON','T':1/365},
+    {'label':'1W','bbg':'1W','bbg_fwd':'1W','T':7/365},
+    {'label':'2W','bbg':'2W','bbg_fwd':'2W','T':14/365},
+    {'label':'1M','bbg':'1M','bbg_fwd':'1M','T':1/12},
+    {'label':'2M','bbg':'2M','bbg_fwd':'2M','T':2/12},
+    {'label':'3M','bbg':'3M','bbg_fwd':'3M','T':3/12},
+    {'label':'6M','bbg':'6M','bbg_fwd':'6M','T':6/12},
+    {'label':'9M','bbg':'9M','bbg_fwd':'9M','T':9/12},
+    {'label':'1Y','bbg':'1Y','bbg_fwd':'12M','T':1.0},
+    {'label':'2Y','bbg':'2Y','bbg_fwd':'2Y','T':2.0},
 ]
 BBG_PAIRS = {
+    # G10
     'EURUSD':{'spot':'EURUSD Curncy','vol':'EURUSDV','rr25':'EURUSD25R','rr10':'EURUSD10R','fly25':'EURUSD25B','fly10':'EURUSD10B','fwd':'EUR'},
     'USDJPY':{'spot':'USDJPY Curncy','vol':'USDJPYV','rr25':'USDJPY25R','rr10':'USDJPY10R','fly25':'USDJPY25B','fly10':'USDJPY10B','fwd':'JPY'},
     'GBPUSD':{'spot':'GBPUSD Curncy','vol':'GBPUSDV','rr25':'GBPUSD25R','rr10':'GBPUSD10R','fly25':'GBPUSD25B','fly10':'GBPUSD10B','fwd':'GBP'},
@@ -861,10 +1448,40 @@ BBG_PAIRS = {
     'AUDUSD':{'spot':'AUDUSD Curncy','vol':'AUDUSDV','rr25':'AUDUSD25R','rr10':'AUDUSD10R','fly25':'AUDUSD25B','fly10':'AUDUSD10B','fwd':'AUD'},
     'NZDUSD':{'spot':'NZDUSD Curncy','vol':'NZDUSDV','rr25':'NZDUSD25R','rr10':'NZDUSD10R','fly25':'NZDUSD25B','fly10':'NZDUSD10B','fwd':'NZD'},
     'USDCAD':{'spot':'USDCAD Curncy','vol':'USDCADV','rr25':'USDCAD25R','rr10':'USDCAD10R','fly25':'USDCAD25B','fly10':'USDCAD10B','fwd':'CAD'},
+    'USDSEK':{'spot':'USDSEK Curncy','vol':'USDSEKV','rr25':'USDSEK25R','rr10':'USDSEK10R','fly25':'USDSEK25B','fly10':'USDSEK10B','fwd':'SEK'},
+    'USDNOK':{'spot':'USDNOK Curncy','vol':'USDNOKV','rr25':'USDNOK25R','rr10':'USDNOK10R','fly25':'USDNOK25B','fly10':'USDNOK10B','fwd':'NOK'},
+    'EURGBP':{'spot':'EURGBP Curncy','vol':'EURGBPV','rr25':'EURGBP25R','rr10':'EURGBP10R','fly25':'EURGBP25B','fly10':'EURGBP10B','fwd':'EURGBP'},
+    'EURJPY':{'spot':'EURJPY Curncy','vol':'EURJPYV','rr25':'EURJPY25R','rr10':'EURJPY10R','fly25':'EURJPY25B','fly10':'EURJPY10B','fwd':'EURJPY'},
+    'GBPJPY':{'spot':'GBPJPY Curncy','vol':'GBPJPYV','rr25':'GBPJPY25R','rr10':'GBPJPY10R','fly25':'GBPJPY25B','fly10':'GBPJPY10B','fwd':'GBPJPY'},
+    'EURCHF':{'spot':'EURCHF Curncy','vol':'EURCHFV','rr25':'EURCHF25R','rr10':'EURCHF10R','fly25':'EURCHF25B','fly10':'EURCHF10B','fwd':'EURCHF'},
+    'AUDJPY':{'spot':'AUDJPY Curncy','vol':'AUDJPYV','rr25':'AUDJPY25R','rr10':'AUDJPY10R','fly25':'AUDJPY25B','fly10':'AUDJPY10B','fwd':'AUDJPY'},
+    # EM
+    'USDMXN':{'spot':'USDMXN Curncy','vol':'USDMXNV','rr25':'USDMXN25R','rr10':'USDMXN10R','fly25':'USDMXN25B','fly10':'USDMXN10B','fwd':'MXN'},
+    'USDBRL':{'spot':'USDBRL Curncy','vol':'USDBRLV','rr25':'USDBRL25R','rr10':'USDBRL10R','fly25':'USDBRL25B','fly10':'USDBRL10B','fwd':'BRL'},
+    'USDTRY':{'spot':'USDTRY Curncy','vol':'USDTRYV','rr25':'USDTRY25R','rr10':'USDTRY10R','fly25':'USDTRY25B','fly10':'USDTRY10B','fwd':'TRY'},
+    'USDZAR':{'spot':'USDZAR Curncy','vol':'USDZARV','rr25':'USDZAR25R','rr10':'USDZAR10R','fly25':'USDZAR25B','fly10':'USDZAR10B','fwd':'ZAR'},
+    'USDCNH':{'spot':'USDCNH Curncy','vol':'USDCNHV','rr25':'USDCNH25R','rr10':'USDCNH10R','fly25':'USDCNH25B','fly10':'USDCNH10B','fwd':'CNH'},
+    'USDINR':{'spot':'USDINR Curncy','vol':'USDINRV','rr25':'USDINR25R','rr10':'USDINR10R','fly25':'USDINR25B','fly10':'USDINR10B','fwd':'INR'},
+    'USDKRW':{'spot':'USDKRW Curncy','vol':'USDKRWV','rr25':'USDKRW25R','rr10':'USDKRW10R','fly25':'USDKRW25B','fly10':'USDKRW10B','fwd':'KRW'},
+    'USDSGD':{'spot':'USDSGD Curncy','vol':'USDSGDV','rr25':'USDSGD25R','rr10':'USDSGD10R','fly25':'USDSGD25B','fly10':'USDSGD10B','fwd':'SGD'},
+    'USDTWD':{'spot':'USDTWD Curncy','vol':'USDTWDV','rr25':'USDTWD25R','rr10':'USDTWD10R','fly25':'USDTWD25B','fly10':'USDTWD10B','fwd':'TWD'},
+    'USDPHP':{'spot':'USDPHP Curncy','vol':'USDPHPV','rr25':'USDPHP25R','rr10':'USDPHP10R','fly25':'USDPHP25B','fly10':'USDPHP10B','fwd':'PHP'},
+    'USDIDR':{'spot':'USDIDR Curncy','vol':'USDIDRV','rr25':'USDIDR25R','rr10':'USDIDR10R','fly25':'USDIDR25B','fly10':'USDIDR10B','fwd':'IDR'},
+    'USDTHB':{'spot':'USDTHB Curncy','vol':'USDTHBV','rr25':'USDTHB25R','rr10':'USDTHB10R','fly25':'USDTHB25B','fly10':'USDTHB10B','fwd':'THB'},
+    'USDHKD':{'spot':'USDHKD Curncy','vol':'USDHKDV','rr25':'USDHKD25R','rr10':'USDHKD10R','fly25':'USDHKD25B','fly10':'USDHKD10B','fwd':'HKD'},
+    'AUDNZD':{'spot':'AUDNZD Curncy','vol':'AUDNZDV','rr25':'AUDNZD25R','rr10':'AUDNZD10R','fly25':'AUDNZD25B','fly10':'AUDNZD10B','fwd':'AUDNZD'},
+    'USDCLP':{'spot':'USDCLP Curncy','vol':'USDCLPV','rr25':'USDCLP25R','rr10':'USDCLP10R','fly25':'USDCLP25B','fly10':'USDCLP10B','fwd':'CLP'},
+    'USDCOP':{'spot':'USDCOP Curncy','vol':'USDCOPV','rr25':'USDCOP25R','rr10':'USDCOP10R','fly25':'USDCOP25B','fly10':'USDCOP10B','fwd':'COP'},
+    'USDPEN':{'spot':'USDPEN Curncy','vol':'USDPENV','rr25':'USDPEN25R','rr10':'USDPEN10R','fly25':'USDPEN25B','fly10':'USDPEN10B','fwd':'PEN'},
     'USDILS':{'spot':'USDILS Curncy','vol':'USDILSV','rr25':'USDILS25R','rr10':'USDILS10R','fly25':'USDILS25B','fly10':'USDILS10B','fwd':'ILS'},
     'EURILS':{'spot':'EURILS Curncy','vol':'EURILSV','rr25':'EURILS25R','rr10':'EURILS10R','fly25':'EURILS25B','fly10':'EURILS10B','fwd':'EURILS'},
 }
-DEFAULT_RATES = {'USD':0.045,'EUR':0.025,'GBP':0.044,'JPY':0.005,'CHF':0.015,'AUD':0.035,'NZD':0.04,'CAD':0.035,'ILS':0.045}
+DEFAULT_RATES = {
+    'USD':0.045,'EUR':0.025,'GBP':0.044,'JPY':0.005,'CHF':0.015,'AUD':0.035,'NZD':0.04,'CAD':0.035,
+    'SEK':0.03,'NOK':0.035,'MXN':0.1,'BRL':0.12,'TRY':0.4,'ZAR':0.08,'CNH':0.025,
+    'INR':0.065,'KRW':0.03,'SGD':0.03,'TWD':0.015,'IDR':0.06,'PHP':0.055,'THB':0.02,
+    'ILS':0.045,'HKD':0.045,'CLP':0.06,'COP':0.1,'PEN':0.06,
+}
 
 def pull_bbg_surfaces(pairs=None):
     import math
@@ -906,8 +1523,9 @@ def pull_bbg_surfaces(pairs=None):
         tickers = [cfg['spot']]
         for tn in BBG_TENORS:
             b = tn['bbg']
+            bf = tn['bbg_fwd']  # 1Y uses '12M' for fwd points
             tickers += [f"{cfg['vol']}{b} Curncy",f"{cfg['rr25']}{b} Curncy",f"{cfg['rr10']}{b} Curncy",
-                        f"{cfg['fly25']}{b} Curncy",f"{cfg['fly10']}{b} Curncy",f"{cfg['fwd']}{b} Curncy"]
+                        f"{cfg['fly25']}{b} Curncy",f"{cfg['fly10']}{b} Curncy",f"{cfg['fwd']}{bf} Curncy"]
         req = svc.createRequest("ReferenceDataRequest")
         for t in tickers: req.getElement("securities").appendValue(t)
         req.getElement("fields").appendValue("PX_LAST"); session.sendRequest(req)
@@ -935,10 +1553,11 @@ def pull_bbg_surfaces(pairs=None):
         td = []
         for tn in BBG_TENORS:
             b = tn['bbg']
+            bf = tn['bbg_fwd']
             atm=data.get(f"{cfg['vol']}{b} Curncy",0)
             rr25=data.get(f"{cfg['rr25']}{b} Curncy",0); rr10=data.get(f"{cfg['rr10']}{b} Curncy",0)
             fly25=data.get(f"{cfg['fly25']}{b} Curncy",0); fly10=data.get(f"{cfg['fly10']}{b} Curncy",0)
-            fwdPts=data.get(f"{cfg['fwd']}{b} Curncy",0)
+            fwdPts=data.get(f"{cfg['fwd']}{bf} Curncy",0)
             if fly10==0 and fly25!=0: fly10=fly25*3.6
             if rr10==0 and rr25!=0: rr10=rr25*1.925
             if atm>0:
@@ -979,6 +1598,164 @@ def pull_bbg_surfaces(pairs=None):
 
     session.stop()
     return {'source':'Bloomberg','timestamp':datetime.now().isoformat(),'surfaces':surfaces}
+
+
+def get_bbg_hist_spot(pair, date_str, time_str=''):
+    """Get historical spot from Bloomberg for a pair at a given date/time."""
+    try:
+        import blpapi
+    except ImportError:
+        return {'error': 'blpapi not installed', 'spot': 0}
+    
+    ticker = f"{pair} Curncy"
+    opts = blpapi.SessionOptions()
+    opts.setServerHost("localhost"); opts.setServerPort(8194)
+    session = blpapi.Session(opts)
+    if not session.start():
+        return {'error': 'Cannot connect to Bloomberg', 'spot': 0}
+    if not session.openService("//blp/refdata"):
+        session.stop()
+        return {'error': 'Cannot open refdata', 'spot': 0}
+    
+    svc = session.getService("//blp/refdata")
+    
+    if time_str:
+        # Intraday: use IntradayBarRequest for the specific time
+        req = svc.createRequest("IntradayBarRequest")
+        req.set("security", ticker)
+        req.set("eventType", "TRADE")
+        req.set("interval", 1)  # 1 minute bars
+        # Parse date and time
+        dt_start = f"{date_str}T{time_str}:00"
+        dt_end = f"{date_str}T{time_str}:59"
+        req.set("startDateTime", dt_start)
+        req.set("endDateTime", dt_end)
+        session.sendRequest(req)
+        spot = 0
+        while True:
+            ev = session.nextEvent(5000)
+            for msg in ev:
+                if msg.hasElement("barData"):
+                    bd = msg.getElement("barData")
+                    if bd.hasElement("barTickData"):
+                        bars = bd.getElement("barTickData")
+                        if bars.numValues() > 0:
+                            last_bar = bars.getValueAsElement(bars.numValues() - 1)
+                            if last_bar.hasElement("close"):
+                                spot = last_bar.getElementAsFloat("close")
+            if ev.eventType() == blpapi.Event.RESPONSE:
+                break
+        session.stop()
+        return {'pair': pair, 'date': date_str, 'time': time_str, 'spot': spot}
+    else:
+        # End of day: use HistoricalDataRequest
+        req = svc.createRequest("HistoricalDataRequest")
+        req.getElement("securities").appendValue(ticker)
+        req.getElement("fields").appendValue("PX_LAST")
+        req.set("startDate", date_str.replace('-', ''))
+        req.set("endDate", date_str.replace('-', ''))
+        session.sendRequest(req)
+        spot = 0
+        while True:
+            ev = session.nextEvent(5000)
+            for msg in ev:
+                if msg.hasElement("securityData"):
+                    sd = msg.getElement("securityData")
+                    if sd.hasElement("fieldData"):
+                        fd = sd.getElement("fieldData")
+                        if fd.numValues() > 0:
+                            row = fd.getValueAsElement(0)
+                            if row.hasElement("PX_LAST"):
+                                spot = row.getElementAsFloat("PX_LAST")
+            if ev.eventType() == blpapi.Event.RESPONSE:
+                break
+        session.stop()
+        return {'pair': pair, 'date': date_str, 'spot': spot}
+
+
+def fetch_bbg_hist_spots(pair, dates_str='', date_str='', time_str=''):
+    """Fetch historical spot prices from Bloomberg.
+    Can request:
+      - Multiple dates: dates=2026-03-26,2026-03-25 (closing prices)
+      - Single date+time: date=2026-03-26&time=14:30 (intraday)
+    Returns {spots: {datetime_str: price, ...}}
+    """
+    try:
+        import blpapi
+    except ImportError:
+        return {'error': 'blpapi not installed', 'spots': {}}
+
+    ticker = f"{pair} Curncy"
+    opts = blpapi.SessionOptions()
+    opts.setServerHost("localhost"); opts.setServerPort(8194)
+    session = blpapi.Session(opts)
+    if not session.start():
+        return {'error': 'Cannot connect to Bloomberg', 'spots': {}}
+    if not session.openService("//blp/refdata"):
+        session.stop()
+        return {'error': 'Cannot open refdata', 'spots': {}}
+
+    svc = session.getService("//blp/refdata")
+    spots = {}
+
+    if dates_str:
+        # Multiple dates — use HistoricalDataRequest
+        date_list = [d.strip() for d in dates_str.split(',') if d.strip()]
+        if not date_list:
+            session.stop()
+            return {'error': 'No dates provided', 'spots': {}}
+
+        req = svc.createRequest("HistoricalDataRequest")
+        req.getElement("securities").appendValue(ticker)
+        req.getElement("fields").appendValue("PX_LAST")
+        req.set("startDate", min(date_list).replace('-', ''))
+        req.set("endDate", max(date_list).replace('-', ''))
+        req.set("periodicitySelection", "DAILY")
+        session.sendRequest(req)
+
+        while True:
+            ev = session.nextEvent(5000)
+            for msg in ev:
+                if msg.hasElement("securityData"):
+                    sd = msg.getElement("securityData")
+                    if sd.hasElement("fieldData"):
+                        fd = sd.getElement("fieldData")
+                        for i in range(fd.numValues()):
+                            row = fd.getValueAsElement(i)
+                            if row.hasElement("date") and row.hasElement("PX_LAST"):
+                                dt = str(row.getElementAsString("date"))
+                                px = row.getElementAsFloat("PX_LAST")
+                                spots[dt] = px
+            if ev.eventType() == blpapi.Event.RESPONSE:
+                break
+
+    elif date_str:
+        # Single date — get closing price via HistoricalDataRequest
+        req = svc.createRequest("HistoricalDataRequest")
+        req.getElement("securities").appendValue(ticker)
+        req.getElement("fields").appendValue("PX_LAST")
+        req.set("startDate", date_str.replace('-', ''))
+        req.set("endDate", date_str.replace('-', ''))
+        req.set("periodicitySelection", "DAILY")
+        session.sendRequest(req)
+
+        while True:
+            ev = session.nextEvent(5000)
+            for msg in ev:
+                if msg.hasElement("securityData"):
+                    sd = msg.getElement("securityData")
+                    if sd.hasElement("fieldData"):
+                        fd = sd.getElement("fieldData")
+                        for i in range(fd.numValues()):
+                            row = fd.getValueAsElement(i)
+                            if row.hasElement("PX_LAST"):
+                                spots[date_str] = row.getElementAsFloat("PX_LAST")
+            if ev.eventType() == blpapi.Event.RESPONSE:
+                break
+
+    session.stop()
+    log(f"BBG hist spot {pair}: {len(spots)} data points")
+    return {'pair': pair, 'spots': spots}
 
 
 class BBGSpotStreamer:
@@ -1188,6 +1965,23 @@ class Handler(SimpleHTTPRequestHandler):
         else:
             super().do_GET()
 
+    def do_POST(self):
+        if self.path == '/api/save_marks':
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length)
+                data = json.loads(body)
+                marks_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'saved_marks.json')
+                with open(marks_file, 'w') as f:
+                    json.dump(data, f, indent=2)
+                log(f"Marks saved: {len(data.get('surfaces', {}))} pairs -> saved_marks.json")
+                self._json({'ok': True, 'pairs': len(data.get('surfaces', {}))})
+            except Exception as e:
+                log(f"Save marks error: {e}")
+                self._json({'ok': False, 'error': str(e)})
+        else:
+            self.send_error(404)
+
     def _api(self):
         p = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(p.query)
@@ -1228,6 +2022,31 @@ class Handler(SimpleHTTPRequestHandler):
                 })
             else:
                 self._json({'spots': {}, 'fwd_pts': {}, 'rates': {}, 'streaming': False})
+
+        elif p.path == '/api/bbg_hist_spot':
+            # Fetch historical spot for a pair at specific datetimes
+            # Usage: /api/bbg_hist_spot?pair=EURUSD&dates=2026-03-26,2026-03-25
+            # or: /api/bbg_hist_spot?pair=EURUSD&date=2026-03-26&time=14:30
+            try:
+                pair = q.get('pair', [''])[0].upper().replace('/','')
+                dates = q.get('dates', [''])[0]
+                date = q.get('date', [''])[0]
+                tm = q.get('time', [''])[0]
+                result = fetch_bbg_hist_spots(pair, dates, date, tm)
+                self._json(result)
+            except Exception as e:
+                self._json({'error': str(e), 'spots': {}})
+
+        elif p.path == '/api/load_marks':
+            marks_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'saved_marks.json')
+            if os.path.exists(marks_file):
+                try:
+                    with open(marks_file, 'r') as f:
+                        self._json(json.load(f))
+                except Exception as e:
+                    self._json({'error': str(e), 'surfaces': {}})
+            else:
+                self._json({'surfaces': {}})
 
         elif p.path == '/api/status' and _dtcc:
             self._json(_dtcc.stats)
