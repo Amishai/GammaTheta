@@ -316,39 +316,76 @@ dRFeed = function() {
     setTimeout(pollBBG, 1500);
 })();
 
-// === DAMPER: blend DTCC prints with your marks ===
-var DTCC_DAMPER = 0.25;
-var dCS_raw = {};  // raw DTCC surface BEFORE damping (for alerts)
-var dStratView = 'marks';  // 'marks' or 'adjusted'
+// === DTCC WEIGHT (combined damper + markup scaler) ===
+// Single slider controlling how much weight DTCC prints get vs your marks.
+// Applied as a scaler on the raw IV diff: scaled_iv = mark + weight*(raw_iv - mark)
+// Same weight is used to blend DTCC surface into displayed heatmap.
+// 0% = ignore DTCC entirely (pure marks, no alerts fire)
+// 50% = treat half the vol diff as real signal (default)
+// 100% = fully trust DTCC prints, no markup correction
+var DTCC_WEIGHT = 0.5;
+// Back-compat aliases so existing code keeps working
+var DTCC_DAMPER = DTCC_WEIGHT;
+var MARKUP_SCALER = DTCC_WEIGHT;
+var dCS_raw = {};
+var dStratView = 'marks';
 
-// Inject damper slider
-(function injectDamper() {
+function setDtccWeight(v) {
+    DTCC_WEIGHT = v;
+    DTCC_DAMPER = v;
+    MARKUP_SCALER = v;
+    var pct = Math.round(v * 100);
+    var el = document.getElementById('dtcc-weight-val');
+    if (el) el.textContent = pct + '%';
+    dBuildSurf(); dRA();
+}
+
+(function injectControls() {
     var dpb = document.getElementById('dpb');
-    if (!dpb) { setTimeout(injectDamper, 500); return; }
+    if (!dpb) { setTimeout(injectControls, 500); return; }
     var ctrls = dpb.parentElement.querySelector('div[style*="gap:10px"]');
-    if (!ctrls) { setTimeout(injectDamper, 500); return; }
+    if (!ctrls) { setTimeout(injectControls, 500); return; }
+    if (document.getElementById('dtcc-weight')) return;
     var d = document.createElement('span');
     d.style.cssText = 'display:flex;align-items:center;gap:4px;margin-left:8px';
-    d.innerHTML = '<span style="font-size:11px;color:#888">Damper</span>'
-        + '<input type="range" min="0" max="100" value="25" id="dtcc-damper" '
-        + 'style="width:60px;accent-color:#90caf9" oninput="DTCC_DAMPER=this.value/100;'
-        + 'document.getElementById(\'dtcc-damper-val\').textContent=this.value+\'%\';'
-        + 'dBuildSurf();dRA();">'
-        + '<span id="dtcc-damper-val" style="font-size:11px;color:#90caf9;min-width:30px">25%</span>';
+    d.innerHTML = '<span style="font-size:11px;color:#888" title="How much weight to give DTCC prints vs your marks. 0% = pure marks. 50% = treat half the vol diff as real signal (accounts for sales margin in DTCC premiums). 100% = fully trust DTCC.">DTCC Weight</span>'
+        + '<input type="range" min="0" max="100" value="50" id="dtcc-weight" '
+        + 'style="width:80px;accent-color:#ffa726" oninput="setDtccWeight(this.value/100)">'
+        + '<span id="dtcc-weight-val" style="font-size:11px;color:#ffa726;min-width:30px">50%</span>';
     ctrls.appendChild(d);
 })();
 
-// Override dBuildSurf: save raw, then apply damper
+// Helper: apply weight to a raw DTCC IV given the corresponding mark
+function _applyScaler(rawIV, markVol) {
+    if (markVol === null || markVol === undefined) return rawIV;
+    return markVol + DTCC_WEIGHT * (rawIV - markVol);
+}
+
+// Override dBuildSurf: save raw, apply markup scaler, then apply damper
 var _origDBuildSurf = typeof dBuildSurf === 'function' ? dBuildSurf : null;
 if (_origDBuildSurf) {
     dBuildSurf = function() {
         _origDBuildSurf();
-        // Save raw DTCC surface before damping
+        // Apply markup scaler FIRST — pulls raw DTCC values toward marks
+        DTCC_G10.concat(DTCC_EM).forEach(function(pair) {
+            var raw = dCS[pair];
+            if (!raw) return;
+            for (var ti = 0; ti < DT.length; ti++) {
+                if (!raw[ti]) continue;
+                var base = dtccGetBase(pair, DT[ti]);
+                if (!base) continue;
+                for (var di = 0; di < 5; di++) {
+                    if (raw[ti][di] === null) continue;
+                    raw[ti][di] = _applyScaler(raw[ti][di], base.vols[di]);
+                }
+            }
+        });
+        // Save scaled surface (used by alerts, table diffs, drilldown)
         dCS_raw = {};
         DTCC_G10.concat(DTCC_EM).forEach(function(pair) {
             if (dCS[pair]) dCS_raw[pair] = dCS[pair].map(function(r) { return r.slice(); });
         });
-        // Apply damper: displayed = marks*(1-alpha) + dtcc_raw*alpha
+        // Apply damper: displayed = marks*(1-alpha) + scaled_dtcc*alpha
         var alpha = DTCC_DAMPER;
         DTCC_G10.concat(DTCC_EM).forEach(function(pair) {
             var raw = dCS[pair];
@@ -377,21 +414,37 @@ dRSurf = function() {
     }
 
     // Build marks surface [ti][di] and track which cells have DTCC data
-    var marks = [], alerts = [];
+    // Build trade-level alerts: each trade contributes ONLY to its (closest_tenor, delta_bucket) cell
+    // Alert level = max deviation seen across trades in that exact cell (using scaled IV)
+    var marks = [], alerts = [], maxDiff = [];
     for (var ti = 0; ti < DT.length; ti++) {
         var base = dtccGetBase(pk, DT[ti]);
         marks[ti] = base ? base.vols.slice() : [null, null, null, null, null];
-        alerts[ti] = [0, 0, 0, 0, 0];  // 0=none, 1=yellow(>0.5), 2=red(>1.0)
-        if (base && raw && raw[ti]) {
-            for (var di = 0; di < 5; di++) {
-                if (raw[ti][di] !== null && marks[ti][di] !== null) {
-                    var diff = Math.abs(raw[ti][di] - marks[ti][di]);
-                    if (diff >= 1.0) alerts[ti][di] = 2;
-                    else if (diff >= 0.5) alerts[ti][di] = 1;
-                }
-            }
-        }
+        alerts[ti] = [0, 0, 0, 0, 0];   // 0=none, 1=yellow(>0.5), 2=red(>1.0)
+        maxDiff[ti] = [0, 0, 0, 0, 0];  // largest scaled diff in that cell
     }
+    var trades = dAT[pk] || [];
+    trades.forEach(function(t) {
+        // Find closest tenor by days
+        var tnrs = pd.tenors, bestTi = 0, bestDist = 9999;
+        for (var ti = 0; ti < tnrs.length; ti++) {
+            var dist = Math.abs(tnrs[ti].T * 365 - t.days);
+            if (dist < bestDist) { bestDist = dist; bestTi = ti; }
+        }
+        var tenorLabel = tnrs[bestTi].tenor;
+        var hmTi = DT.indexOf(tenorLabel);
+        if (hmTi < 0) return;
+        var di = dDB(t.delta);  // 0=10dP, 1=25dP, 2=ATM, 3=25dC, 4=10dC
+        var base = dtccGetBase(pk, tenorLabel);
+        if (!base) return;
+        var markVol = base.vols[di];
+        if (markVol === null || markVol === undefined) return;
+        var scaledIV = _applyScaler(t.iv, markVol);
+        var diff = Math.abs(scaledIV - markVol);
+        if (diff > maxDiff[hmTi][di]) maxDiff[hmTi][di] = diff;
+        if (diff >= 1.0 && alerts[hmTi][di] < 2) alerts[hmTi][di] = 2;
+        else if (diff >= 0.5 && alerts[hmTi][di] < 1) alerts[hmTi][di] = 1;
+    });
 
     // Z values = marks, text = marks + alert emoji
     var z = marks.map(function(r) { return r.map(function(v) { return v !== null ? parseFloat(v.toFixed(2)) : null; }); });
@@ -497,7 +550,26 @@ dRStrat = function() {
     document.getElementById('dsb').innerHTML = rows.join('');
 };
 
-// Override dRFeed: show Strike, Time, Expiry, Notl, Vol, vs Mark, Delta
+// Override dRFeed: show Strike, Time, Expiry, Notl, Vol, vs Mark, Delta, Spot
+// Spot-at-trade is fetched async for each new trade from /api/bbg_hist_spot
+var _histSpotCache = {};  // key = pair|YYYY-MM-DD|HH:MM -> spot value
+
+function fetchHistSpot(pair, date, time) {
+    var key = pair + '|' + date + '|' + time;
+    if (_histSpotCache[key] !== undefined) return;  // already cached or in flight
+    _histSpotCache[key] = null;  // mark as in-flight
+    fetch('/api/bbg_hist_spot?pair=' + pair + '&date=' + date + '&time=' + time)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            _histSpotCache[key] = (data && data.spot > 0) ? data.spot : 0;
+            // Trigger re-render if DTCC tab is still active
+            if (document.getElementById('tab-dtcc').classList.contains('active')) {
+                dRFeed();
+            }
+        })
+        .catch(function() { _histSpotCache[key] = 0; });
+}
+
 dRFeed = function() {
     var tr = (dAT[dAP] || []).slice().sort(function(a,b) {
         return a.time > b.time ? -1 : a.time < b.time ? 1 : 0;
@@ -507,8 +579,13 @@ dRFeed = function() {
     if (!tr.length) { list.innerHTML = '<div style="padding:2rem;text-align:center;color:#888">No prints</div>'; return; }
 
     var hdr = document.querySelector('.dtcc-feed-header');
-    if (hdr) hdr.innerHTML = '<span>Strike</span><span>Time</span><span>Expiry</span><span>Notl</span><span>Vol</span><span>vs Mark</span><span>\u0394</span>';
-    if (hdr) hdr.style.gridTemplateColumns = '62px 42px 50px 48px 42px 50px 36px';
+    var gridCols = '62px 38px 48px 48px 42px 46px 34px 56px';
+    if (hdr) {
+        hdr.innerHTML = '<span>Strike</span><span>Time</span><span>Expiry</span><span>Notl</span><span>Vol</span><span>vs Mk</span><span>\u0394</span><span>Spot@T</span>';
+        hdr.style.gridTemplateColumns = gridCols;
+    }
+
+    var today = new Date().toISOString().slice(0, 10);
 
     var h = '';
     tr.slice(0, 200).forEach(function(t, i) {
@@ -521,6 +598,8 @@ dRFeed = function() {
         var kTxt = t.strike >= 1000 ? t.strike.toFixed(0) : t.strike < 10 ? t.strike.toFixed(4) : t.strike.toFixed(2);
         var expTxt = t.expiry ? t.expiry.slice(5) : '';
         var dTxt = Math.round(Math.abs(t.delta) * 100) + '\u0394';
+
+        // vs Mark with SCALER applied
         var diffTxt = '', diffStyle = 'color:#555';
         var pk = dAP;
         if (pk && mktSurfaces[pk] && mktSurfaces[pk].tenors) {
@@ -532,21 +611,46 @@ dRFeed = function() {
             var base = dtccGetBase(pk, tnrs[bestTi].tenor);
             if (base) {
                 var di = dDB(t.delta);
-                var diff = t.iv - base.vols[di];
+                var markVol = base.vols[di];
+                var scaledIV = _applyScaler(t.iv, markVol);
+                var diff = scaledIV - markVol;
                 diffTxt = (diff >= 0 ? '+' : '') + diff.toFixed(1);
-                if (Math.abs(diff) >= 1.5) diffStyle = diff > 0 ? 'color:#ffa726;font-weight:700' : 'color:#42a5f5;font-weight:700';
-                else if (Math.abs(diff) >= 0.5) diffStyle = diff > 0 ? 'color:#ffcc80' : 'color:#90caf9';
+                if (Math.abs(diff) >= 1.0) diffStyle = diff > 0 ? 'color:#ef5350;font-weight:700' : 'color:#42a5f5;font-weight:700';
+                else if (Math.abs(diff) >= 0.5) diffStyle = diff > 0 ? 'color:#ffa726;font-weight:700' : 'color:#90caf9;font-weight:700';
                 else diffStyle = 'color:#666';
             }
         }
-        h += '<div class="dtcc-feed-item' + (i < 3 ? ' fresh' : '') + '" style="grid-template-columns:62px 42px 50px 48px 42px 50px 36px">'
+
+        // Spot at trade time: use live if same day and close to now, else fetch historical
+        var spotTxt = '-', spotStyle = 'color:#555';
+        if (t.spot > 0) {
+            // Already have a spot (live or tagged at execution)
+            spotTxt = t.strike >= 1000 ? t.spot.toFixed(1) : t.spot < 10 ? t.spot.toFixed(4) : t.spot.toFixed(2);
+            spotStyle = 'color:#aaa';
+        } else if (t.time && t.expiry) {
+            // Fetch historical spot for this trade's execution time
+            var tradeDate = today;  // best guess; _ts was stripped but time HH:MM is available
+            var cacheKey = pk + '|' + tradeDate + '|' + t.time;
+            var cached = _histSpotCache[cacheKey];
+            if (cached === undefined) {
+                fetchHistSpot(pk, tradeDate, t.time);
+                spotTxt = '...';
+                spotStyle = 'color:#666';
+            } else if (cached && cached > 0) {
+                spotTxt = t.strike >= 1000 ? cached.toFixed(1) : cached < 10 ? cached.toFixed(4) : cached.toFixed(2);
+                spotStyle = 'color:#aaa';
+            }
+        }
+
+        h += '<div class="dtcc-feed-item' + (i < 3 ? ' fresh' : '') + '" style="grid-template-columns:' + gridCols + '">'
             + '<span style="' + tc + ';font-weight:700;font-size:10px">' + kTxt + '</span>'
-            + '<span style="color:#888;font-variant-numeric:tabular-nums">' + t.time + '</span>'
+            + '<span style="color:#888;font-variant-numeric:tabular-nums;font-size:10px">' + t.time + '</span>'
             + '<span style="color:#888;font-size:10px">' + expTxt + '</span>'
             + '<span style="' + sc + '">$' + notlTxt + '</span>'
             + '<span style="' + vc + '">' + ivTxt + '</span>'
             + '<span style="' + diffStyle + ';font-size:10px">' + diffTxt + '</span>'
-            + '<span style="color:#888">' + dTxt + '</span></div>';
+            + '<span style="color:#888">' + dTxt + '</span>'
+            + '<span style="' + spotStyle + ';font-size:10px">' + spotTxt + '</span></div>';
     });
     list.innerHTML = h;
 };
@@ -675,38 +779,83 @@ renderIneff = function() {
 
 // === DTCC HEATMAP DRILLDOWN ===
 // Click any cell on the marks heatmap to see contributing trades
-(function setupDtccDrill() {
-    var check = function() {
-        var el = document.getElementById('dsp');
-        if (!el) { setTimeout(check, 1000); return; }
-        el.on('plotly_click', function(data) {
-            if (!data || !data.points || !data.points.length) return;
-            var pt = data.points[0], ti = DT.indexOf(pt.y), di = DDL.indexOf(pt.x);
-            if (ti < 0 || di < 0) return;
-            var pk = dAP, trades = (dAT[pk] || []).filter(function(t) {
-                var tw = tenorWeights(t.days), tdi = dDB(t.delta);
-                return tw.some(function(wt) { return wt.ti === ti; }) && tdi === di;
-            });
-            if (!trades.length) return;
-            var base = dtccGetBase(pk, DT[ti]);
-            var markVol = base ? base.vols[di] : null;
-            var title = pk + ' ' + DT[ti] + ' ' + DDL[di] + ' \u2014 ' + trades.length + ' trades';
-            if (markVol) title += ' (mark: ' + markVol.toFixed(2) + ')';
-            document.getElementById('drill-title').textContent = title;
-            var h = '<table style="width:100%"><tr><th>Time</th><th>Strike</th><th>Expiry</th><th>Type</th><th>Vol</th><th>vs Mark</th><th>Delta</th><th>Notl</th><th>Spot</th></tr>';
-            trades.sort(function(a, b) { return a.time > b.time ? -1 : 1; }).forEach(function(t) {
-                var diff = markVol ? t.iv - markVol : 0;
-                var dc = Math.abs(diff) >= 1.0 ? 'color:#ef5350;font-weight:700' : Math.abs(diff) >= 0.5 ? 'color:#ffa726' : 'color:#aaa';
-                var kTxt = t.strike >= 1000 ? t.strike.toFixed(0) : t.strike < 10 ? t.strike.toFixed(4) : t.strike.toFixed(2);
-                h += '<tr><td>' + t.time + '</td><td>' + kTxt + '</td><td>' + (t.expiry||'').slice(5) + '</td><td style="' + (t.ic ? 'color:#66bb6a' : 'color:#ef5350') + '">' + t.type + '</td><td>' + t.iv.toFixed(1) + '</td><td style="' + dc + '">' + (diff >= 0 ? '+' : '') + diff.toFixed(1) + '</td><td>' + Math.round(Math.abs(t.delta)*100) + '</td><td>$' + t.notl.toFixed(1) + 'M</td><td>' + (t.spot > 0 ? t.spot.toFixed(4) : '-') + '</td></tr>';
-            });
-            h += '</table>';
-            document.getElementById('drill-content').innerHTML = h;
-            document.getElementById('drill-modal').classList.add('show');
-        });
-    };
-    setTimeout(check, 2000);
-})();
+// DTCC heatmap click handler — attached via dRSurf on every render
+function _dtccHeatmapClick(data) {
+    if (!data || !data.points || !data.points.length) return;
+    if (typeof dtccEditMode !== 'undefined' && dtccEditMode) return;
+    var pt = data.points[0], ti = DT.indexOf(pt.y), di = DDL.indexOf(pt.x);
+    if (ti < 0 || di < 0) return;
+    var pk = dAP;
+    var pd = mktSurfaces[pk];
+    if (!pd || !pd.tenors) return;
+
+    // Match the alert logic: trade lands in (closest_tenor, dDB(delta))
+    var trades = (dAT[pk] || []).filter(function(t) {
+        var tnrs = pd.tenors, bestTi = 0, bestDist = 9999;
+        for (var tti = 0; tti < tnrs.length; tti++) {
+            var dist = Math.abs(tnrs[tti].T * 365 - t.days);
+            if (dist < bestDist) { bestDist = dist; bestTi = tti; }
+        }
+        var tenorLabel = tnrs[bestTi].tenor;
+        var hmTi = DT.indexOf(tenorLabel);
+        var tdi = dDB(t.delta);
+        return hmTi === ti && tdi === di;
+    });
+
+    var base = dtccGetBase(pk, DT[ti]);
+    var markVol = base ? base.vols[di] : null;
+    var title = pk + ' ' + DT[ti] + ' ' + DDL[di] + ' \u2014 ' + trades.length + ' trades';
+    if (markVol !== null) title += ' (mark: ' + markVol.toFixed(2) + ', weight ' + Math.round(DTCC_WEIGHT*100) + '%)';
+    document.getElementById('drill-title').textContent = title;
+
+    if (!trades.length) {
+        document.getElementById('drill-content').innerHTML = '<p style="text-align:center;color:#aaa;padding:20px">No trades at this tenor/delta</p>';
+        document.getElementById('drill-modal').classList.add('show');
+        return;
+    }
+
+    var today = new Date().toISOString().slice(0, 10);
+    var h = '<table style="width:100%"><tr><th>Time</th><th>Strike</th><th>Expiry</th><th>Type</th><th>Vol</th><th>vs Mark</th><th>Delta</th><th>Notl</th><th>Spot@T</th></tr>';
+    trades.sort(function(a, b) { return a.time > b.time ? -1 : 1; }).forEach(function(t) {
+        var scaledIV = markVol !== null ? _applyScaler(t.iv, markVol) : t.iv;
+        var diff = markVol !== null ? scaledIV - markVol : 0;
+        var dc = Math.abs(diff) >= 1.0 ? 'color:#ef5350;font-weight:700' : Math.abs(diff) >= 0.5 ? 'color:#ffa726' : 'color:#aaa';
+        var kTxt = t.strike >= 1000 ? t.strike.toFixed(0) : t.strike < 10 ? t.strike.toFixed(4) : t.strike.toFixed(2);
+        var spotTxt = '-';
+        if (t.spot > 0) {
+            spotTxt = t.strike >= 1000 ? t.spot.toFixed(1) : t.spot < 10 ? t.spot.toFixed(4) : t.spot.toFixed(2);
+        } else if (t.time) {
+            var key = pk + '|' + today + '|' + t.time;
+            if (typeof _histSpotCache !== 'undefined' && _histSpotCache[key] !== undefined && _histSpotCache[key] > 0) {
+                var s = _histSpotCache[key];
+                spotTxt = t.strike >= 1000 ? s.toFixed(1) : s < 10 ? s.toFixed(4) : s.toFixed(2);
+            } else if (typeof fetchHistSpot === 'function' && typeof _histSpotCache !== 'undefined' && _histSpotCache[key] === undefined) {
+                fetchHistSpot(pk, today, t.time);
+                spotTxt = '...';
+            }
+        }
+        var ivTxt = scaledIV.toFixed(1) + (Math.abs(t.iv - scaledIV) > 0.05 ? ' <span style="color:#666;font-size:10px">(' + t.iv.toFixed(1) + ')</span>' : '');
+        h += '<tr><td>' + t.time + '</td><td>' + kTxt + '</td><td>' + (t.expiry||'').slice(5) + '</td><td style="' + (t.ic ? 'color:#66bb6a' : 'color:#ef5350') + '">' + t.type + '</td><td>' + ivTxt + '</td><td style="' + dc + '">' + (diff >= 0 ? '+' : '') + diff.toFixed(1) + '</td><td>' + Math.round(Math.abs(t.delta)*100) + '</td><td>$' + t.notl.toFixed(1) + 'M</td><td>' + spotTxt + '</td></tr>';
+    });
+    h += '</table>';
+    document.getElementById('drill-content').innerHTML = h;
+    document.getElementById('drill-modal').classList.add('show');
+}
+
+// Rebind click handler after every dRSurf render
+var _origDRSurfForDrill = dRSurf;
+dRSurf = function() {
+    _origDRSurfForDrill();
+    var el = document.getElementById('dsp');
+    if (el && el.on) {
+        // Plotly's removeAllListeners safely clears any prior click bindings
+        if (el.removeAllListeners) el.removeAllListeners('plotly_click');
+        el.on('plotly_click', _dtccHeatmapClick);
+    }
+};
+
+// Remove old setupDtccDrill - no longer needed
+(function noop() {})();
 
 // === DTCC EDIT MODE ===
 var dtccEditMode = false;
@@ -863,7 +1012,7 @@ function saveMarks() {
 // === TOAST ALERTS for trades > 1 vol off marks ===
 (function injectToastCSS() {
     var style = document.createElement('style');
-    style.textContent = '#toast-container{position:fixed;top:60px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:350px}'
+    style.textContent = '#toast-container{position:fixed;bottom:20px;right:20px;z-index:9999;display:flex;flex-direction:column-reverse;gap:8px;pointer-events:none;max-width:350px}'
         + '.toast{background:#2d2d2d;border-left:4px solid #ef5350;border-radius:6px;padding:10px 14px;color:#e0e0e0;font-size:12px;box-shadow:0 4px 12px rgba(0,0,0,0.5);pointer-events:auto;animation:toastIn 0.3s ease-out;opacity:1;transition:opacity 0.5s}'
         + '.toast.warn{border-left-color:#ffa726}'
         + '.toast .toast-pair{font-weight:700;color:#90caf9;margin-right:6px}'
@@ -916,7 +1065,8 @@ dProcTrades = function(trades) {
         if (!base) return;
         var di = dDB(mt.delta);
         var markVol = base.vols[di];
-        var diff = mt.iv - markVol;
+        var scaledIV = _applyScaler(mt.iv, markVol);
+        var diff = scaledIV - markVol;
         if (Math.abs(diff) >= 1.0) {
             _toastSeen[did] = true;
             var dir = diff > 0 ? 'RICH' : 'CHEAP';
@@ -928,84 +1078,13 @@ dProcTrades = function(trades) {
                 + mt.type + ' ' + kTxt + ' ' + (mt.expiry || '').slice(5)
                 + ' $' + notlR.toFixed(1) + 'M'
                 + '<br><span class="toast-vol ' + cls + '">'
-                + mt.iv.toFixed(1) + '% (' + (diff > 0 ? '+' : '') + diff.toFixed(1) + ' ' + dir + ')</span>'
+                + scaledIV.toFixed(1) + '% (' + (diff > 0 ? '+' : '') + diff.toFixed(1) + ' ' + dir + ')</span>'
                 + ' vs mark ' + markVol.toFixed(1) + '%',
                 10000
             );
         }
     });
 };
-
-// === TOAST ALERTS for trades >1 vol off marks ===
-(function initToasts() {
-    // Inject toast container CSS
-    var style = document.createElement('style');
-    style.textContent = '#toast-container{position:fixed;top:60px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:6px;max-height:50vh;overflow-y:auto;pointer-events:none}'
-        + '.toast{pointer-events:auto;background:#3d3d3d;border-left:4px solid #ef5350;border-radius:4px;padding:8px 14px;box-shadow:0 4px 12px rgba(0,0,0,0.4);font-size:12px;color:#e0e0e0;min-width:260px;max-width:360px;animation:toastIn 0.3s ease;cursor:pointer}'
-        + '.toast:hover{background:#4a4a4a}'
-        + '.toast .t-pair{font-weight:700;color:#90caf9}.toast .t-vol{font-weight:700}.toast .t-rich{color:#ef5350}.toast .t-cheap{color:#42a5f5}'
-        + '@keyframes toastIn{from{opacity:0;transform:translateX(80px)}to{opacity:1;transform:translateX(0)}}';
-    document.head.appendChild(style);
-    // Create container
-    var c = document.createElement('div');
-    c.id = 'toast-container';
-    document.body.appendChild(c);
-})();
-
-var _lastToastTrades = {};  // track by _did to avoid re-alerting
-function showTradeToast(pair, trade, diff, markVol) {
-    var did = trade.time + trade.strike;
-    if (_lastToastTrades[did]) return;
-    _lastToastTrades[did] = true;
-    var container = document.getElementById('toast-container');
-    if (!container) return;
-    var dir = diff > 0 ? 'RICH' : 'CHEAP';
-    var cls = diff > 0 ? 't-rich' : 't-cheap';
-    var kTxt = trade.strike >= 1000 ? trade.strike.toFixed(0) : trade.strike < 10 ? trade.strike.toFixed(4) : trade.strike.toFixed(2);
-    var toast = document.createElement('div');
-    toast.className = 'toast';
-    toast.innerHTML = '<span class="t-pair">' + pair + '</span> '
-        + '<span class="' + cls + '">' + dir + ' ' + (diff > 0 ? '+' : '') + diff.toFixed(1) + 'v</span><br>'
-        + '<span style="color:#aaa">K=' + kTxt + ' ' + trade.type + ' '
-        + trade.iv.toFixed(1) + '% (mark ' + markVol.toFixed(1) + '%) $' + trade.notl.toFixed(0) + 'M '
-        + trade.time + '</span>';
-    toast.onclick = function() { toast.remove(); };
-    container.appendChild(toast);
-    // Auto-remove after 12 seconds
-    setTimeout(function() { if (toast.parentNode) toast.remove(); }, 12000);
-    // Keep max 8 toasts
-    while (container.children.length > 8) container.removeChild(container.firstChild);
-}
-
-// Hook into dProcTrades to fire toasts for big deviations
-var _origDProcTradesForToast = typeof dProcTrades === 'function' ? dProcTrades : null;
-if (_origDProcTradesForToast) {
-    var _wrappedDProcTrades = dProcTrades;
-    dProcTrades = function(trades) {
-        _wrappedDProcTrades(trades);
-        // After processing, check all trades for big diffs and toast
-        var allPairs = DTCC_G10.concat(DTCC_EM);
-        allPairs.forEach(function(pk) {
-            var tr = dAT[pk] || [];
-            if (!tr.length || !mktSurfaces[pk] || !mktSurfaces[pk].tenors) return;
-            tr.forEach(function(t) {
-                var tnrs = mktSurfaces[pk].tenors, bestTi = 0, bestDist = 9999;
-                for (var ti = 0; ti < tnrs.length; ti++) {
-                    var dist = Math.abs(tnrs[ti].T * 365 - t.days);
-                    if (dist < bestDist) { bestDist = dist; bestTi = ti; }
-                }
-                var base = dtccGetBase(pk, tnrs[bestTi].tenor);
-                if (!base) return;
-                var di = dDB(t.delta);
-                var markVol = base.vols[di];
-                var diff = t.iv - markVol;
-                if (Math.abs(diff) >= 1.0) {
-                    showTradeToast(pk, t, diff, markVol);
-                }
-            });
-        });
-    };
-}
 
 console.log('mathfix.js: all overrides applied');
 """
@@ -1925,15 +2004,28 @@ class BBGSpotStreamer:
         log(f"BBG: {len(self.spots)} spots, {len(self.fwd_pts)} fwd curves, "
             f"{len(self.rates)} rate pairs, USD 3M={usd_3m*100:.2f}%")
 
-        # ---- Switch to streaming for spot updates ----
+        # ---- Switch to streaming for spot AND fwd point updates ----
         if not session.openService("//blp/mktdata"):
             log("BBG: cannot open mktdata for streaming")
             return
         subs = blpapi.SubscriptionList()
+        # Spots
         for pair in self.ALL_FX_PAIRS:
             subs.add(f"{pair} Curncy", "LAST_PRICE", "", blpapi.CorrelationId(pair))
+        # Forward points — subscribe for all (pair, tenor) combinations
+        # CorrelationId format: "FWD|{pair}|{tenor_label}"
+        n_fwd = 0
+        for pair in self.ALL_FX_PAIRS:
+            prefix = self.FWD_PREFIX.get(pair)
+            if not prefix:
+                continue
+            for tn in self.FWD_TENORS:
+                tk = f"{prefix}{tn['bbg']} Curncy"
+                cid_val = f"FWD|{pair}|{tn['label']}"
+                subs.add(tk, "LAST_PRICE", "", blpapi.CorrelationId(cid_val))
+                n_fwd += 1
         session.subscribe(subs)
-        log(f"BBG: streaming {len(self.ALL_FX_PAIRS)} spots")
+        log(f"BBG: streaming {len(self.ALL_FX_PAIRS)} spots + {n_fwd} fwd points")
 
         while self._running:
             try:
@@ -1941,8 +2033,17 @@ class BBGSpotStreamer:
                 for msg in ev:
                     if msg.hasElement("LAST_PRICE"):
                         cid = msg.correlationIds()[0]
-                        pair = cid.value()
-                        self.spots[pair] = msg.getElementAsFloat("LAST_PRICE")
+                        cv = cid.value()
+                        px = msg.getElementAsFloat("LAST_PRICE")
+                        if isinstance(cv, str) and cv.startswith("FWD|"):
+                            # Forward point update
+                            _, pair, tenor = cv.split("|", 2)
+                            if pair not in self.fwd_pts:
+                                self.fwd_pts[pair] = {}
+                            self.fwd_pts[pair][tenor] = px
+                        else:
+                            # Spot update
+                            self.spots[cv] = px
             except: pass
         session.stop()
 
