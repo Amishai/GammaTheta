@@ -33,9 +33,12 @@ MATHFIX_JS = r"""
 // === serve_dashboard.py v3.0 math overrides ===
 console.log('mathfix.js loaded — fwd pts, spot delta, prints, premium diagnostics');
 
-// Forward points scaling: JPY pairs = /100, others = /10000
+// Forward points scaling: prefer Bloomberg-derived pipScale on mktSurfaces[pair], fall back to JPY regex
 function _fwdPtScale(pair) {
     if (!pair) return 10000;
+    if (typeof mktSurfaces !== 'undefined' && mktSurfaces[pair] && mktSurfaces[pair].pipScale) {
+        return mktSurfaces[pair].pipScale;
+    }
     return /JPY/.test(pair) ? 100 : 10000;
 }
 
@@ -266,6 +269,7 @@ dRFeed = function() {
             var spots = data.spots || {};
             var fwdPts = data.fwd_pts || {};
             var rates = data.rates || {};
+            var pipScales = data.pip_scales || {};
 
             Object.keys(spots).forEach(function(pair) {
                 var s = parseFloat(spots[pair]);
@@ -277,12 +281,14 @@ dRFeed = function() {
                     var rf = (rates[pair] && rates[pair].r_f) ? rates[pair].r_f : (DEFAULT_RD[base] || 0.03);
                     mktSurfaces[pair] = {
                         spot: s, _pair: pair, r_d: rd, r_f: rf,
+                        pipScale: pipScales[pair] || null,  // null = unknown, fallback to spot heuristic
                         tenors: TN_LABELS.map(function(tn, ti) {
                             return {tenor: tn, T: TENOR_T[ti], atm: 8, rr25: 0, rr10: 0, fly25: 0.2, fly10: 0.5, fwdPts: 0};
                         })
                     };
                 } else {
                     mktSurfaces[pair].spot = s;
+                    if (pipScales[pair]) mktSurfaces[pair].pipScale = pipScales[pair];
                 }
 
                 // Apply CIP-derived rates
@@ -657,6 +663,68 @@ dRFeed = function() {
 
 // === PORTFOLIO TAB OVERRIDES ===
 // Delta in tables, written Greek names, gamma/notional heatmap toggles
+// Theta + T/N roll (matches the Rich score formula)
+
+// Wrap buildSurf again to inject pipScale + _pair into returned cs
+// (The first wrapper at top pre-scales fwdPts; this one adds metadata to cs output)
+var _bsForPipScale = typeof buildSurf === 'function' ? buildSurf : null;
+if (_bsForPipScale) {
+    buildSurf = function(pd) {
+        var cs = _bsForPipScale(pd);
+        if (cs && pd) {
+            cs._pair = pd._pair || '';
+            cs.pipScale = pd.pipScale || null;  // null = unknown, cpg falls back to heuristic
+        }
+        return cs;
+    };
+}
+
+// Override cpg:
+// 1. Fold T/N roll into displayed theta
+// 2. Rich = |theta + roll| / |gamma| with pip-scale correction for cross-pair comparability
+//
+// Pip scale is pulled from Bloomberg via QUOTE_INCREMENT / PX_DISP_FORMAT_MAX at startup.
+// Falls back to spot-magnitude heuristic if Bloomberg didn't provide (spot>500 -> /1, spot>50 -> /100, else /10000).
+var _origCpg = typeof cpg === 'function' ? cpg : null;
+if (_origCpg) {
+    cpg = function(cs, K, T, vol, notional, ic) {
+        var r = _origCpg(cs, K, T, vol, notional, ic);
+        var aN = Math.abs(notional);
+        var tnR = cs.tnR || 0;
+        var S = cs.spot || 1;
+        // Use pipScale from Bloomberg if available, else fallback heuristic
+        var pipScale = cs.pipScale;
+        if (!pipScale) {
+            if (S > 500) pipScale = 1;
+            else if (S > 50) pipScale = 100;
+            else pipScale = 10000;
+        }
+        // Delta notional in $M = r.delta (signed raw delta) * aN
+        var deltaNotional_M = r.delta * aN;
+        // Roll P&L per day in $K = delta_$M * tnR * 1000 / (pipScale * spot)
+        var rollPerDay = deltaNotional_M * tnR * 1000 / (pipScale * S);
+        r.theta = r.theta + rollPerDay;
+        // Rich = |theta + roll| / |gamma| with pip-scale correction
+        var absG = Math.abs(r.gamma);
+        var rawRich = absG > 1e-9 ? Math.abs(r.theta) / absG : 0;
+        r.rich = rawRich * pipScale / 10000;
+        return r;
+    };
+}
+
+// Override richColor for the theta/gamma ratio scale (typically 0-5)
+// 0-1 = cheap (blue), ~1 = fair (white), 2+ = expensive (red)
+var _origRichColor = typeof richColor === 'function' ? richColor : null;
+richColor = function(v) {
+    var clamped = Math.max(0, Math.min(5, v));
+    if (clamped <= 1) {
+        var t = clamped / 1;
+        return 'rgb(' + Math.round(21 + (224-21)*t) + ',' + Math.round(101 + (224-101)*t) + ',' + Math.round(192 + (224-192)*t) + ')';
+    } else {
+        var t = Math.min(1, (clamped - 1) / 4);
+        return 'rgb(' + Math.round(224 + (198-224)*t) + ',' + Math.round(224 + (40-224)*t) + ',' + Math.round(224 + (40-224)*t) + ')';
+    }
+};
 
 // Inject gamma + notional toggle buttons
 (function injectPortToggles() {
@@ -955,6 +1023,7 @@ function saveMarks() {
         if (!pd || !pd.tenors) return;
         output.surfaces[pair] = {
             spot: pd.spot, r_d: pd.r_d, r_f: pd.r_f,
+            pipScale: pd.pipScale || null,
             tenors: pd.tenors.map(function(t) {
                 return {tenor: t.tenor, T: t.T, atm: t.atm, rr25: t.rr25, rr10: t.rr10,
                         fly25: t.fly25, fly10: t.fly10, fwdPts: t.fwdPts};
@@ -1627,7 +1696,11 @@ def pull_bbg_surfaces(pairs=None):
         # F = S + fwdPts/scale  and  F = S × exp((r_d - r_f) × T)
         # Therefore: r_d - r_f = ln(F/S) / T
         # USD is always one side — use pulled USD rate as anchor
-        scale = 100 if 'JPY' in pair or 'KRW' in pair or 'INR' in pair else 10000
+        # Prefer pip scale detected from Bloomberg streamer, else fall back to pair-name heuristic
+        if _bbg_spots and pair in _bbg_spots.pip_scales:
+            scale = _bbg_spots.pip_scales[pair]
+        else:
+            scale = 100 if 'JPY' in pair or 'KRW' in pair or 'INR' in pair else 10000
         rate_diffs = []
         td = []
         for tn in BBG_TENORS:
@@ -1883,6 +1956,7 @@ class BBGSpotStreamer:
         self.spots = {}       # pair -> spot
         self.fwd_pts = {}     # pair -> {tenor_label: pts}
         self.rates = {}       # pair -> {r_d, r_f}
+        self.pip_scales = {}  # pair -> 10000/100/1 (detected from Bloomberg)
         self._running = False
 
     def start(self):
@@ -1932,9 +2006,13 @@ class BBGSpotStreamer:
         req.getElement("securities").appendValue("US0003M Index")
 
         req.getElement("fields").appendValue("PX_LAST")
+        # Also request the quote increment (smallest tick) — tells us pip convention
+        req.getElement("fields").appendValue("PX_DISP_FORMAT_MAX")  # decimal places displayed
+        req.getElement("fields").appendValue("QUOTE_INCREMENT")     # smallest tick size
         session.sendRequest(req)
 
         data = {}
+        pip_info = {}  # ticker -> (decimals, increment)
         while True:
             ev = session.nextEvent(5000)
             for msg in ev:
@@ -1946,6 +2024,15 @@ class BBGSpotStreamer:
                         flds = sec.getElement("fieldData")
                         if flds.hasElement("PX_LAST"):
                             data[tk] = flds.getElementAsFloat("PX_LAST")
+                        decimals, incr = None, None
+                        if flds.hasElement("PX_DISP_FORMAT_MAX"):
+                            try: decimals = int(flds.getElementAsFloat("PX_DISP_FORMAT_MAX"))
+                            except: pass
+                        if flds.hasElement("QUOTE_INCREMENT"):
+                            try: incr = flds.getElementAsFloat("QUOTE_INCREMENT")
+                            except: pass
+                        if decimals is not None or incr is not None:
+                            pip_info[tk] = (decimals, incr)
             if ev.eventType() == blpapi.Event.RESPONSE:
                 break
 
@@ -1954,6 +2041,37 @@ class BBGSpotStreamer:
             px = data.get(f"{pair} Curncy")
             if px and px > 0:
                 self.spots[pair] = px
+
+        # Derive pip scale per pair from Bloomberg metadata
+        # QUOTE_INCREMENT: 0.0001 -> /10000 pips, 0.01 -> /100 pips, 1 -> /1 pips
+        # PX_DISP_FORMAT_MAX: 4 decimals -> /10000, 2 decimals -> /100, 0 decimals -> /1
+        # Fall back: if spot > 50 use /100, else /10000 (only if Bloomberg didn't provide)
+        for pair in self.ALL_FX_PAIRS:
+            tk = f"{pair} Curncy"
+            decimals, incr = pip_info.get(tk, (None, None))
+            scale = None
+            if incr and incr > 0:
+                scale = int(round(1.0 / incr))
+                # Snap to standard values: 10000, 100, 1
+                if scale >= 5000: scale = 10000
+                elif scale >= 50: scale = 100
+                else: scale = 1
+            elif decimals is not None:
+                scale = 10 ** decimals
+                if scale >= 5000: scale = 10000
+                elif scale >= 50: scale = 100
+                else: scale = 1
+            else:
+                # Fallback: spot-based heuristic
+                spot = self.spots.get(pair, 1.0)
+                if spot > 500: scale = 1
+                elif spot > 50: scale = 100
+                else: scale = 10000
+            self.pip_scales[pair] = scale
+
+        log(f"BBG: pip scales — {sum(1 for s in self.pip_scales.values() if s == 10000)} at /10000, "
+            f"{sum(1 for s in self.pip_scales.values() if s == 100)} at /100, "
+            f"{sum(1 for s in self.pip_scales.values() if s == 1)} at /1")
 
         # Parse fwd points
         for tk, (pair, tenor) in fwd_ticker_map.items():
@@ -1974,7 +2092,7 @@ class BBGSpotStreamer:
             fp = self.fwd_pts.get(pair, {}).get('3M', None)
             if fp is None:
                 continue
-            scale = 100 if 'JPY' in pair else 10000
+            scale = self.pip_scales.get(pair, 10000)  # use detected pip scale
             fwd = spot + fp / scale
             T = 0.25  # 3M
 
@@ -2119,10 +2237,11 @@ class Handler(SimpleHTTPRequestHandler):
                     'spots': _bbg_spots.spots,
                     'fwd_pts': _bbg_spots.fwd_pts,
                     'rates': _bbg_spots.rates,
+                    'pip_scales': _bbg_spots.pip_scales,
                     'streaming': _bbg_spots._running
                 })
             else:
-                self._json({'spots': {}, 'fwd_pts': {}, 'rates': {}, 'streaming': False})
+                self._json({'spots': {}, 'fwd_pts': {}, 'rates': {}, 'pip_scales': {}, 'streaming': False})
 
         elif p.path == '/api/bbg_hist_spot':
             # Fetch historical spot for a pair at specific datetimes
