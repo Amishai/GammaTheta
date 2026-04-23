@@ -464,17 +464,18 @@ dRSurf = function() {
         });
     });
 
-    var cs = [[0, '#0d47a1'], [0.5, '#fff59d'], [1, '#b71c1c']];
+    // Rich gradient: blue (cold) -> cyan -> green -> yellow -> orange -> red (hot)
+    var cs = [[0,'#0d47a1'],[0.2,'#0288d1'],[0.4,'#4caf50'],[0.6,'#fff59d'],[0.8,'#ff9800'],[1,'#b71c1c']];
     Plotly.react('dsp', [{
         z: z, x: DDL, y: DT, type: 'heatmap', colorscale: cs,
-        text: txt, texttemplate: '%{text}', textfont: {size: 10, color: 'black'},
+        text: txt, texttemplate: '%{text}', textfont: {size: 14, color: 'black', family: 'Arial Black, sans-serif'},
         hovertemplate: '%{y} %{x}<br>Mark: %{z:.2f}%<extra></extra>',
-        connectgaps: false, colorbar: {thickness: 12, len: 0.85, tickfont: {size: 10, color: '#aaa'}}
+        connectgaps: false, colorbar: {thickness: 14, len: 0.85, tickfont: {size: 11, color: '#ddd'}}
     }], {
-        margin: {l: 50, r: 60, t: 10, b: 45}, paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
-        xaxis: {color: '#aaa', gridcolor: '#555', tickfont: {size: 11}},
-        yaxis: {color: '#aaa', gridcolor: '#555', tickfont: {size: 11}, autorange: 'reversed'},
-        font: {color: '#ccc'}
+        margin: {l: 55, r: 65, t: 10, b: 50}, paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+        xaxis: {color: '#ddd', gridcolor: '#555', tickfont: {size: 13, color: '#fff'}},
+        yaxis: {color: '#ddd', gridcolor: '#555', tickfont: {size: 13, color: '#fff'}, autorange: 'reversed'},
+        font: {color: '#fff'}
     }, {displayModeBar: false, responsive: true});
 };
 
@@ -681,10 +682,11 @@ if (_bsForPipScale) {
 
 // Override cpg:
 // 1. Fold T/N roll into displayed theta
-// 2. Rich = |theta + roll| / |gamma| with pip-scale correction for cross-pair comparability
+// 2. Scale theta AND vega by pipScale/10000 so all pairs are in USD-comparable units
+// 3. Rich = |theta_scaled| / |gamma| directly (no hidden factors)
 //
 // Pip scale is pulled from Bloomberg via QUOTE_INCREMENT / PX_DISP_FORMAT_MAX at startup.
-// Falls back to spot-magnitude heuristic if Bloomberg didn't provide (spot>500 -> /1, spot>50 -> /100, else /10000).
+// Falls back to spot-magnitude heuristic if Bloomberg didn't provide.
 var _origCpg = typeof cpg === 'function' ? cpg : null;
 if (_origCpg) {
     cpg = function(cs, K, T, vol, notional, ic) {
@@ -704,10 +706,14 @@ if (_origCpg) {
         // Roll P&L per day in $K = delta_$M * tnR * 1000 / (pipScale * spot)
         var rollPerDay = deltaNotional_M * tnR * 1000 / (pipScale * S);
         r.theta = r.theta + rollPerDay;
-        // Rich = |theta + roll| / |gamma| with pip-scale correction
+        // Apply pipScale/10000 normalization to theta and vega so they're USD-comparable
+        // across pip conventions. EUR pairs unchanged, JPY pairs shrink by 100x.
+        var pipFactor = pipScale / 10000;
+        r.theta = r.theta * pipFactor;
+        r.vega = r.vega * pipFactor;
+        // Rich = |theta| / |gamma| directly (no hidden pip factor — it's already in theta)
         var absG = Math.abs(r.gamma);
-        var rawRich = absG > 1e-9 ? Math.abs(r.theta) / absG : 0;
-        r.rich = rawRich * pipScale / 10000;
+        r.rich = absG > 1e-9 ? Math.abs(r.theta) / absG : 0;
         return r;
     };
 }
@@ -780,29 +786,102 @@ buildPortHm = function(cs, comp) {
 var _origRenderPortHm = typeof renderPortHm === 'function' ? renderPortHm : null;
 renderPortHm = function() {
     if (!portHmData) return;
-    if (currentPh !== 'gamma' && currentPh !== 'notional') { _origRenderPortHm(); return; }
-    var M = (currentPh === 'gamma' ? portHmData.gamma : portHmData.notional)
-        .map(function(r) { return r.map(function(v) { return v === 0 ? null : v; }); });
-    var bt = '$M';
-    var cs2 = [[0,'#1565c0'],[0.5,'#e0e0e0'],[1,'#c62828']];
-    var fl = M.flat().filter(function(v) { return v !== null; });
-    var mx = fl.length > 0 ? Math.max(Math.abs(Math.min.apply(null, fl)), Math.abs(Math.max.apply(null, fl))) : 1;
-    var txt = M.map(function(r) { return r.map(function(v) {
+    // Handle all views with rich gradient + bold text
+    var M, cs2, z1, z5, bt;
+    if (currentPh === 'richness') {
+        M = portHmData.rich;
+        cs2 = [[0,'#0d47a1'],[0.2,'#0288d1'],[0.4,'#4caf50'],[0.6,'#fff59d'],[0.8,'#ff9800'],[1,'#b71c1c']];
+        z1 = 0; z5 = 5; bt = 'Rich';
+    } else if (currentPh === 'vega') {
+        M = portHmData.vega.map(function(r) { return r.map(function(v) { return v === 0 ? null : v; }); });
+        cs2 = [[0,'#b71c1c'],[0.2,'#ff9800'],[0.4,'#fff59d'],[0.5,'#e0e0e0'],[0.6,'#4caf50'],[0.8,'#0288d1'],[1,'#0d47a1']];
+        bt = '$K';
+        var flv = M.flat().filter(function(v) { return v !== null; });
+        var mxv = flv.length > 0 ? Math.max(Math.abs(Math.min.apply(null, flv)), Math.abs(Math.max.apply(null, flv))) : 1;
+        z1 = -mxv; z5 = mxv;
+    } else if (currentPh === 'decay') {
+        M = portHmData.decay.map(function(r) { return r.map(function(v) { return v === 0 ? null : v; }); });
+        cs2 = [[0,'#b71c1c'],[0.2,'#ff9800'],[0.4,'#fff59d'],[0.5,'#e0e0e0'],[0.6,'#4caf50'],[0.8,'#0288d1'],[1,'#0d47a1']];
+        bt = '$K/day';
+        var fld = M.flat().filter(function(v) { return v !== null; });
+        var mxd = fld.length > 0 ? Math.max(Math.abs(Math.min.apply(null, fld)), Math.abs(Math.max.apply(null, fld))) : 1;
+        z1 = -mxd; z5 = mxd;
+    } else if (currentPh === 'gamma' || currentPh === 'notional') {
+        M = (currentPh === 'gamma' ? portHmData.gamma : portHmData.notional)
+            .map(function(r) { return r.map(function(v) { return v === 0 ? null : v; }); });
+        cs2 = [[0,'#b71c1c'],[0.2,'#ff9800'],[0.4,'#fff59d'],[0.5,'#e0e0e0'],[0.6,'#4caf50'],[0.8,'#0288d1'],[1,'#0d47a1']];
+        bt = '$M';
+        var flg = M.flat().filter(function(v) { return v !== null; });
+        var mxg = flg.length > 0 ? Math.max(Math.abs(Math.min.apply(null, flg)), Math.abs(Math.max.apply(null, flg))) : 1;
+        z1 = -mxg; z5 = mxg;
+    } else {
+        _origRenderPortHm(); return;
+    }
+
+    var dir = portHmData.dir;
+    var txt = M.map(function(r, ti) { return r.map(function(v, si) {
         if (v === null) return '';
-        return (v >= 0 ? '+' : '') + v.toFixed(currentPh === 'notional' ? 1 : 4);
+        if (currentPh === 'richness') return v.toFixed(2);
+        if (currentPh === 'notional') return (v >= 0 ? '+' : '') + v.toFixed(1);
+        if (currentPh === 'gamma') return (v >= 0 ? '+' : '') + v.toFixed(3);
+        var d = dir && dir[ti] && dir[ti][si] ? dir[ti][si] + ' ' : '';
+        return d + (v >= 0 ? '+' : '') + v.toFixed(currentPh === 'vega' ? 1 : 2);
     }); });
+
     Plotly.react('port-hm', [{z: M, x: portHmData.labels, y: TENORS, type: 'heatmap', colorscale: cs2,
-        text: txt, texttemplate: '%{text}', textfont: {size: 9, color: 'black'},
-        colorbar: {title: {text: bt, font: {color:'#e0e0e0'}}, tickfont: {color:'#e0e0e0'}, len: .9},
-        zmin: -mx, zmax: mx, hoverongaps: false}],
-    {margin: {t:20,b:80,l:60,r:50}, xaxis: {title:'Strike',tickangle:45,color:'#e0e0e0',type:'category'},
-     yaxis: {title:'Tenor',color:'#e0e0e0'}, paper_bgcolor:'#3d3d3d', plot_bgcolor:'#3d3d3d'},
+        text: txt, texttemplate: '%{text}', textfont: {size: 13, color: 'black', family: 'Arial Black, sans-serif'},
+        colorbar: {title: {text: bt, font: {color:'#fff',size:13}}, tickfont: {color:'#fff',size:11}, len: .9},
+        zmin: z1, zmax: z5, hoverongaps: false}],
+    {margin: {t:20,b:80,l:65,r:55},
+     xaxis: {title:{text:'Strike',font:{size:13,color:'#fff'}},tickangle:45,color:'#fff',type:'category',tickfont:{size:12}},
+     yaxis: {title:{text:'Tenor',font:{size:13,color:'#fff'}},color:'#fff',tickfont:{size:12}},
+     paper_bgcolor:'#3d3d3d', plot_bgcolor:'#3d3d3d'},
     {displayModeBar: false, responsive: true});
     document.getElementById('port-hm').on('plotly_click', function(data) {
         var pt = data.points[0], ti = TENORS.indexOf(pt.y), si = portHmData.labels.indexOf(String(pt.x));
         if (ti >= 0 && si >= 0) showDrill(ti, si);
     });
 };
+
+// Override surface analysis heatmap (Analysis tab) — richer gradient + bolder text
+var _origRenderHm = typeof renderHm === 'function' ? renderHm : null;
+if (_origRenderHm) {
+    renderHm = function(cs) {
+        if (typeof DELTAS === 'undefined' || typeof DL === 'undefined') { _origRenderHm(cs); return; }
+        var n = getN(), mat = [], z1 = 0, z5 = 5, bt = 'Rich';
+        // Rich gradient: blue -> cyan -> green -> yellow -> orange -> red
+        var clr = [[0,'#0d47a1'],[0.2,'#0288d1'],[0.4,'#4caf50'],[0.6,'#fff59d'],[0.8,'#ff9800'],[1,'#b71c1c']];
+        TENORS.forEach(function(t) {
+            var row = DELTAS.map(function(d) {
+                var pt = cs.data.find(function(r) { return r.tenor === t && r.dl === d; });
+                if (!pt) return null;
+                if (currentHm === 'richness') return pt.rich;
+                if (currentHm === 'theta') return Math.abs(pt.theta * n);
+                return Math.abs(pt.vega * n);
+            });
+            mat.push(row);
+        });
+        if (currentHm !== 'richness') {
+            var fl = mat.flat().filter(function(v) { return v !== null; });
+            z1 = fl.length ? Math.min.apply(null, fl) : 0;
+            z5 = fl.length ? Math.max.apply(null, fl) : 1;
+            bt = currentHm === 'theta' ? '$K/day' : '$K';
+        }
+        var txt = mat.map(function(r) { return r.map(function(v) { return v !== null ? v.toFixed(2) : ''; }); });
+        Plotly.react('heatmap', [{
+            z: mat, x: DL, y: TENORS, type: 'heatmap', colorscale: clr,
+            text: txt, texttemplate: '%{text}',
+            textfont: {size: 14, color: 'black', family: 'Arial Black, sans-serif'},
+            colorbar: {title: {text: bt, font: {color: '#fff', size: 13}}, tickfont: {color: '#fff', size: 11}, len: 0.9},
+            zmin: z1, zmax: z5
+        }], {
+            margin: {t: 20, b: 80, l: 65, r: 55},
+            xaxis: {title: {text: 'Delta', font: {size: 13, color: '#fff'}}, tickangle: 45, color: '#fff', tickfont: {size: 12}},
+            yaxis: {title: {text: 'Tenor', font: {size: 13, color: '#fff'}}, color: '#fff', tickfont: {size: 12}},
+            paper_bgcolor: '#3d3d3d', plot_bgcolor: '#3d3d3d'
+        }, {displayModeBar: false, responsive: true});
+    };
+}
 
 // Override renderPortTab: add delta column, written Greek names
 var _origRenderPortTab = typeof renderPortTab === 'function' ? renderPortTab : null;
@@ -1154,6 +1233,18 @@ dProcTrades = function(trades) {
         }
     });
 };
+
+// Portfolio tab: force full-width single-column layout
+// Order: heatmap (gamma/theta) -> positions -> richest/cheapest (inefficient) -> time charts
+(function injectPortfolioCSS() {
+    var style = document.createElement('style');
+    style.textContent = '.portfolio-grid{grid-template-columns:1fr !important}'
+        + '#port-hm{height:450px !important}'
+        + '#pos-tbl{max-height:none !important}'
+        + '#ineff-tbl{max-height:none !important}'
+        + '#tab-portfolio .card{width:100%}';
+    document.head.appendChild(style);
+})();
 
 console.log('mathfix.js: all overrides applied');
 """
