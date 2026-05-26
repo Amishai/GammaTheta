@@ -33,6 +33,23 @@ MATHFIX_JS = r"""
 // === serve_dashboard.py v3.0 math overrides ===
 console.log('mathfix.js loaded — fwd pts, spot delta, prints, premium diagnostics');
 
+// Current DTCC trading day as YYYY-MM-DD, applying the 5pm-ET rollover.
+// The FX/DTCC trading day ends at 17:00 New York time — trades at/after 5pm ET
+// belong to the NEXT trading day. Must NOT use the UTC calendar date.
+function _tradingDayNY() {
+    var now = new Date();
+    // Get the wall-clock time in New York regardless of the browser's own TZ
+    var nyStr = now.toLocaleString('en-US', {timeZone: 'America/New_York', hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit'});
+    // nyStr like "05/25/2026, 18" — parse month/day/year and hour
+    var m = nyStr.match(/(\d{2})\/(\d{2})\/(\d{4}),?\s+(\d{1,2})/);
+    if (!m) return now.toISOString().slice(0, 10);  // fallback
+    var mo = parseInt(m[1],10), da = parseInt(m[2],10), yr = parseInt(m[3],10), hr = parseInt(m[4],10);
+    var d = new Date(Date.UTC(yr, mo - 1, da));
+    if (hr >= 17) d.setUTCDate(d.getUTCDate() + 1);  // 5pm ET roll
+    return d.toISOString().slice(0, 10);
+}
+
 // Forward points scaling: prefer Bloomberg-derived pipScale on mktSurfaces[pair], fall back to JPY regex
 function _fwdPtScale(pair) {
     if (!pair) return 10000;
@@ -85,6 +102,135 @@ function _interpFwdPts(tenors, days) {
     return null;
 }
 
+// ===== SURFACE-ANCHORED PACKAGE DECOMPOSITION =====
+// DTCC reports ONE price for a package (RR / fly / strangle). That single number
+// cannot be split into two leg vols on its own — it's underdetermined. But the
+// package price IS itself a vol-convention quote (when notation==3): an RR trade
+// gives the market's RR, a fly trade gives the market's fly.
+//
+// We decompose by anchoring the OTHER surface params to your marks:
+//   RR traded   -> call = ATM + BF + RR/2,  put = ATM + BF - RR/2   (ATM,BF anchored)
+//   Fly traded  -> call = ATM + BF + RR/2,  put = ATM + BF - RR/2   (ATM,RR anchored)
+//   Strangle    -> wing avg = ATM + BF;  RR splits the two wings    (ATM,RR,BF anchored)
+//
+// The leg vols are DERIVED, never observed. Tagged as such everywhere.
+//
+// Anchor source: try user marks (mktSurfaces) first, then DTCC base surface.
+
+// Get ATM / RR25 / FLY25 anchors for a pair at a given day count.
+// Returns {atm, rr, fly, src} or null if nothing usable.
+function _surfaceAnchor(pk, days) {
+    // Try user surface marks first
+    if (typeof mktSurfaces !== 'undefined' && mktSurfaces[pk] && mktSurfaces[pk].tenors) {
+        var tns = mktSurfaces[pk].tenors, best = null, bd = 9999;
+        for (var i = 0; i < tns.length; i++) {
+            var d = Math.abs((tns[i].T || 0) * 365 - days);
+            if (d < bd) { bd = d; best = tns[i]; }
+        }
+        if (best && best.atm > 0) {
+            return {atm: best.atm, rr: best.rr25 || 0, fly: best.fly25 || 0.2, src: 'marks'};
+        }
+    }
+    // Fall back to DTCC base surface
+    if (typeof dtccGetBase === 'function' && typeof DT !== 'undefined') {
+        var tw = (typeof tenorWeights === 'function') ? tenorWeights(days) : [{ti:0}];
+        var bti = tw[0].ti;
+        var base = dtccGetBase(pk, DT[bti]);
+        if (base && base.vols) {
+            // base.vols indexed by delta bucket: [10dP,25dP,ATM,25dC,10dC] typically
+            var atm = base.vols[2] || 0;
+            if (atm > 0) {
+                var c25 = base.vols[3] || atm, p25 = base.vols[1] || atm;
+                return {atm: atm, rr: c25 - p25, fly: 0.5*(c25+p25) - atm, src: 'dtcc_base'};
+            }
+        }
+    }
+    return null;
+}
+
+// Classify a group of package legs sharing one pkg_id.
+// Returns 'RR' | 'FLY' | 'STRANGLE' | 'STRADDLE' | 'SPREAD' | 'UNKNOWN'.
+function _classifyPackage(legs) {
+    if (!legs || legs.length < 2) return 'UNKNOWN';
+    var calls = legs.filter(function(l){ return l.type === 'CALL'; });
+    var puts  = legs.filter(function(l){ return l.type === 'PUT'; });
+    if (legs.length === 2 && calls.length === 1 && puts.length === 1) {
+        var c = calls[0], p = puts[0];
+        if (Math.abs(c.strike - p.strike) < 1e-9) return 'STRADDLE';
+        // Call strike above put strike = classic RR / strangle shape
+        if (c.strike > p.strike) {
+            // RR vs strangle: hard to tell without sign of notional, but the
+            // package price notation disambiguates downstream. Default RR.
+            return 'RR';
+        }
+        return 'STRANGLE';
+    }
+    if (legs.length >= 3 && legs.length <= 4 && calls.length >= 1 && puts.length >= 1) {
+        return 'FLY';
+    }
+    if (legs.length === 2 && (calls.length === 2 || puts.length === 2)) return 'SPREAD';
+    return 'UNKNOWN';
+}
+
+// Decompose package legs into derived per-leg vols. Mutates the leg objects,
+// adding derivedIV, derivedDelta, structure. Returns count successfully decomposed.
+function _decomposePackages(pkgLegs) {
+    if (!pkgLegs || !pkgLegs.length) return 0;
+    // Group by pkg_id (skip legs without an id — can't group them)
+    var groups = {};
+    pkgLegs.forEach(function(l) {
+        if (!l.pkg_id) return;
+        (groups[l.pkg_id] = groups[l.pkg_id] || []).push(l);
+    });
+    var decomposed = 0;
+    Object.keys(groups).forEach(function(pid) {
+        var legs = groups[pid];
+        var structure = _classifyPackage(legs);
+        legs.forEach(function(l){ l.structure = structure; });
+        if (structure !== 'RR' && structure !== 'FLY' && structure !== 'STRANGLE') return;
+
+        // Package price must be in vol terms (notation 3) to be usable as RR/fly
+        var pkgN = String(legs[0].pkg_notation || '');
+        var pkgP = parseFloat(legs[0].pkg_price);
+        if (pkgN !== '3' || isNaN(pkgP)) return;
+
+        var anchor = _surfaceAnchor(legs[0].pair, legs[0].days);
+        if (!anchor) return;
+
+        var atm = anchor.atm, callV, putV;
+        if (structure === 'RR') {
+            // pkgP is the RR; anchor ATM + fly
+            var rr = pkgP;
+            callV = atm + anchor.fly + rr/2;
+            putV  = atm + anchor.fly - rr/2;
+        } else if (structure === 'FLY') {
+            // pkgP is the fly; anchor ATM + RR
+            var fly = pkgP;
+            callV = atm + fly + anchor.rr/2;
+            putV  = atm + fly - anchor.rr/2;
+        } else { // STRANGLE
+            // pkgP is the strangle vol (avg of wings); anchor RR to split
+            var wingAvg = pkgP;
+            callV = wingAvg + anchor.rr/2;
+            putV  = wingAvg - anchor.rr/2;
+        }
+        // Assign each leg its derived vol by type
+        legs.forEach(function(l) {
+            var v = (l.type === 'CALL') ? callV : putV;
+            if (v > 0.5 && v < 80) {
+                l.derivedIV = v;
+                l.anchorSrc = anchor.src;
+                // Derived delta off the derived vol
+                if (typeof dCD === 'function' && l.fwd > 0) {
+                    l.derivedDelta = dCD(l.fwd, l.strike, v/100, l.T, l.ic, l.rd, l.spot);
+                }
+                decomposed++;
+            }
+        });
+    });
+    return decomposed;
+}
+
 // Tag mktSurfaces with pair name
 var _origInitApp = typeof initApp === 'function' ? initApp : null;
 if (_origInitApp) {
@@ -134,6 +280,8 @@ if (_origDProcTrades) {
                         filtered: 0, accepted: 0};
         // Reset spot-error buffer — repopulated fresh each run
         window._spotErrTrades = [];
+        // Reset package-leg buffer — package legs (RR/fly) with no per-leg IV
+        window._pkgLegTrades = [];
 
         trades.forEach(function(t) { try {
             var isNdo = (t.is_ndo === true || t.is_ndo === 'true' || t.subtype === 'NDO');
@@ -261,7 +409,28 @@ if (_origDProcTrades) {
                 var siteIV = parseFloat(String(t.iv).replace('%', ''));
                 if (!isNaN(siteIV) && siteIV > 0) { iv = siteIV; fallback++; }
             }
-            if (iv === null) { skipped++; if (isNdo) ndoStats.noIV++; return; }
+            if (iv === null) {
+                // No IV could be derived. If this is a PACKAGE leg, that's expected —
+                // the premium belongs to the whole structure, not this leg. Capture it
+                // with everything a post-pass needs to attempt surface-anchored
+                // vol decomposition (see _decomposePackages below).
+                if (isPackage) {
+                    if (!window._pkgLegTrades) window._pkgLegTrades = [];
+                    window._pkgLegTrades.push({
+                        time: t.time || '', trade_date: t.trade_date || '',
+                        pair: pk, type: t.opt_type || '', strike: strike,
+                        days: days, notl: notl, expiry: t.expiry || '',
+                        fwd: fwd, spot: spot, rd: rd, T: T, ic: ic,
+                        delta: null, pkg_id: t.pkg_id || '',
+                        pkg_price: t.pkg_price || '', pkg_notation: t.pkg_notation || '',
+                        isNdo: isNdo, subtype: t.subtype || '',
+                        derivedIV: null, derivedDelta: null, structure: null
+                    });
+                    noPkg++;
+                    return;
+                }
+                skipped++; if (isNdo) ndoStats.noIV++; return;
+            }
 
             // Spot delta with GK discount
             var delta = dCD(fwd, strike, iv / 100, T, ic, rd, spot);
@@ -282,6 +451,31 @@ if (_origDProcTrades) {
                 isNdo: isNdo, fwdSrc: fwdSource, trade_date: t.trade_date || ''
             });
         } catch(e) { skipped++; } });
+
+        // ---- Surface-anchored package decomposition ----
+        // Try to derive per-leg vols for RR/fly/strangle package legs that had no
+        // per-leg IV. Successfully decomposed legs get placed on the surface,
+        // tagged derived=true so the heatmap/feed can mark them distinctly.
+        var pkgDecomposed = 0;
+        if (window._pkgLegTrades && window._pkgLegTrades.length) {
+            pkgDecomposed = _decomposePackages(window._pkgLegTrades);
+            window._pkgLegTrades.forEach(function(l) {
+                if (l.derivedIV == null) return;
+                var lpk = l.pair;
+                if (!lpk || !dAT[lpk]) return;
+                var dlt = (l.derivedDelta != null) ? l.derivedDelta : 0;
+                if (Math.abs(dlt) < 0.05 || l.derivedIV > 60 || l.derivedIV < 0.5) return;
+                dAT[lpk].push({
+                    time: l.time || '', type: l.type, strike: l.strike, spot: l.spot,
+                    fwd: l.fwd, days: l.days, iv: l.derivedIV, notl: l.notl,
+                    expiry: l.expiry || '', ic: l.ic, delta: dlt,
+                    ivSrc: 'derived', isNdo: l.isNdo, fwdSrc: 'pkg',
+                    trade_date: l.trade_date || '',
+                    derived: true, structure: l.structure, anchorSrc: l.anchorSrc
+                });
+            });
+        }
+        window._pkgDecomposed = pkgDecomposed;
 
         // Expose NDO diagnostics globally so the Diag modal can show them
         window._ndoStats = ndoStats;
@@ -679,11 +873,13 @@ dRFeed = function() {
     // Spot-error trades for THIS pair — couldn't be placed on the surface (no spot)
     // but still shown in the feed so the user sees them flow in.
     var spotErrs = (window._spotErrTrades || []).filter(function(s) { return s.pair === dAP; });
+    var pkgCount = (window._pkgLegTrades || []).filter(function(s) { return s.pair === dAP; }).length;
 
     document.getElementById('dfc').textContent = tr.length + ' prints'
+        + (pkgCount ? ' + ' + pkgCount + ' pkg legs' : '')
         + (spotErrs.length ? ' + ' + spotErrs.length + ' spot err' : '');
     var list = document.getElementById('dfl');
-    if (!tr.length && !spotErrs.length) { list.innerHTML = '<div style="padding:2rem;text-align:center;color:#888">No prints</div>'; return; }
+    if (!tr.length && !spotErrs.length && !pkgCount) { list.innerHTML = '<div style="padding:2rem;text-align:center;color:#888">No prints</div>'; return; }
 
     var hdr = document.querySelector('.dtcc-feed-header');
     var gridCols = '62px 38px 48px 48px 42px 46px 34px 56px';
@@ -692,14 +888,15 @@ dRFeed = function() {
         hdr.style.gridTemplateColumns = gridCols;
     }
 
-    var today = new Date().toISOString().slice(0, 10);
+    var today = _tradingDayNY();  // trading day with 5pm-ET roll, not UTC date
 
     var h = '';
     tr.slice(0, 200).forEach(function(t, i) {
         var tc = t.ic ? 'color:#66bb6a' : 'color:#ef5350';
         var vc = t.iv >= 15 ? 'color:#ffa726;font-weight:700' : t.iv >= 10 ? 'color:#90caf9;font-weight:600' : 'color:#aaa';
         var sc = t.notl >= 50 ? 'color:#ffa726;font-weight:700' : t.notl >= 20 ? 'color:#90caf9;font-weight:600' : 'color:#888';
-        var ivTxt = t.iv.toFixed(1) + (t.ivSrc === 'calc' ? '*' : '');
+        // IV text: '*' = solved from premium, '~' = DERIVED from package decomposition
+        var ivTxt = t.iv.toFixed(1) + (t.derived ? '~' : (t.ivSrc === 'calc' ? '*' : ''));
         var notlR = Math.round(t.notl * 2) / 2;
         var notlTxt = notlR >= 1000 ? (notlR/1000).toFixed(1) + 'B' : notlR.toFixed(1) + 'M';
         var kTxt = t.strike >= 1000 ? t.strike.toFixed(0) : t.strike < 10 ? t.strike.toFixed(4) : t.strike.toFixed(2);
@@ -749,15 +946,50 @@ dRFeed = function() {
             }
         }
 
-        h += '<div class="dtcc-feed-item' + (i < 3 ? ' fresh' : '') + '" style="grid-template-columns:' + gridCols + '">'
+        var rowStyle = 'grid-template-columns:' + gridCols;
+        if (t.derived) rowStyle += ';border-left:2px dashed #ab47bc;background:rgba(171,71,188,0.06)';
+        h += '<div class="dtcc-feed-item' + (i < 3 ? ' fresh' : '') + '" style="' + rowStyle + '"'
+            + (t.derived ? ' title="DERIVED leg vol — ' + (t.structure||'package')
+               + ' decomposed using surface anchor (' + (t.anchorSrc||'?') + '). Not directly observed."' : '')
+            + '>'
             + '<span style="' + tc + ';font-weight:700;font-size:10px">' + kTxt + '</span>'
             + '<span style="color:#888;font-variant-numeric:tabular-nums;font-size:10px">' + t.time + '</span>'
             + '<span style="color:#888;font-size:10px">' + expTxt + '</span>'
             + '<span style="' + sc + '">$' + notlTxt + '</span>'
-            + '<span style="' + vc + '">' + ivTxt + '</span>'
+            + '<span style="' + (t.derived ? 'color:#ce93d8;font-weight:700' : vc) + '">' + ivTxt + '</span>'
             + '<span style="' + diffStyle + ';font-size:10px">' + diffTxt + '</span>'
             + '<span style="color:#888">' + dTxt + '</span>'
             + '<span style="' + spotStyle + ';font-size:10px">' + spotTxt + '</span></div>';
+    });
+
+    // Prepend package legs that could NOT be decomposed (no vol-notation price,
+    // no surface anchor, or unclassifiable structure). Decomposed legs already
+    // appear in the main feed above, tagged derived (~).
+    var pkgLegs = (window._pkgLegTrades || []).filter(function(s) {
+        return s.pair === dAP && s.derivedIV == null;
+    });
+    var ph = '';
+    pkgLegs.slice(0, 60).forEach(function(s) {
+        var tc = s.type === 'CALL' ? 'color:#66bb6a' : s.type === 'PUT' ? 'color:#ef5350' : 'color:#999';
+        var kTxt = !s.strike ? '-' : s.strike >= 1000 ? s.strike.toFixed(0)
+                   : s.strike < 10 ? s.strike.toFixed(4) : s.strike.toFixed(2);
+        var notlR = Math.round((s.notl||0) * 2) / 2;
+        var notlTxt = notlR >= 1000 ? (notlR/1000).toFixed(1)+'B' : notlR.toFixed(1)+'M';
+        var expTxt = s.expiry ? s.expiry.slice(5) : '';
+        var pid = s.pkg_id ? String(s.pkg_id).slice(-6) : '';
+        var structTxt = s.structure && s.structure !== 'UNKNOWN' ? s.structure : 'structure';
+        ph += '<div class="dtcc-feed-item" style="grid-template-columns:' + gridCols
+            + ';background:rgba(171,71,188,0.10)" title="Package leg (' + structTxt + '). '
+            + 'Could not derive a per-leg vol — needs a vol-notation package price and a '
+            + 'surface anchor. Package id: ' + (s.pkg_id||'?') + '">'
+            + '<span style="' + tc + ';font-weight:700;font-size:10px">' + kTxt + (s.isNdo ? ' \u00b7NDO' : '') + '</span>'
+            + '<span style="color:#888;font-size:10px">' + (s.time||'') + '</span>'
+            + '<span style="color:#888;font-size:10px">' + expTxt + '</span>'
+            + '<span style="color:#999;font-size:10px">$' + notlTxt + '</span>'
+            + '<span style="color:#ce93d8;font-size:9px;font-weight:700">PKG</span>'
+            + '<span style="color:#9575cd;font-size:9px">' + (pid ? '#'+pid : 'leg') + '</span>'
+            + '<span style="color:#555">-</span>'
+            + '<span style="color:#9575cd;font-size:9px">' + structTxt + '</span></div>';
     });
 
     // Prepend spot-error trades — visible but flagged, not on the surface
@@ -780,7 +1012,7 @@ dRFeed = function() {
             + '<span style="color:#555">-</span>'
             + '<span style="color:#ef5350;font-size:9px">no spot</span></div>';
     });
-    list.innerHTML = seh + h;
+    list.innerHTML = seh + ph + h;
 };
 
 // === PORTFOLIO TAB OVERRIDES ===
@@ -1084,7 +1316,7 @@ function _dtccHeatmapClick(data) {
         return;
     }
 
-    var today = new Date().toISOString().slice(0, 10);
+    var today = _tradingDayNY();  // trading day with 5pm-ET roll, not UTC date
     var h = '<table style="width:100%"><tr><th>Time</th><th>Strike</th><th>Expiry</th><th>Type</th><th>Vol</th><th>vs Mark</th><th>Delta</th><th>Notl</th><th>Spot@T</th></tr>';
     trades.sort(function(a, b) { return a.time > b.time ? -1 : 1; }).forEach(function(t) {
         var scaledIV = markVol !== null ? _applyScaler(t.iv, markVol) : t.iv;
@@ -1765,6 +1997,8 @@ FIELD_MAP = {
     'pkg_price':   ['packageTransactionPrice','Package transaction price'],
     'pkg_notation': ['packageTransactionPriceNotation','Package transaction price notation'],
     'package_ind':  ['packageIndicator','Package Indicator','Package indicator'],
+    'pkg_id':      ['packageTransactionIdentifier','Package Transaction Identifier',
+                    'packageIdentifier','Package Identifier','packageTransactionID'],
     'nonstandard':  ['nonstandardizedTermIndicator','Nonstandardized Term Indicator',
                      'Non-standardized Term Indicator','nonstandardTermIndicator'],
 }
@@ -1826,6 +2060,29 @@ def parse_ts(s):
         except Exception:
             continue
     return None
+
+# The CFTC/DTCC trading day ends at 5pm New York time. Any trade executed at or
+# after 17:00 ET belongs to the NEXT trading day. The end-of-day cumulative file
+# CFTC_CUMULATIVE_FOREX_{date}.zip is keyed by this trading day, NOT by UTC date.
+_TRADING_DAY_ROLL_HOUR = 17  # 5pm ET
+
+def _trading_day(dt):
+    """Given a tz-aware datetime, return the DTCC trading day (a date object).
+    Trades at/after 5pm ET roll into the next trading day."""
+    if dt is None:
+        return None
+    ny = _to_ny(dt)
+    if ny is None:
+        return None
+    d = ny.date()
+    if ny.hour >= _TRADING_DAY_ROLL_HOUR:
+        d = d + timedelta(days=1)
+    return d
+
+def _current_trading_day():
+    """The trading day we are currently in (now, in ET, with 5pm roll)."""
+    return _trading_day(datetime.now(timezone.utc))
+
 
 def extract_tape_record(row):
     """Lightweight extraction for the RAW TAPE view — captures every row regardless
@@ -1943,8 +2200,21 @@ def parse_trade(row, stats=None):
     if opt_subtype not in ('VAN', 'NDO'):
         return reject(f'opt_subtype_not_VAN_NDO (got: {opt_subtype})', upi[:80])
 
+    # Package detection: a trade is a package if EITHER the packageIndicator is
+    # set OR a packageTransactionIdentifier is present. DTCC often populates the
+    # ID but leaves the indicator blank, so relying on the indicator alone misses
+    # many risk-reversal / butterfly legs.
     pkg_ind = get_field(row, 'package_ind').upper()
-    is_package = pkg_ind in ('TRUE', 'Y', 'YES', '1')
+    pkg_id_val = get_field(row, 'pkg_id')
+    indicator_says_pkg = pkg_ind in ('TRUE', 'T', 'Y', 'YES', '1')
+    has_pkg_id = bool(pkg_id_val and pkg_id_val.strip()
+                      and pkg_id_val.strip().upper() not in ('', 'N/A', 'NA', 'NONE', '0'))
+    is_package = indicator_says_pkg or has_pkg_id
+    if stats is not None and is_package:
+        pkgsrc = stats.setdefault('package_detect_source', {'indicator': 0, 'id_only': 0, 'both': 0})
+        if indicator_says_pkg and has_pkg_id: pkgsrc['both'] += 1
+        elif indicator_says_pkg:             pkgsrc['indicator'] += 1
+        else:                                pkgsrc['id_only'] += 1
 
     ns_ind = get_field(row, 'nonstandard').upper()
     if ns_ind in ('TRUE', 'Y', 'YES', '1'):
@@ -1967,8 +2237,11 @@ def parse_trade(row, stats=None):
         return reject('strike_zero_or_negative', get_field(row, 'strike'))
     exp_raw = get_field(row, 'expiry')
     try:
-        exp = datetime.strptime(exp_raw[:10], '%Y-%m-%d')
-        days = max(1, (exp - datetime.now()).days)
+        exp = datetime.strptime(exp_raw[:10], '%Y-%m-%d').date()
+        # Measure time-to-expiry from the current trading day (5pm ET roll),
+        # so the day count is consistent with how the trading day is defined.
+        ref = _current_trading_day() or datetime.now(timezone.utc).date()
+        days = max(1, (exp - ref).days)
         if days <= 0:
             return reject('expired (days<=0)', f'exp={exp_raw} days={days}')
         if days > 1500:
@@ -2025,9 +2298,16 @@ def parse_trade(row, stats=None):
         'days':days,'premium':prem,'premium_ccy':prem_ccy,'base_notl':base_notl,
         'base_ccy':base_ccy,'terms_ccy':terms_ccy,'usd_amt':usd,'iv':iv,
         'is_package': is_package, 'is_ndo': (opt_subtype == 'NDO'), 'subtype': opt_subtype,
-        # Display time + date in NEW YORK time so it matches what a NY trader expects
+        'pkg_id': get_field(row, 'pkg_id'),
+        'pkg_price': pkg_p, 'pkg_notation': pkg_n,
+        # Display time in NEW YORK time so it matches what a NY trader expects.
         'time': ts_ny.strftime('%H:%M') if ts_ny else '',
+        # trade_date = CALENDAR date in ET — used for historical spot lookup
+        # (you want the spot at the actual wall-clock moment of the trade).
         'trade_date': ts_ny.strftime('%Y-%m-%d') if ts_ny else '',
+        # trading_day = DTCC trading session (5pm ET roll) — a 6pm ET trade
+        # belongs to the NEXT trading day. Used for day-bucketing / EOD files.
+        'trading_day': _trading_day(ts).strftime('%Y-%m-%d') if ts else '',
         'ts_source': ts_source,
         'expiry':exp.strftime('%Y-%m-%d'),
         # _ts keeps full UTC ISO for any internal comparisons
@@ -2130,9 +2410,13 @@ class DTCCReader:
         return None
 
     def _load_cumulative(self, cutoff):
-        today = datetime.now(timezone.utc).date()
-        d = cutoff.date()
-        while d < today:
+        # Iterate by TRADING DAY (5pm ET roll), not UTC calendar date.
+        # The cumulative EOD file is keyed by trading day.
+        today_td = _current_trading_day()
+        d = _trading_day(cutoff)
+        if d is None or today_td is None:
+            return
+        while d < today_td:
             ds = d.strftime('%Y_%m_%d')
             if ds not in self._cumul_trades: self._dl_cumul(ds)
             d += timedelta(days=1)
@@ -2953,6 +3237,7 @@ class Handler(SimpleHTTPRequestHandler):
                 'total_rows_seen': _dtcc.diag.get('total_rows', 0),
                 'accepted': _dtcc.diag.get('accepted', 0),
                 'accepted_by_subtype': _dtcc.diag.get('accepted_by_subtype', {}),
+                'package_detect_source': _dtcc.diag.get('package_detect_source', {}),
                 'subtype_tokens_seen': _dtcc.diag.get('subtype_tokens_seen', {}),
                 'rejected_by_reason': _dtcc.diag.get('rejected', {}),
                 'sample_rejected_rows': _dtcc.diag.get('samples', {}),
