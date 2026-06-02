@@ -174,60 +174,119 @@ function _classifyPackage(legs) {
 
 // Decompose package legs into derived per-leg vols. Mutates the leg objects,
 // adding derivedIV, derivedDelta, structure. Returns count successfully decomposed.
+// Side effect: writes window._pkgDecompReasons = {reason: count} for diagnostics.
 function _decomposePackages(pkgLegs) {
-    if (!pkgLegs || !pkgLegs.length) return 0;
+    var reasons = {};
+    var bump = function(r){ reasons[r] = (reasons[r]||0) + 1; };
+    if (!pkgLegs || !pkgLegs.length) {
+        window._pkgDecompReasons = reasons;
+        return 0;
+    }
     // Group by pkg_id (skip legs without an id — can't group them)
-    var groups = {};
+    var groups = {}, noIdLegs = 0;
     pkgLegs.forEach(function(l) {
-        if (!l.pkg_id) return;
+        if (!l.pkg_id) { noIdLegs++; return; }
         (groups[l.pkg_id] = groups[l.pkg_id] || []).push(l);
     });
+    if (noIdLegs > 0) reasons['skipped: no pkg_id (cannot group)'] = noIdLegs;
     var decomposed = 0;
     Object.keys(groups).forEach(function(pid) {
         var legs = groups[pid];
         var structure = _classifyPackage(legs);
         legs.forEach(function(l){ l.structure = structure; });
-        if (structure !== 'RR' && structure !== 'FLY' && structure !== 'STRANGLE') return;
-
-        // Package price must be in vol terms (notation 3) to be usable as RR/fly
-        var pkgN = String(legs[0].pkg_notation || '');
-        var pkgP = parseFloat(legs[0].pkg_price);
-        if (pkgN !== '3' || isNaN(pkgP)) return;
+        if (structure !== 'RR' && structure !== 'FLY' && structure !== 'STRANGLE') {
+            bump('skipped: structure=' + structure + ' (' + legs.length + ' legs)');
+            return;
+        }
 
         var anchor = _surfaceAnchor(legs[0].pair, legs[0].days);
-        if (!anchor) return;
+        if (!anchor) {
+            bump('skipped: no surface anchor for ' + legs[0].pair);
+            return;
+        }
+
+        var pkgN = String(legs[0].pkg_notation || '');
+        var pkgP = parseFloat(String(legs[0].pkg_price || '').replace(/,/g,''));
+        if (isNaN(pkgP)) {
+            bump('skipped: pkg_price not numeric (raw="' + (legs[0].pkg_price||'') + '")');
+            return;
+        }
+        // The 9.9999999999 sentinel means "no package price" — never treat it as a vol
+        var pkgPlaceholder = (pkgP > 9.99 && pkgP < 10.01);
+        if (pkgPlaceholder) {
+            bump('skipped: pkg_price is 9.9999 placeholder (no real package price)');
+            return;
+        }
 
         var atm = anchor.atm, callV, putV;
-        if (structure === 'RR') {
-            // pkgP is the RR; anchor ATM + fly
-            var rr = pkgP;
-            callV = atm + anchor.fly + rr/2;
-            putV  = atm + anchor.fly - rr/2;
-        } else if (structure === 'FLY') {
-            // pkgP is the fly; anchor ATM + RR
-            var fly = pkgP;
-            callV = atm + fly + anchor.rr/2;
-            putV  = atm + fly - anchor.rr/2;
-        } else { // STRANGLE
-            // pkgP is the strangle vol (avg of wings); anchor RR to split
-            var wingAvg = pkgP;
-            callV = wingAvg + anchor.rr/2;
-            putV  = wingAvg - anchor.rr/2;
-        }
-        // Assign each leg its derived vol by type
-        legs.forEach(function(l) {
-            var v = (l.type === 'CALL') ? callV : putV;
-            if (v > 0.5 && v < 80) {
-                l.derivedIV = v;
-                l.anchorSrc = anchor.src;
-                // Derived delta off the derived vol
-                if (typeof dCD === 'function' && l.fwd > 0) {
-                    l.derivedDelta = dCD(l.fwd, l.strike, v/100, l.T, l.ic, l.rd, l.spot);
+
+        // Only treat as a vol structure if notation 3 AND a plausible vol value
+        if (pkgN === '3' && pkgP > 0 && pkgP < 5) {
+            // ---- Package price is in VOL terms: it directly IS the RR / fly / strangle ----
+            if (structure === 'RR') {
+                callV = atm + anchor.fly + pkgP/2;
+                putV  = atm + anchor.fly - pkgP/2;
+            } else if (structure === 'FLY') {
+                callV = atm + pkgP + anchor.rr/2;
+                putV  = atm + pkgP - anchor.rr/2;
+            } else { // STRANGLE
+                callV = pkgP + anchor.rr/2;
+                putV  = pkgP - anchor.rr/2;
+            }
+            var thisGroupOk = false;
+            legs.forEach(function(l) {
+                var v = (l.type === 'CALL') ? callV : putV;
+                if (v > 0.5 && v < 80) {
+                    l.derivedIV = v; l.anchorSrc = anchor.src; l.deriveMethod = 'vol-notation';
+                    if (typeof dCD === 'function' && l.fwd > 0)
+                        l.derivedDelta = dCD(l.fwd, l.strike, v/100, l.T, l.ic, l.rd, l.spot);
+                    decomposed++; thisGroupOk = true;
+                } else {
+                    bump('vol-notation produced out-of-range v=' + v.toFixed(2));
                 }
-                decomposed++;
+            });
+            if (thisGroupOk) bump('OK: vol-notation ' + structure);
+            return;
+        }
+
+        // ---- Package price is a PREMIUM: split it by the MODEL premium ratio ----
+        if (typeof b76P !== 'function' || typeof b76SolveIV !== 'function') {
+            bump('skipped: b76 helpers not available');
+            return;
+        }
+        var markCallV = atm + anchor.fly + anchor.rr/2;
+        var markPutV  = atm + anchor.fly - anchor.rr/2;
+        var modelTot = 0, modelByLeg = [];
+        legs.forEach(function(l) {
+            var mv = (l.type === 'CALL') ? markCallV : markPutV;
+            var mp = (l.fwd > 0 && l.T > 0)
+                ? Math.abs(b76P(l.fwd, l.strike, l.T, mv/100, l.rd, l.ic)) : 0;
+            modelByLeg.push(mp);
+            modelTot += mp;
+        });
+        if (modelTot <= 0) {
+            bump('skipped: model premiums all zero (missing fwd/T)');
+            return;
+        }
+        var thisOk = false;
+        legs.forEach(function(l, idx) {
+            var share = modelByLeg[idx] / modelTot;
+            var allocPrem = pkgP * share;       // this leg's slice of the package premium
+            var solved = b76SolveIV(l.fwd, l.strike, l.T, l.rd, l.ic, allocPrem);
+            if (solved !== null && solved > 0.5 && solved < 80) {
+                l.derivedIV = solved;
+                l.anchorSrc = anchor.src;
+                l.deriveMethod = 'prem-split';
+                if (typeof dCD === 'function' && l.fwd > 0)
+                    l.derivedDelta = dCD(l.fwd, l.strike, solved/100, l.T, l.ic, l.rd, l.spot);
+                decomposed++; thisOk = true;
+            } else {
+                bump('prem-split solve returned ' + solved + ' (alloc=' + allocPrem.toFixed(6) + ')');
             }
         });
+        if (thisOk) bump('OK: prem-split ' + structure + ' (pkgN=' + (pkgN||'empty') + ')');
     });
+    window._pkgDecompReasons = reasons;
     return decomposed;
 }
 
@@ -282,6 +341,35 @@ if (_origDProcTrades) {
         window._spotErrTrades = [];
         // Reset package-leg buffer — package legs (RR/fly) with no per-leg IV
         window._pkgLegTrades = [];
+
+        // ---- DEDUP PRE-PASS ----
+        // Same trade can arrive from the ticker, a slice file, AND the cumulative
+        // file. Each ingest path may parse the IV field differently, producing
+        // visually-identical rows with different vols. Dedup by dissem id first,
+        // then by a structural fingerprint for trades missing a dissem id.
+        var seenDids = {}, seenSig = {}, dedupHits = 0;
+        var dedupedTrades = [];
+        trades.forEach(function(t) {
+            var did = t._did || '';
+            if (did) {
+                if (seenDids[did]) { dedupHits++; return; }
+                seenDids[did] = true;
+                dedupedTrades.push(t);
+                return;
+            }
+            // No dissem id — build a structural signature
+            var sig = (t.pair||'') + '|' + (t.opt_type||'') + '|' + (t.strike||'') + '|'
+                    + (t.expiry||'') + '|' + (t.time||'') + '|' + (t.usd_amt||'') + '|'
+                    + (t.premium||'') + '|' + (t.premium_ccy||'');
+            if (seenSig[sig]) { dedupHits++; return; }
+            seenSig[sig] = true;
+            dedupedTrades.push(t);
+        });
+        window._dedupHits = dedupHits;
+        trades = dedupedTrades;
+
+        // Track ivSrc distribution for diagnostics
+        var ivSrcStats = {calc: 0, site: 0, derived: 0, none: 0};
 
         trades.forEach(function(t) { try {
             var isNdo = (t.is_ndo === true || t.is_ndo === 'true' || t.subtype === 'NDO');
@@ -358,31 +446,106 @@ if (_origDProcTrades) {
             var baseCcy = (t.base_ccy || pk.slice(0,3)).toUpperCase();
             var termsCcy = (t.terms_ccy || pk.slice(3)).toUpperCase();
             var baseNotl = t.base_notl ? parseFloat(t.base_notl) : 0;
-            if (baseNotl <= 0) baseNotl = notl * 1e6 / spot;  // fallback estimate
+            if (baseNotl <= 0) {
+                // base_notl wasn't resolved from the DTCC legs. Recover it without
+                // needing a USD cross-rate:
+                //   1. If terms_notl is known: base_notl = terms_notl / fwd  (exact)
+                //   2. Else if base IS USD: base_notl = usd_amt * 1e6        (exact)
+                //   3. Else if terms IS USD: base_notl = usd_amt*1e6 / spot  (spot is a USD rate here)
+                //   4. Else (a cross): try to derive USD/base from mktSurfaces — for
+                //      EURGBP we look up either EURUSD or USDGBP/GBPUSD spot. This
+                //      uses default surfaces when BBG isn't connected, which is at
+                //      least better than skipping.
+                //   5. Else: leave 0 -> IV solve skipped (genuinely unresolvable)
+                var termsNotl = t.terms_notl ? parseFloat(t.terms_notl) : 0;
+                if (termsNotl > 0 && fwd > 0) {
+                    baseNotl = termsNotl / fwd;
+                } else if (baseCcy === 'USD') {
+                    baseNotl = notl * 1e6;
+                } else if (termsCcy === 'USD') {
+                    baseNotl = notl * 1e6 / spot;
+                } else {
+                    // Cross-pair: try to find a USD/base rate via mktSurfaces
+                    var usdBaseRate = 0;
+                    var baseUsd = baseCcy + 'USD'; // e.g. EURUSD
+                    var usdBase = 'USD' + baseCcy; // e.g. USDJPY
+                    if (mktSurfaces[baseUsd] && mktSurfaces[baseUsd].spot > 0) {
+                        usdBaseRate = mktSurfaces[baseUsd].spot;  // base in USD
+                    } else if (mktSurfaces[usdBase] && mktSurfaces[usdBase].spot > 0) {
+                        usdBaseRate = 1 / mktSurfaces[usdBase].spot;
+                    }
+                    if (usdBaseRate > 0 && notl > 0) {
+                        // notl is USD-millions. base_notl = USD-amount / (USD per base)
+                        baseNotl = notl * 1e6 / usdBaseRate;
+                    } else {
+                        baseNotl = 0;  // truly unresolvable
+                    }
+                }
+            }
 
-            if (premRaw > 0 && baseNotl > 0 && !isPackage) {
+            // Use packageTransactionPrice as the premium for SINGLETON packages
+            // (rows tagged is_package=True but with no other leg sharing the pkg_id
+            // or grouped by execution time). DTCC flags many lone trades as
+            // "packages" for clearing reasons; their packageTransactionPrice is the
+            // actual cash premium and we should solve their IV normally.
+            // The package-price notation field is unreliable. DTCC marks many
+            // single-leg trades as notation '3' (vol) but fills packageTransactionPrice
+            // with a sentinel value of 9.9999999999 meaning "no package price given".
+            // Those are NOT vol-quoted structures — they have real per-leg premiums
+            // and should solve normally. A GENUINE vol-quote has a small, plausible
+            // value (e.g. 0.05 for a fly, or 1-30 for an ATM/RR vol). We treat
+            // notation '3' as a real structural vol quote ONLY when pkg_price is in
+            // a believable vol range and is not the 9.9999 sentinel.
+            var pkgN = String(t.pkg_notation || '');
+            var pkgP = parseFloat(String(t.pkg_price || '').replace(/,/g,''));
+            var pkgPlaceholder = (!isNaN(pkgP) && pkgP > 9.99 && pkgP < 10.01); // 9.9999... sentinel
+            // A real vol-notation structure: notation 3, plausible vol value, not sentinel
+            var isVolStructure = (pkgN === '3' && !isNaN(pkgP) && pkgP > 0 && pkgP < 5 && !pkgPlaceholder);
+
+            // If we have no premium but a NON-vol package premium is populated, adopt it
+            // (notation 1 = premium amount). Skip the 9.9999 sentinel and real vol quotes.
+            if (premRaw <= 0 && !isNaN(pkgP) && pkgP !== 0 && !isVolStructure && !pkgPlaceholder) {
+                premRaw = Math.abs(pkgP);
+                if (!premCcy && t.terms_ccy) premCcy = t.terms_ccy; // best-effort default
+            }
+
+            // Allow the premium-based solve to fire for packages too, EXCEPT when the
+            // package is a GENUINE vol-notation structure (those go to _decomposePackages).
+            // Placeholder-notation-3 trades (9.9999) are allowed to solve normally.
+            var allowSolve = !isPackage || !isVolStructure;
+
+            // Compute this leg's own mktP (premium in TERMS per unit BASE) up front —
+            // we need it both for the normal solve AND, if this is a vol structure that
+            // fails decomposition, for a last-resort own-premium solve.
+            var legMktP = null;
+            if (premRaw > 0 && baseNotl > 0) {
+                if (premCcy === termsCcy) {
+                    legMktP = premRaw / baseNotl;
+                } else if (premCcy === baseCcy) {
+                    legMktP = premRaw * fwd / baseNotl;
+                } else if (premCcy === 'USD' && termsCcy !== 'USD' && baseCcy !== 'USD') {
+                    legMktP = null;  // USD prem on a cross — can't convert without USD/terms
+                } else if (premCcy === 'USD' && termsCcy !== 'USD') {
+                    legMktP = premRaw * fwd / baseNotl;
+                } else {
+                    legMktP = premRaw / baseNotl;
+                }
+            }
+
+            if (premRaw > 0 && baseNotl > 0 && allowSolve) {
                 // B76P = price in TERMS ccy per unit BASE ccy
                 // So mktP = total_prem_in_TERMS / base_notional
-                var mktP;
-                if (premCcy === termsCcy) {
-                    // Premium already in terms currency — just divide by base notional
-                    // e.g. USDJPY prem in JPY: mktP = prem_JPY / USD_notl
-                    mktP = premRaw / baseNotl;
-                } else if (premCcy === baseCcy) {
-                    // Premium in base currency — multiply by fwd to get terms ccy
-                    // e.g. EURUSD prem in EUR: mktP = prem_EUR * fwd / EUR_notl
-                    mktP = premRaw * fwd / baseNotl;
-                } else if (premCcy === 'USD' && termsCcy !== 'USD') {
-                    // Premium in USD, but terms is not USD (e.g. EURGBP)
-                    // Would need cross rate — approximate with spot
-                    mktP = premRaw * spot / baseNotl;
-                } else {
-                    // Premium in USD, terms is USD (e.g. EURUSD, GBPUSD)
-                    mktP = premRaw / baseNotl;
-                }
-                var solvedIV = b76SolveIV(fwd, strike, T, rd, apiIsCall, mktP);
+                var mktP = legMktP;
+                // Track WHY the solve failed at each gate so we can show it later
+                var solveFail = null;
+                var solvedIV = (mktP !== null && mktP > 0)
+                    ? b76SolveIV(fwd, strike, T, rd, apiIsCall, mktP) : null;
+                if (mktP === null) solveFail = 'mktP null (cross w/ USD prem; baseCcy=' + baseCcy + ' termsCcy=' + termsCcy + ')';
+                else if (mktP <= 0) solveFail = 'mktP <= 0 (prem=' + premRaw + ' ' + premCcy + ' baseNotl=' + baseNotl.toExponential(2) + ')';
+                else if (solvedIV === null) solveFail = 'solver rej (mktP=' + mktP.toExponential(3) + ' K=' + strike + ' F=' + fwd.toFixed(5) + ' T=' + T.toFixed(3) + ')';
                 if (solvedIV !== null) {
-                    // Sanity check: reject if IV is more than 2.5x the ATM mark
+                    // Sanity check: reject if IV is more than 3x the ATM mark
+                    // (loosened from 1.5x — EM pairs in stress trade 2-3x ATM)
                     var atmMark = 0;
                     if (mktSurfaces[pk] && mktSurfaces[pk].tenors) {
                         var tnrs2 = mktSurfaces[pk].tenors, bestTi2 = 0, bestDist2 = 9999;
@@ -392,22 +555,48 @@ if (_origDProcTrades) {
                         }
                         atmMark = tnrs2[bestTi2].atm || 0;
                     }
-                    if (atmMark > 0 && solvedIV > atmMark * 1.5) {
-                        // Solved IV way above marks — likely currency mismatch or exotic premium
-                        // Skip this solve, fall through to package price
+                    if (atmMark > 0 && solvedIV > atmMark * 3.0) {
+                        solveFail = 'IV ' + solvedIV.toFixed(1) + ' > 3x ATM mark ' + atmMark.toFixed(1) + ' (rejected)';
                     } else {
                         iv = solvedIV; solved++;
                     }
                 }
+                // Stash failure reason for later visibility
+                t._solveFail = solveFail;
             } else {
                 if (isPackage) noPkg++;
                 else noPrem++;
+                // Be specific about WHY the prem*notl gate failed — too often this
+                // looked like "no notl" when it was really "no premium" or vice versa.
+                if (premRaw <= 0 && baseNotl <= 0) {
+                    t._solveFail = 'no prem & no notl (premRaw=' + premRaw + ' baseNotl=' + baseNotl
+                        + ' usd_amt=' + (t.usd_amt||0) + ' base_ccy=' + baseCcy + ' terms_ccy=' + termsCcy
+                        + ' base_notl=' + (t.base_notl||'') + ' terms_notl=' + (t.terms_notl||'') + ')';
+                } else if (premRaw <= 0) {
+                    t._solveFail = 'no premium (pkg_price=' + (t.pkg_price||'empty')
+                        + ' pkg_notation=' + (t.pkg_notation||'empty')
+                        + ' premium_ccy=' + (t.premium_ccy||'empty') + ')';
+                } else {
+                    t._solveFail = 'no base notional (premRaw=' + premRaw + ' ' + premCcy
+                        + ' base_ccy=' + baseCcy + ' terms_ccy=' + termsCcy
+                        + ' base_notl=' + (t.base_notl||'empty') + ' terms_notl=' + (t.terms_notl||'empty')
+                        + ' usd_amt=' + (t.usd_amt||0) + ')';
+                }
             }
 
             // Fallback: packageTransactionPrice with notation=3 (percentage = IV)
+            // Track per-trade IV source explicitly. 'calc' = solved from premium,
+            // 'site' = taken from DTCC's reported IV field, 'none' = no IV.
+            var thisIvSrc = 'none';
+            if (iv !== null) thisIvSrc = 'calc';
+
             if (iv === null && t.iv != null && t.iv !== '\u2014' && t.iv !== '') {
                 var siteIV = parseFloat(String(t.iv).replace('%', ''));
-                if (!isNaN(siteIV) && siteIV > 0) { iv = siteIV; fallback++; }
+                if (!isNaN(siteIV) && siteIV > 0) {
+                    iv = siteIV;
+                    fallback++;
+                    thisIvSrc = 'site';
+                }
             }
             if (iv === null) {
                 // No IV could be derived. If this is a PACKAGE leg, that's expected —
@@ -424,7 +613,12 @@ if (_origDProcTrades) {
                         delta: null, pkg_id: t.pkg_id || '',
                         pkg_price: t.pkg_price || '', pkg_notation: t.pkg_notation || '',
                         isNdo: isNdo, subtype: t.subtype || '',
-                        derivedIV: null, derivedDelta: null, structure: null
+                        derivedIV: null, derivedDelta: null, structure: null,
+                        solveFail: t._solveFail || 'unknown',
+                        // Carry the leg's OWN computed mktP (terms per base) so that if
+                        // structural decomposition fails, we can still try to solve the
+                        // leg from its own premium as a last resort.
+                        ownMktP: legMktP
                     });
                     noPkg++;
                     return;
@@ -444,10 +638,11 @@ if (_origDProcTrades) {
             }
             if (spot > 0 && (!dPM[pk] || t.time > (dPM[pk].lt || ''))) dPM[pk] = {spot: spot, lt: t.time};
             if (isNdo) ndoStats.accepted++;
+            ivSrcStats[thisIvSrc] = (ivSrcStats[thisIvSrc] || 0) + 1;
             dAT[pk].push({
                 time: t.time || '', type: ic ? 'CALL' : 'PUT', strike: strike, spot: spot,
                 fwd: fwd, days: days, iv: iv, notl: notl, expiry: t.expiry || '',
-                ic: ic, delta: delta, ivSrc: solved > fallback ? 'calc' : 'site',
+                ic: ic, delta: delta, ivSrc: thisIvSrc,
                 isNdo: isNdo, fwdSrc: fwdSource, trade_date: t.trade_date || ''
             });
         } catch(e) { skipped++; } });
@@ -459,6 +654,48 @@ if (_origDProcTrades) {
         var pkgDecomposed = 0;
         if (window._pkgLegTrades && window._pkgLegTrades.length) {
             pkgDecomposed = _decomposePackages(window._pkgLegTrades);
+
+            // Last-resort: for legs decomposition couldn't resolve but which have
+            // their own premium (ownMktP), solve the leg directly from its own
+            // premium. Accept only if the result is in a sane range vs the surface
+            // ATM — this guards against legs whose "premium" is actually the
+            // package NET premium (which would solve to a near-zero garbage vol).
+            var ownSolved = 0;
+            window._pkgLegTrades.forEach(function(l) {
+                if (l.derivedIV != null) return;          // decomposition already got it
+                if (l.ownMktP == null || l.ownMktP <= 0) return;  // no usable own premium
+                if (typeof b76SolveIV !== 'function') return;
+                var iv2 = b76SolveIV(l.fwd, l.strike, l.T, l.rd, l.ic, l.ownMktP);
+                if (iv2 === null || iv2 <= 0.5 || iv2 >= 80) {
+                    l.solveFail = 'own-prem solve out of range (' + (iv2===null?'null':iv2.toFixed(1)) + ')';
+                    return;
+                }
+                // Sane-range gate vs surface ATM at the leg's tenor
+                var atmM = 0;
+                if (mktSurfaces[l.pair] && mktSurfaces[l.pair].tenors) {
+                    var tn = mktSurfaces[l.pair].tenors, bi = 0, bd = 9999;
+                    for (var ii = 0; ii < tn.length; ii++) {
+                        var dd = Math.abs(tn[ii].T * 365 - l.days);
+                        if (dd < bd) { bd = dd; bi = ii; }
+                    }
+                    atmM = tn[bi].atm || 0;
+                }
+                // Accept if within [0.3x, 3x] of ATM mark (or if no mark to compare)
+                if (atmM > 0 && (iv2 < atmM * 0.3 || iv2 > atmM * 3.0)) {
+                    l.solveFail = 'own-prem IV ' + iv2.toFixed(1) + ' off ATM ' + atmM.toFixed(1)
+                        + ' (likely net pkg premium, not leg premium)';
+                    return;
+                }
+                l.derivedIV = iv2;
+                l.deriveMethod = 'own-premium';
+                l.anchorSrc = 'leg-premium';
+                if (typeof dCD === 'function' && l.fwd > 0)
+                    l.derivedDelta = dCD(l.fwd, l.strike, iv2/100, l.T, l.ic, l.rd, l.spot);
+                ownSolved++;
+            });
+            pkgDecomposed += ownSolved;
+            window._pkgOwnSolved = ownSolved;
+
             window._pkgLegTrades.forEach(function(l) {
                 if (l.derivedIV == null) return;
                 var lpk = l.pair;
@@ -471,14 +708,50 @@ if (_origDProcTrades) {
                     expiry: l.expiry || '', ic: l.ic, delta: dlt,
                     ivSrc: 'derived', isNdo: l.isNdo, fwdSrc: 'pkg',
                     trade_date: l.trade_date || '',
-                    derived: true, structure: l.structure, anchorSrc: l.anchorSrc
+                    derived: true, structure: l.structure, anchorSrc: l.anchorSrc,
+                    deriveMethod: l.deriveMethod
                 });
             });
         }
         window._pkgDecomposed = pkgDecomposed;
 
+        // ---- Historic spot-at-trade tagging (batched) ----
+        // For each trade, fetch the Bloomberg spot at the trade's actual execution
+        // time (snapped to nearest 5-minute bucket) and recompute its delta off
+        // that spot rather than the current live spot. Batched so we issue at most
+        // one Bloomberg request per (pair, date).
+        _tagHistoricSpots(dAT);
+
         // Expose NDO diagnostics globally so the Diag modal can show them
         window._ndoStats = ndoStats;
+        window._ivSrcStats = ivSrcStats;
+        // Decomposition diagnostics: count by structure type detected
+        var structCounts = {};
+        (window._pkgLegTrades || []).forEach(function(l){
+            var s = l.structure || 'UNKNOWN';
+            structCounts[s] = (structCounts[s] || 0) + 1;
+        });
+        window._pkgStructCounts = structCounts;
+        // Histogram of solve-failure reasons across all package legs
+        var solveFails = {};
+        (window._pkgLegTrades || []).forEach(function(l){
+            if (l.derivedIV != null) return;  // decomposed legs don't count
+            var r = l.solveFail || 'unknown';
+            // Strip varying numeric details so similar failures group together
+            r = r.replace(/mktP=[\d.eE+-]+/, 'mktP=<num>')
+                 .replace(/K=[\d.eE+-]+/, 'K=<num>')
+                 .replace(/F=[\d.eE+-]+/, 'F=<num>')
+                 .replace(/ATM mark [\d.]+/, 'ATM mark <num>')
+                 .replace(/IV [\d.]+/, 'IV <num>');
+            solveFails[r] = (solveFails[r]||0) + 1;
+        });
+        window._pkgSolveFails = solveFails;
+
+        // Always bump monotonic counters at the end of each dProcTrades — this
+        // way the hibernate stats are accurate even if the user never opened it.
+        if (typeof _bumpMonotonicCounters === 'function') {
+            try { _bumpMonotonicCounters(); } catch (e) {}
+        }
 
         var dot = document.getElementById('dd'), txt = document.getElementById('dt');
         if (dot && dot.className.indexOf('ok') >= 0) {
@@ -697,11 +970,16 @@ if (_origDBuildSurf) {
 
 // === HEATMAP: show MY MARKS with alert emojis where DTCC prints deviate ===
 dRSurf = function() {
+    // Guard against being called when the DTCC tab DOM isn't present (e.g. on
+    // first run before the tab has been viewed, or during programmatic refreshes
+    // from other tabs like Restore Defaults).
+    var dspEl = document.getElementById('dsp');
+    if (!dspEl) return;
     var pk = dAP;
     var raw = dCS_raw[pk];  // raw DTCC-derived surface
     var pd = mktSurfaces[pk];
     if (!pd || !pd.tenors) {
-        document.getElementById('dsp').innerHTML = '<div style="text-align:center;padding:80px 20px;color:#888">No marks for ' + pk + '</div>';
+        dspEl.innerHTML = '<div style="text-align:center;padding:80px 20px;color:#888">No marks for ' + pk + '</div>';
         return;
     }
 
@@ -788,12 +1066,15 @@ function dCC2(v) {
 }
 
 dRStrat = function() {
+    // Guard against being called when DTCC tab DOM isn't present
+    var dsbEl = document.getElementById('dsb');
+    if (!dsbEl) return;
     var pk = dAP;
     var raw = dCS_raw[pk];     // raw DTCC surface
     var damped = dCS[pk];      // damped surface
     var tr = dAT[pk] || [];
     var pd = mktSurfaces[pk];
-    if (!pd || !pd.tenors) { document.getElementById('dsb').innerHTML = ''; return; }
+    if (!pd || !pd.tenors) { dsbEl.innerHTML = ''; return; }
 
     // Count trades per tenor
     var tc = Array(DT.length).fill(0);
@@ -866,6 +1147,10 @@ function fetchHistSpot(pair, date, time) {
 dRFeed = function() {
     // If raw tape view is active, don't let the normal feed overwrite it
     if (typeof _dtccTapeOn !== 'undefined' && _dtccTapeOn) { renderDtccTape(); return; }
+    // Guard against being called when DTCC tab DOM isn't present
+    var dfcEl = document.getElementById('dfc');
+    var dflEl = document.getElementById('dfl');
+    if (!dfcEl || !dflEl) return;
 
     var tr = (dAT[dAP] || []).slice().sort(function(a,b) {
         return a.time > b.time ? -1 : a.time < b.time ? 1 : 0;
@@ -873,18 +1158,30 @@ dRFeed = function() {
     // Spot-error trades for THIS pair — couldn't be placed on the surface (no spot)
     // but still shown in the feed so the user sees them flow in.
     var spotErrs = (window._spotErrTrades || []).filter(function(s) { return s.pair === dAP; });
-    var pkgCount = (window._pkgLegTrades || []).filter(function(s) { return s.pair === dAP; }).length;
+    var pkgLegsForPair = (window._pkgLegTrades || []).filter(function(s) { return s.pair === dAP; });
+    var pkgDerivedHere = pkgLegsForPair.filter(function(s){ return s.derivedIV != null; }).length;
+    var pkgUndecHere = pkgLegsForPair.length - pkgDerivedHere;
+    // Global counts (across all pairs) so user can see if ANY packages are flowing even
+    // when this pair has none
+    var pkgTotalGlobal = (window._pkgLegTrades || []).length;
+    var pkgDerivedGlobal = (window._pkgLegTrades || []).filter(function(s){ return s.derivedIV != null; }).length;
 
-    document.getElementById('dfc').textContent = tr.length + ' prints'
-        + (pkgCount ? ' + ' + pkgCount + ' pkg legs' : '')
-        + (spotErrs.length ? ' + ' + spotErrs.length + ' spot err' : '');
+    var statusBits = [tr.length + ' prints'];
+    if (pkgDerivedHere) statusBits.push(pkgDerivedHere + ' pkg-derived');
+    if (pkgUndecHere) statusBits.push(pkgUndecHere + ' pkg-only');
+    if (spotErrs.length) statusBits.push(spotErrs.length + ' spot err');
+    if (pkgTotalGlobal && !pkgLegsForPair.length) {
+        statusBits.push('[' + pkgDerivedGlobal + '/' + pkgTotalGlobal + ' pkg on other pairs]');
+    }
+    document.getElementById('dfc').textContent = statusBits.join(' + ');
     var list = document.getElementById('dfl');
-    if (!tr.length && !spotErrs.length && !pkgCount) { list.innerHTML = '<div style="padding:2rem;text-align:center;color:#888">No prints</div>'; return; }
+    if (!tr.length && !spotErrs.length && !pkgLegsForPair.length) { list.innerHTML = '<div style="padding:2rem;text-align:center;color:#888">No prints</div>'; return; }
 
     var hdr = document.querySelector('.dtcc-feed-header');
-    var gridCols = '62px 38px 48px 48px 42px 46px 34px 56px';
+    // 9-col grid (added Date column next to Time for multi-day lookback)
+    var gridCols = '52px 38px 60px 48px 48px 42px 46px 34px 56px';
     if (hdr) {
-        hdr.innerHTML = '<span>Strike</span><span>Time</span><span>Expiry</span><span>Notl</span><span>Vol</span><span>vs Mk</span><span>\u0394</span><span>Spot@T</span>';
+        hdr.innerHTML = '<span>Date</span><span>Time</span><span>Strike</span><span>Expiry</span><span>Notl</span><span>Vol</span><span>vs Mk</span><span>\u0394</span><span>Spot@T</span>';
         hdr.style.gridTemplateColumns = gridCols;
     }
 
@@ -901,7 +1198,9 @@ dRFeed = function() {
         var notlTxt = notlR >= 1000 ? (notlR/1000).toFixed(1) + 'B' : notlR.toFixed(1) + 'M';
         var kTxt = t.strike >= 1000 ? t.strike.toFixed(0) : t.strike < 10 ? t.strike.toFixed(4) : t.strike.toFixed(2);
         var expTxt = t.expiry ? t.expiry.slice(5) : '';
-        var dTxt = Math.round(Math.abs(t.delta) * 100) + '\u0394';
+        // Prefer historic delta (computed from BBG spot at trade time) when available
+        var dispDelta = (t.deltaHist != null) ? t.deltaHist : t.delta;
+        var dTxt = Math.round(Math.abs(dispDelta) * 100) + '\u0394' + (t.deltaHist != null ? '\u2032' : '');
 
         // vs Mark with SCALER applied
         var diffTxt = '', diffStyle = 'color:#555';
@@ -925,14 +1224,16 @@ dRFeed = function() {
             }
         }
 
-        // Spot at trade time: use live if same day and close to now, else fetch historical
+        // Spot at trade time: prefer historic (Bloomberg @ trade time), else live
         var spotTxt = '-', spotStyle = 'color:#555';
-        if (t.spot > 0) {
-            // Already have a spot (live or tagged at execution)
+        if (t.histSpot > 0) {
+            spotTxt = t.strike >= 1000 ? t.histSpot.toFixed(1) : t.histSpot < 10 ? t.histSpot.toFixed(4) : t.histSpot.toFixed(2);
+            spotStyle = 'color:#90caf9';  // blue tint = historic
+        } else if (t.spot > 0) {
             spotTxt = t.strike >= 1000 ? t.spot.toFixed(1) : t.spot < 10 ? t.spot.toFixed(4) : t.spot.toFixed(2);
             spotStyle = 'color:#aaa';
         } else if (t.time && (t.trade_date || t.expiry)) {
-            // Fetch historical spot for this trade's actual execution date (not today!)
+            // Legacy single-shot fetch fallback (used when batch hasn't returned yet)
             var tradeDate = t.trade_date || today;
             var cacheKey = pk + '|' + tradeDate + '|' + t.time;
             var cached = _histSpotCache[cacheKey];
@@ -948,12 +1249,18 @@ dRFeed = function() {
 
         var rowStyle = 'grid-template-columns:' + gridCols;
         if (t.derived) rowStyle += ';border-left:2px dashed #ab47bc;background:rgba(171,71,188,0.06)';
+        // Compact date: show MM-DD only; full date in title attribute
+        var dateTxt = t.trade_date ? t.trade_date.slice(5) : '';
+        // Highlight if not from today's trading day
+        var isOld = t.trade_date && t.trade_date !== today;
+        var dateStyle = isOld ? 'color:#90caf9;font-size:10px' : 'color:#666;font-size:10px';
         h += '<div class="dtcc-feed-item' + (i < 3 ? ' fresh' : '') + '" style="' + rowStyle + '"'
             + (t.derived ? ' title="DERIVED leg vol — ' + (t.structure||'package')
                + ' decomposed using surface anchor (' + (t.anchorSrc||'?') + '). Not directly observed."' : '')
             + '>'
-            + '<span style="' + tc + ';font-weight:700;font-size:10px">' + kTxt + '</span>'
+            + '<span style="' + dateStyle + '" title="' + (t.trade_date||'') + '">' + dateTxt + '</span>'
             + '<span style="color:#888;font-variant-numeric:tabular-nums;font-size:10px">' + t.time + '</span>'
+            + '<span style="' + tc + ';font-weight:700;font-size:10px">' + kTxt + '</span>'
             + '<span style="color:#888;font-size:10px">' + expTxt + '</span>'
             + '<span style="' + sc + '">$' + notlTxt + '</span>'
             + '<span style="' + (t.derived ? 'color:#ce93d8;font-weight:700' : vc) + '">' + ivTxt + '</span>'
@@ -976,20 +1283,47 @@ dRFeed = function() {
         var notlR = Math.round((s.notl||0) * 2) / 2;
         var notlTxt = notlR >= 1000 ? (notlR/1000).toFixed(1)+'B' : notlR.toFixed(1)+'M';
         var expTxt = s.expiry ? s.expiry.slice(5) : '';
+        var dateTxt = s.trade_date ? s.trade_date.slice(5) : '';
         var pid = s.pkg_id ? String(s.pkg_id).slice(-6) : '';
-        var structTxt = s.structure && s.structure !== 'UNKNOWN' ? s.structure : 'structure';
+        // Friendlier structure labels
+        var structRaw = s.structure || 'UNKNOWN';
+        var structLabels = {RR:'RR', FLY:'FLY', STRANGLE:'STR', STRADDLE:'STD',
+                            SPREAD:'SPRD', UNKNOWN:'PKG'};
+        var structTxt = structLabels[structRaw] || structRaw;
+        // Spot column — historic preferred, then live, then '-'
+        var spotVal = (s.histSpot > 0) ? s.histSpot : (s.spot > 0 ? s.spot : 0);
+        var spotTxt = spotVal > 0
+            ? (s.strike >= 1000 ? spotVal.toFixed(1) : spotVal < 10 ? spotVal.toFixed(4) : spotVal.toFixed(2))
+            : '-';
+        var spotStyle = (s.histSpot > 0) ? 'color:#90caf9' : 'color:#aaa';
+        // Compact failure reason for the row itself (full reason in tooltip).
+        // Examples: "no prem", "no notl", "no anchor", "K=<num>", "IV>3xATM", "no pkg_id"
+        var fail = s.solveFail || '';
+        var shortFail = 'no vol';
+        if (/no prem & no notl/i.test(fail)) shortFail = 'no prem+notl';
+        else if (/no premium/i.test(fail)) shortFail = 'no prem';
+        else if (/no base notional/i.test(fail)) shortFail = 'no notl';
+        else if (/mktP null/i.test(fail)) shortFail = 'cross USD prem';
+        else if (/mktP <= 0/i.test(fail)) shortFail = 'mktP<=0';
+        else if (/solver rej/i.test(fail)) shortFail = 'solver rej';
+        else if (/IV .* > 3x ATM/i.test(fail)) shortFail = 'IV>3xATM';
+        else if (structRaw === 'UNKNOWN' && !s.pkg_id) shortFail = 'no pkg_id';
         ph += '<div class="dtcc-feed-item" style="grid-template-columns:' + gridCols
-            + ';background:rgba(171,71,188,0.10)" title="Package leg (' + structTxt + '). '
-            + 'Could not derive a per-leg vol — needs a vol-notation package price and a '
-            + 'surface anchor. Package id: ' + (s.pkg_id||'?') + '">'
-            + '<span style="' + tc + ';font-weight:700;font-size:10px">' + kTxt + (s.isNdo ? ' \u00b7NDO' : '') + '</span>'
+            + ';background:rgba(171,71,188,0.10);border-left:2px solid #9575cd" '
+            + 'title="' + structRaw + ' package leg. '
+            + (structRaw === 'UNKNOWN' ? 'Structure could not be classified from grouped legs. ' : '')
+            + 'Per-leg vol not derived. '
+            + (fail ? 'Solve failed: ' + fail.replace(/"/g,'') + '. ' : '')
+            + 'Pkg ID: ' + (s.pkg_id||'empty') + '">'
+            + '<span style="color:#666;font-size:10px" title="' + (s.trade_date||'') + '">' + dateTxt + '</span>'
             + '<span style="color:#888;font-size:10px">' + (s.time||'') + '</span>'
+            + '<span style="' + tc + ';font-weight:700;font-size:10px">' + kTxt + (s.isNdo ? ' \u00b7NDO' : '') + '</span>'
             + '<span style="color:#888;font-size:10px">' + expTxt + '</span>'
             + '<span style="color:#999;font-size:10px">$' + notlTxt + '</span>'
-            + '<span style="color:#ce93d8;font-size:9px;font-weight:700">PKG</span>'
-            + '<span style="color:#9575cd;font-size:9px">' + (pid ? '#'+pid : 'leg') + '</span>'
-            + '<span style="color:#555">-</span>'
-            + '<span style="color:#9575cd;font-size:9px">' + structTxt + '</span></div>';
+            + '<span style="color:#ce93d8;font-size:9px;font-weight:700">' + structTxt + '</span>'
+            + '<span style="color:#ef5350;font-size:9px">' + shortFail + '</span>'
+            + '<span style="color:#9575cd;font-size:9px">' + (pid ? '#'+pid : '') + '</span>'
+            + '<span style="' + spotStyle + ';font-size:10px">' + spotTxt + '</span></div>';
     });
 
     // Prepend spot-error trades — visible but flagged, not on the surface
@@ -1001,10 +1335,12 @@ dRFeed = function() {
         var notlR = Math.round((s.notl||0) * 2) / 2;
         var notlTxt = notlR >= 1000 ? (notlR/1000).toFixed(1)+'B' : notlR.toFixed(1)+'M';
         var expTxt = s.expiry ? s.expiry.slice(5) : '';
+        var dateTxt = s.trade_date ? s.trade_date.slice(5) : '';
         seh += '<div class="dtcc-feed-item" style="grid-template-columns:' + gridCols
             + ';background:rgba(239,83,80,0.08)" title="No spot available - shown for visibility, not mapped to surface">'
-            + '<span style="' + tc + ';font-weight:700;font-size:10px">' + kTxt + (s.isNdo ? ' \u00b7NDO' : '') + '</span>'
+            + '<span style="color:#666;font-size:10px" title="' + (s.trade_date||'') + '">' + dateTxt + '</span>'
             + '<span style="color:#888;font-size:10px">' + (s.time||'') + '</span>'
+            + '<span style="' + tc + ';font-weight:700;font-size:10px">' + kTxt + (s.isNdo ? ' \u00b7NDO' : '') + '</span>'
             + '<span style="color:#888;font-size:10px">' + expTxt + '</span>'
             + '<span style="color:#999;font-size:10px">$' + notlTxt + '</span>'
             + '<span style="color:#ef5350;font-size:9px;font-weight:700">SPOT ERR</span>'
@@ -1370,8 +1706,8 @@ var dtccEditMode = false;
     wrap.style.cssText = 'display:flex;align-items:center;gap:4px;margin-left:12px';
     wrap.innerHTML = '<button class="btn-toggle" id="dtcc-edit-btn" onclick="toggleDtccEdit()" style="border-color:#e65100;color:#e65100">Edit Mode</button>'
         + '<button class="btn" id="dtcc-publish-btn" onclick="publishDtccEdits()" style="display:none;background:#2e7d32;color:white;font-size:11px;padding:5px 12px;border-radius:4px">Publish</button>'
-        + '<button class="btn" id="dtcc-tape-btn" onclick="toggleDtccTape()" style="background:#6a1b9a;color:white;font-size:11px;padding:5px 12px;border-radius:4px;margin-left:8px" title="Show raw stream of ALL trades (exotics, NDFs, MODIs) without surface mapping">Raw Tape</button>'
-        + '<button class="btn" id="dtcc-diag-btn" onclick="showDtccDiag()" style="background:#1976d2;color:white;font-size:11px;padding:5px 12px;border-radius:4px;margin-left:8px" title="Show why trades are being filtered out">Diag</button>';
+        + '<button class="btn" id="dtcc-diag-btn" onclick="showDtccDiag()" style="background:#1976d2;color:white;font-size:11px;padding:5px 12px;border-radius:4px;margin-left:8px" title="Show why trades are being filtered out">Diag</button>'
+        + '<button class="btn" id="dtcc-export-btn" onclick="_exportDiagXlsx()" style="background:#2e7d32;color:white;font-size:11px;padding:5px 12px;border-radius:4px;margin-left:6px" title="Download a diagnostic .xlsx with full DTCC row data \u2014 useful for debugging package decomposition">\u2913 Export</button>';
     ctrls.appendChild(wrap);
 })();
 
@@ -1545,6 +1881,67 @@ function showDtccDiag() {
                 h += '<div style="color:#888;margin-top:16px">NDO pipeline stats not available yet — open the DTCC tab and let trades load, then reopen this dialog.</div>';
             }
 
+            // ---- IV source breakdown — helps spot vol-resolution issues ----
+            var ivStats = window._ivSrcStats || {};
+            var ivTotal = (ivStats.calc||0) + (ivStats.site||0) + (ivStats.none||0);
+            if (ivTotal > 0) {
+                h += '<h3 style="color:#ffa726;margin-top:24px">IV Source Breakdown</h3>';
+                h += '<div style="background:#2d2d2d;padding:12px;border-radius:6px;font-family:monospace;font-size:12px">';
+                var calcPct = ((ivStats.calc||0)/ivTotal*100).toFixed(0);
+                var sitePct = ((ivStats.site||0)/ivTotal*100).toFixed(0);
+                h += '<div style="color:#aaa">Solved from premium (Black-76): <span style="color:#66bb6a;font-weight:700">' + (ivStats.calc||0) + '</span> (' + calcPct + '%)</div>';
+                h += '<div style="color:#aaa">Site IV (DTCC-reported, no premium solve): <span style="color:#ffa726;font-weight:700">' + (ivStats.site||0) + '</span> (' + sitePct + '%)</div>';
+                if ((ivStats.site||0)/ivTotal > 0.3) {
+                    h += '<div style="color:#ef5350;font-size:11px;margin-top:8px">\u26A0 More than 30% of trades fell back to site IV. This typically indicates a premium/notional mismatch — check premium currency and base_notl resolution.</div>';
+                }
+                h += '</div>';
+            }
+
+            // ---- Package decomposition diagnostics ----
+            var pkgLegs = window._pkgLegTrades || [];
+            var pkgDecomposed = window._pkgDecomposed || 0;
+            var pkgStructs = window._pkgStructCounts || {};
+            if (pkgLegs.length > 0 || pkgDecomposed > 0) {
+                h += '<h3 style="color:#ffa726;margin-top:24px">Package Decomposition</h3>';
+                h += '<div style="background:#2d2d2d;padding:12px;border-radius:6px;font-family:monospace;font-size:12px">';
+                h += '<div style="color:#aaa">Package legs captured: <span style="color:#fff;font-weight:700">' + pkgLegs.length + '</span></div>';
+                h += '<div style="color:#aaa">  decomposed to per-leg vol: <span style="color:#66bb6a;font-weight:700">' + pkgDecomposed + '</span></div>';
+                var stillPkg = pkgLegs.filter(function(l){ return l.derivedIV == null; }).length;
+                h += '<div style="color:#aaa">  shown as PKG-only (could not decompose): <span style="color:#ffa726;font-weight:700">' + stillPkg + '</span></div>';
+                if (Object.keys(pkgStructs).length) {
+                    h += '<div style="color:#888;margin-top:8px">Structure breakdown:</div>';
+                    Object.keys(pkgStructs).forEach(function(s) {
+                        h += '<div style="color:#90caf9;padding-left:16px">' + s + ': ' + pkgStructs[s] + '</div>';
+                    });
+                }
+                var reasons = window._pkgDecompReasons || {};
+                if (Object.keys(reasons).length) {
+                    h += '<div style="color:#888;margin-top:8px">Decomposition outcomes by reason:</div>';
+                    Object.keys(reasons).sort(function(a,b){return reasons[b]-reasons[a];}).forEach(function(r) {
+                        var color = r.indexOf('OK:') === 0 ? '#66bb6a' : '#ffa726';
+                        h += '<div style="color:' + color + ';padding-left:16px;font-size:11px">' + r + ': ' + reasons[r] + '</div>';
+                    });
+                }
+                var sfails = window._pkgSolveFails || {};
+                if (Object.keys(sfails).length) {
+                    h += '<div style="color:#888;margin-top:8px">Premium-solve failures (why these stayed PKG-only):</div>';
+                    Object.keys(sfails).sort(function(a,b){return sfails[b]-sfails[a];}).forEach(function(r) {
+                        h += '<div style="color:#ef5350;padding-left:16px;font-size:11px">' + r + ': ' + sfails[r] + '</div>';
+                    });
+                }
+                h += '</div>';
+            }
+
+            // ---- Dedup hits ----
+            var dedupHits = window._dedupHits || 0;
+            if (dedupHits > 0) {
+                h += '<h3 style="color:#ffa726;margin-top:24px">Duplicate Trades Suppressed</h3>';
+                h += '<div style="background:#2d2d2d;padding:12px;border-radius:6px;font-family:monospace;font-size:12px">';
+                h += '<div style="color:#aaa">Duplicate rows removed (same trade from multiple ingest sources): <span style="color:#66bb6a;font-weight:700">' + dedupHits + '</span></div>';
+                h += '<div style="color:#888;font-size:11px;margin-top:6px">A single trade can arrive from the ticker, slice files, AND the cumulative file. Dedup uses dissem id when present, else a structural fingerprint.</div>';
+                h += '</div>';
+            }
+
             // Show samples for the top 5 reasons
             h += '<h3 style="color:#ffa726;margin-top:24px">Sample Rejected Rows (top 5 reasons)</h3>';
             reasonsSorted.slice(0, 5).forEach(function(reason) {
@@ -1630,6 +2027,36 @@ function dtccEditCell(el) {
     }
 }
 
+// Recompute trade pipeline when the user edits spot or rates on the Market
+// Data tab. Without this, deltas would stay stale and trades wouldn't move
+// to the correct delta buckets on the heatmap.
+(function hookOnMktP() {
+    if (typeof onMktP !== 'function') { setTimeout(hookOnMktP, 500); return; }
+    var orig = onMktP;
+    onMktP = function() {
+        var r = orig.apply(this, arguments);
+        // Debounce — multiple field changes in quick succession should batch
+        if (window._mktPRecomputeTimer) clearTimeout(window._mktPRecomputeTimer);
+        window._mktPRecomputeTimer = setTimeout(function() {
+            if (typeof _recomputeFromMarks === 'function') _recomputeFromMarks();
+        }, 400);
+        return r;
+    };
+})();
+
+// Same hook for per-cell edits in DTCC Edit Mode (ATM/RR/fly per tenor)
+(function hookDtccEditCell() {
+    if (typeof dtccEditCell !== 'function') { setTimeout(hookDtccEditCell, 500); return; }
+    var orig = dtccEditCell;
+    dtccEditCell = function(el) {
+        var r = orig.apply(this, arguments);
+        // Don't recompute mid-edit — only when user publishes (we already do
+        // that in publishDtccEdits). Skipping recompute here keeps typing
+        // smooth in the edit table.
+        return r;
+    };
+})();
+
 function publishDtccEdits() {
     saveMarks();
     dtccEditMode = false;
@@ -1640,9 +2067,31 @@ function publishDtccEdits() {
     // Clear the edit table and restore Plotly div
     document.getElementById('dsp').innerHTML = '';
     Plotly.purge('dsp');
-    dBuildSurf(); dRA();
+    // Recompute trades from cached batch with NEW marks — this regenerates
+    // forwards, IVs (where premium-solved), deltas, and delta-bucket
+    // placement. Then rebuild the surface and re-render.
+    _recomputeFromMarks();
     var st = document.getElementById('mkt-status');
     if (st) st.textContent = 'Surface edits published at ' + new Date().toLocaleTimeString();
+}
+
+// Re-runs the trade processing pipeline against the cached last batch using
+// the CURRENT mktSurfaces. Use after editing spot, rates, or surface marks.
+function _recomputeFromMarks() {
+    if (window._lastTradesBatch && typeof dProcTrades === 'function') {
+        try { dProcTrades(window._lastTradesBatch); } catch (e) { console.log('Recompute failed:', e); }
+    }
+    if (typeof dBuildSurf === 'function') { try { dBuildSurf(); } catch (e) {} }
+    if (typeof dRA === 'function') { try { dRA(); } catch (e) {} }
+    if (typeof dRSurf === 'function' && document.getElementById('dsp')) {
+        try { dRSurf(); } catch (e) {}
+    }
+    if (typeof dRFeed === 'function' && document.getElementById('dfl')) {
+        try { dRFeed(); } catch (e) {}
+    }
+    if (typeof dRStrat === 'function' && document.getElementById('dsb')) {
+        try { dRStrat(); } catch (e) {}
+    }
 }
 
 // === SAVE / LOAD MARKS ===
@@ -1725,6 +2174,75 @@ function saveMarks() {
     .catch(function() { console.log('No saved marks found'); });
 })();
 
+// ===== RESTORE DEFAULTS BUTTON =====
+// Adds a button next to Bloomberg refresh that loads default surfaces for all
+// pairs (ATM/RR/fly with realistic shape). Useful as a starting frame when no
+// saved marks exist yet, and to reset back to defaults on demand.
+(function injectRestoreDefaultsBtn() {
+    var bbgBtn = document.getElementById('bbg-btn');
+    if (!bbgBtn) { setTimeout(injectRestoreDefaultsBtn, 500); return; }
+    if (document.getElementById('restore-defaults-btn')) return;
+    var btn = document.createElement('button');
+    btn.className = 'btn';
+    btn.id = 'restore-defaults-btn';
+    btn.style.cssText = 'background:#5e35b1;color:white;font-size:13px;padding:8px 18px;'
+        + 'border-radius:6px;white-space:nowrap;margin-left:8px';
+    btn.textContent = '\u21BB Restore Defaults';
+    btn.title = 'Load default ATM/RR/fly across all pairs and tenors';
+    btn.onclick = function() { restoreDefaultSurfaces(); };
+    bbgBtn.parentNode.insertBefore(btn, bbgBtn.nextSibling);
+})();
+
+function restoreDefaultSurfaces() {
+    if (!confirm('Replace all surface marks with defaults? Any unsaved changes will be lost.'))
+        return;
+    var btn = document.getElementById('restore-defaults-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Loading...'; }
+    fetch('/api/load_defaults')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var surfs = data.surfaces || {};
+            var count = 0;
+            Object.keys(surfs).forEach(function(pair) {
+                var s = surfs[pair];
+                if (!s.tenors) return;
+                mktSurfaces[pair] = {
+                    spot: s.spot || 1.0, r_d: s.r_d || 0.04, r_f: s.r_f || 0.02,
+                    _pair: pair, pipScale: s.pipScale || null, tenors: []
+                };
+                TENORS.forEach(function(tn, ti) {
+                    var src = s.tenors.find(function(t) { return t.tenor === tn; }) || {};
+                    mktSurfaces[pair].tenors.push({
+                        tenor: tn, T: TENOR_T[ti],
+                        atm: src.atm || 0, rr25: src.rr25 || 0, rr10: src.rr10 || 0,
+                        fly25: src.fly25 || 0, fly10: src.fly10 || 0, fwdPts: src.fwdPts || 0
+                    });
+                });
+                count++;
+            });
+            if (count > 0) {
+                if (!activeMktPair || !mktSurfaces[activeMktPair]) {
+                    activeMktPair = Object.keys(mktSurfaces)[0];
+                }
+                renderMktTabs(); renderMktContent();
+                // Re-render the DTCC views ONLY if their DOM containers exist
+                // (i.e. the DTCC tab has been rendered at least once). Otherwise
+                // they'll be drawn when the user navigates to that tab.
+                if (document.getElementById('dsp')) {
+                    try { if (typeof dRSurf === 'function') dRSurf(); } catch (e) { console.log('dRSurf skipped:', e.message); }
+                    try { if (typeof dRStrat === 'function') dRStrat(); } catch (e) { console.log('dRStrat skipped:', e.message); }
+                }
+                var st = document.getElementById('mkt-status');
+                if (st) st.textContent = 'Defaults restored: ' + count + ' pairs';
+            }
+            if (btn) { btn.disabled = false; btn.textContent = '\u21BB Restore Defaults'; }
+        })
+        .catch(function(err) {
+            alert('Failed to load defaults: ' + err.message);
+            if (btn) { btn.disabled = false; btn.textContent = '\u21BB Restore Defaults'; }
+        });
+}
+
 // === TOAST ALERTS for trades > 1 vol off marks ===
 (function injectToastCSS() {
     var style = document.createElement('style');
@@ -1754,9 +2272,13 @@ function showToast(html, ttl) {
     while (c.children.length > 5) c.removeChild(c.firstChild);
 }
 
-// Wrap dProcTrades to detect new alerts
+// Wrap dProcTrades to detect new alerts AND cache the last trade batch so we
+// can re-run the whole pipeline whenever marks change (spot/ATM/RR/fly edits).
 var _dProcTradesForToast = typeof dProcTrades === 'function' ? dProcTrades : null;
+window._lastTradesBatch = null;
 dProcTrades = function(trades) {
+    // Cache for re-run on mark change
+    window._lastTradesBatch = trades;
     _dProcTradesForToast(trades);
     // Check for trades with large vol diff from marks
     trades.forEach(function(t) {
@@ -1813,6 +2335,576 @@ dProcTrades = function(trades) {
         + '#tab-portfolio .card{width:100%}';
     document.head.appendChild(style);
 })();
+
+// ===== HISTORIC SPOT-AT-TRADE TAGGING (batched) =====
+// Collects every trade's (pair, date, time), de-dupes, posts one batched request
+// to /api/bbg_hist_spots_batch, then writes each historic spot back onto the
+// matching trade and recomputes that trade's delta from the historic spot.
+// Cached in window._histSpotBatchCache so repeated dProcTrades runs don't re-fetch.
+window._histSpotBatchCache = window._histSpotBatchCache || {};
+window._histSpotBatchInFlight = window._histSpotBatchInFlight || {};
+
+function _tagHistoricSpots(dATmap) {
+    if (!dATmap) return;
+    // Gather unique (pair, date, time) keys, snapped to nearest 5-minute bucket
+    var needed = {};
+    var snapKey = function(pair, date, time) {
+        // 'HH:MM' -> 'HH:MM' snapped to nearest 5
+        if (!time || time.length < 4) return null;
+        var hh = parseInt(time.substr(0,2),10), mm = parseInt(time.substr(3,2),10);
+        if (isNaN(hh)||isNaN(mm)) return null;
+        var sm = Math.round(mm / 5) * 5;
+        if (sm === 60) { hh += 1; sm = 0; }
+        var snapped = (hh<10?'0':'')+hh + ':' + (sm<10?'0':'')+sm;
+        return pair + '|' + date + '|' + snapped;
+    };
+    Object.keys(dATmap).forEach(function(pk) {
+        (dATmap[pk] || []).forEach(function(t) {
+            var d = t.trade_date || '';
+            var time = t.time || '';
+            if (!d || !time) return;
+            var key = snapKey(pk, d, time);
+            if (!key) return;
+            // Skip if already cached or fetched
+            if (window._histSpotBatchCache[key] !== undefined) return;
+            if (window._histSpotBatchInFlight[key]) return;
+            needed[key] = {pair: pk, date: d, time: time};
+        });
+    });
+    var keys = Object.keys(needed);
+    if (!keys.length) {
+        // Everything cached — just apply
+        _applyHistoricSpots(dATmap);
+        return;
+    }
+    // Mark in-flight, post the batch
+    keys.forEach(function(k){ window._histSpotBatchInFlight[k] = true; });
+    var reqs = keys.map(function(k){ return needed[k]; });
+    fetch('/api/bbg_hist_spots_batch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({requests: reqs, bucket_minutes: 5})
+    }).then(function(r){ return r.json(); }).then(function(data) {
+        var results = (data && data.results) || {};
+        // Resolve every requested key — write spot if found, else mark 0 (cached so we don't retry)
+        keys.forEach(function(k){
+            var snapPair = needed[k].pair, snapDate = needed[k].date, origTime = needed[k].time;
+            // The batch returns keys in the form 'pair|date|HH:MM' using the ORIGINAL trade time
+            var matchKey = snapPair + '|' + snapDate + '|' + origTime;
+            window._histSpotBatchCache[k] = (results[matchKey] && results[matchKey] > 0)
+                ? results[matchKey] : 0;
+            delete window._histSpotBatchInFlight[k];
+        });
+        _applyHistoricSpots(dATmap);
+        if (data && data.error) {
+            console.log('Historic spot batch error:', data.error);
+        }
+    }).catch(function(err) {
+        keys.forEach(function(k){
+            window._histSpotBatchCache[k] = 0;
+            delete window._histSpotBatchInFlight[k];
+        });
+        console.log('Historic spot fetch failed:', err);
+    });
+}
+
+function _applyHistoricSpots(dATmap) {
+    if (!dATmap || typeof dCD !== 'function') return;
+    var snapKey = function(pair, date, time) {
+        if (!time || time.length < 4) return null;
+        var hh = parseInt(time.substr(0,2),10), mm = parseInt(time.substr(3,2),10);
+        if (isNaN(hh)||isNaN(mm)) return null;
+        var sm = Math.round(mm / 5) * 5;
+        if (sm === 60) { hh += 1; sm = 0; }
+        return pair + '|' + date + '|' + (hh<10?'0':'')+hh + ':' + (sm<10?'0':'')+sm;
+    };
+    var anyUpdated = false;
+    Object.keys(dATmap).forEach(function(pk) {
+        (dATmap[pk] || []).forEach(function(t) {
+            var key = snapKey(pk, t.trade_date || '', t.time || '');
+            if (!key) return;
+            var hSpot = window._histSpotBatchCache[key];
+            if (!hSpot || hSpot <= 0) return;
+            // Don't re-apply if already tagged
+            if (t.histSpot === hSpot) return;
+            t.histSpot = hSpot;
+            // Recompute delta with the historic spot. cs.fwd was built off the live
+            // spot; for an honest delta-at-trade we also shift the forward by the
+            // ratio of historic to live spot (preserves the fwd-spot basis).
+            var liveSpot = t.spot || hSpot;
+            var hFwd = (liveSpot > 0) ? t.fwd * (hSpot / liveSpot) : t.fwd;
+            var rd = (mktSurfaces[pk] && mktSurfaces[pk].r_d) || 0.045;
+            try {
+                t.deltaHist = dCD(hFwd, t.strike, t.iv/100, t.days/365, t.ic, rd, hSpot);
+                t.fwdHist = hFwd;
+                t.spotSrc = 'historic';
+                anyUpdated = true;
+            } catch (e) { /* leave as-is */ }
+        });
+    });
+    // Update monotonic tagged-counter
+    if (typeof _bumpMonotonicCounters === 'function') {
+        try { _bumpMonotonicCounters(); } catch (e) {}
+    }
+    if (anyUpdated && typeof dRFeed === 'function') {
+        // Re-render the active feed so updated spot/delta show through
+        try { dRFeed(); } catch (e) {}
+    }
+}
+
+// ===== HIBERNATE MODE =====
+// Idle-run mode: keep server-side DTCC scraping going, keep JS-side trade processing
+// and historic-spot tagging running so data accumulates, but skip the expensive
+// rendering work (Plotly redraws, feed innerHTML, heatmap regenerations).
+// The user's machine load drops substantially while data continues to flow.
+window._hibernating = false;
+
+(function injectHibernateUI() {
+    var css = '#hibernate-btn{position:fixed;right:24px;bottom:88px;width:54px;height:54px;'
+      + 'border-radius:50%;background:linear-gradient(135deg,#37474f,#546e7a);color:white;'
+      + 'border:none;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.4);z-index:9999;'
+      + 'font-size:20px;display:flex;align-items:center;justify-content:center;transition:transform 0.15s}'
+      + '#hibernate-btn:hover{transform:scale(1.08)}'
+      + '#hibernate-btn.active{background:linear-gradient(135deg,#4527a0,#7e57c2)}'
+      + '#hibernate-overlay{position:fixed;inset:0;background:#0a0a0a;z-index:9997;display:none;'
+      + 'align-items:center;justify-content:center;flex-direction:column;gap:24px;color:#e0e0e0;font-family:inherit}'
+      + '#hibernate-overlay.show{display:flex}'
+      + '.hb-pulse{width:80px;height:80px;border-radius:50%;background:radial-gradient(circle,#7e57c2,#311b92);'
+      + 'animation:hbPulse 2.5s infinite ease-in-out;box-shadow:0 0 30px rgba(126,87,194,0.5)}'
+      + '@keyframes hbPulse{0%,100%{transform:scale(1);opacity:0.7}50%{transform:scale(1.15);opacity:1}}'
+      + '.hb-title{font-size:22px;color:#b39ddb;font-weight:300;letter-spacing:2px}'
+      + '.hb-sub{color:#666;font-size:12px;max-width:400px;text-align:center;line-height:1.6}'
+      + '.hb-stats{display:flex;gap:30px;margin-top:20px;font-size:11px;color:#888}'
+      + '.hb-stats span b{color:#b39ddb;font-size:14px;display:block;font-weight:700;font-family:monospace}'
+      + '.hb-wake{margin-top:24px;background:linear-gradient(135deg,#7e57c2,#4527a0);color:white;'
+      + 'border:none;padding:12px 32px;border-radius:30px;cursor:pointer;font-size:13px;font-weight:600;'
+      + 'letter-spacing:1px;box-shadow:0 4px 14px rgba(126,87,194,0.3)}'
+      + '.hb-wake:hover{transform:scale(1.04)}';
+    var style = document.createElement('style'); style.textContent = css;
+    document.head.appendChild(style);
+
+    var btn = document.createElement('button');
+    btn.id = 'hibernate-btn'; btn.title = 'Hibernate (idle mode: scrape + tag, no rendering)';
+    btn.innerHTML = '\u263E';  // crescent moon
+    btn.onclick = function(){ _toggleHibernate(); };
+    document.body.appendChild(btn);
+
+    var overlay = document.createElement('div');
+    overlay.id = 'hibernate-overlay';
+    overlay.innerHTML =
+      '<div class="hb-pulse"></div>'
+      + '<div class="hb-title">HIBERNATING</div>'
+      + '<div class="hb-sub">Scraping DTCC and tagging trades with historic spots. Rendering paused to reduce machine load. All data continues to accumulate on the server.</div>'
+      + '<div class="hb-stats">'
+      + '<span>UPTIME<b id="hb-uptime">0s</b></span>'
+      + '<span>NEW TRADES<b id="hb-trades">0</b></span>'
+      + '<span>NEW TAGGED<b id="hb-tagged">0</b></span>'
+      + '<span>TOTAL TRADES<b id="hb-trades-total">0</b></span>'
+      + '<span>TOTAL TAGGED<b id="hb-tagged-total">0</b></span>'
+      + '</div>'
+      + '<button class="hb-wake" onclick="_toggleHibernate()">Wake up</button>';
+    document.body.appendChild(overlay);
+})();
+
+function _toggleHibernate() {
+    window._hibernating = !window._hibernating;
+    var btn = document.getElementById('hibernate-btn');
+    var overlay = document.getElementById('hibernate-overlay');
+    if (window._hibernating) {
+        if (overlay) overlay.classList.add('show');
+        if (btn) btn.classList.add('active');
+        // Close floating ticker if open (no point during hibernate)
+        if (_floatTickOpen) _toggleFloatTick();
+        // Hide all the floating buttons too — overlay covers everything
+        if (btn) btn.style.display = 'none';
+        var ft = document.getElementById('float-tick-btn'); if (ft) ft.style.display = 'none';
+        _hibernateStart = Date.now();
+        _hibernateTradesAtStart = _getTotalTradesSeen();
+        _hibernateTaggedAtStart = _getTotalTagged();
+        _updateHibernateStats();
+        _hibernateStatsTimer = setInterval(_updateHibernateStats, 1000);
+    } else {
+        if (overlay) overlay.classList.remove('show');
+        if (btn) { btn.classList.remove('active'); btn.style.display = ''; }
+        // Re-show the floating ticker button on all tabs
+        var ft = document.getElementById('float-tick-btn');
+        if (ft) ft.style.display = '';
+        if (_hibernateStatsTimer) { clearInterval(_hibernateStatsTimer); _hibernateStatsTimer = null; }
+        // Force a re-render of the active view since we may have skipped many cycles
+        try {
+            if (typeof dRSurf === 'function') dRSurf();
+            if (typeof dRFeed === 'function') dRFeed();
+            if (typeof dRStrat === 'function') dRStrat();
+        } catch (e) {}
+    }
+}
+
+var _hibernateStart = 0, _hibernateTradesAtStart = 0, _hibernateTaggedAtStart = 0;
+var _hibernateStatsTimer = null;
+
+// Monotonic counters — only ever increase. Track every distinct dissem id
+// the JS has ever seen since page load, and every historic-spot key tagged.
+// These don't reset between dProcTrades runs the way dAT does.
+window._totalDidsSeen = window._totalDidsSeen || {};   // {did: true}
+window._totalTaggedKeys = window._totalTaggedKeys || {}; // {key: true}
+
+function _bumpMonotonicCounters() {
+    // Walk dAT and accumulate any new (pair, time, strike, expiry, notl) signatures
+    // — these survive dProcTrades resets via this side store.
+    if (typeof dAT === 'object') {
+        Object.keys(dAT || {}).forEach(function(pk){
+            (dAT[pk] || []).forEach(function(t){
+                var sig = pk + '|' + (t.time||'') + '|' + (t.strike||'') + '|' + (t.expiry||'') + '|' + (t.notl||'');
+                window._totalDidsSeen[sig] = true;
+            });
+        });
+    }
+    (window._pkgLegTrades || []).forEach(function(l){
+        var sig = 'PKG|' + (l.pair||'') + '|' + (l.time||'') + '|' + (l.strike||'') + '|' + (l.pkg_id||'');
+        window._totalDidsSeen[sig] = true;
+    });
+    (window._spotErrTrades || []).forEach(function(s){
+        var sig = 'ERR|' + (s.pair||'') + '|' + (s.time||'') + '|' + (s.strike||'');
+        window._totalDidsSeen[sig] = true;
+    });
+    Object.keys(window._histSpotBatchCache || {}).forEach(function(k){
+        if (window._histSpotBatchCache[k] > 0) window._totalTaggedKeys[k] = true;
+    });
+}
+
+function _getTotalTradesSeen() {
+    _bumpMonotonicCounters();
+    return Object.keys(window._totalDidsSeen).length;
+}
+function _getTotalTagged() {
+    _bumpMonotonicCounters();
+    return Object.keys(window._totalTaggedKeys).length;
+}
+
+function _updateHibernateStats() {
+    var el;
+    var elapsed = Date.now() - _hibernateStart;
+    var totalSec = Math.floor(elapsed / 1000);
+    var mins = Math.floor(totalSec / 60);
+    el = document.getElementById('hb-uptime');
+    if (el) {
+        if (mins < 1) el.textContent = totalSec + 's';
+        else if (mins < 60) el.textContent = mins + 'm';
+        else el.textContent = Math.floor(mins/60) + 'h ' + (mins%60) + 'm';
+    }
+    var totalTrades = _getTotalTradesSeen();
+    var totalTagged = _getTotalTagged();
+    var deltaTrades = totalTrades - _hibernateTradesAtStart;
+    var deltaTagged = totalTagged - _hibernateTaggedAtStart;
+    el = document.getElementById('hb-trades');
+    if (el) el.textContent = Math.max(0, deltaTrades);
+    el = document.getElementById('hb-tagged');
+    if (el) el.textContent = Math.max(0, deltaTagged);
+    el = document.getElementById('hb-trades-total');
+    if (el) el.textContent = totalTrades;
+    el = document.getElementById('hb-tagged-total');
+    if (el) el.textContent = totalTagged;
+}
+
+// Wrap the heavy render functions so they short-circuit during hibernate.
+// Data processing (dProcTrades, _tagHistoricSpots) still runs — only the
+// render output is suppressed.
+function _hibernateWrap(fnName) {
+    var orig = window[fnName];
+    if (typeof orig !== 'function') return;
+    window[fnName] = function() {
+        if (window._hibernating) return;
+        return orig.apply(this, arguments);
+    };
+}
+(function applyHibernateWraps() {
+    // Wrap after page load so the original functions exist
+    setTimeout(function() {
+        ['dRSurf','dRFeed','dRStrat','dRA','renderPortHm','renderPortTab',
+         'renderMktTabs','renderMktContent','renderHm','renderTbls','renderFwd',
+         'renderIneff','renderDtccTape','_renderFloatTick'].forEach(_hibernateWrap);
+    }, 2000);
+})();
+
+// ===== TAB SWITCH HOOK =====
+// Reserved for future per-tab adjustments. The floating ticker is intentionally
+// visible on EVERY tab including DTCC — there is no longer a separate in-tab
+// Raw Tape view to compete with it.
+(function hookTabSwitch() {
+    if (typeof showTab !== 'function') { setTimeout(hookTabSwitch, 500); return; }
+    var orig = showTab;
+    showTab = function(tab) {
+        var r = orig.apply(this, arguments);
+        // After tab content renders, top up the DTCC lookback dropdown with
+        // multi-day options if the user just landed on DTCC.
+        if (tab === 'dtcc') {
+            setTimeout(_extendDtccLookback, 100);
+        }
+        return r;
+    };
+    // Also try once at load in case DTCC is the default tab
+    setTimeout(_extendDtccLookback, 1500);
+})();
+
+// Add multi-day options (2D / 3D / 1W) to the DTCC lookback dropdown.
+// Backend `fetch` already triggers _load_cumulative when minutes > 480, so the
+// data pipeline supports this — just the UI was missing the choices.
+function _extendDtccLookback() {
+    var sel = document.getElementById('dlb');
+    if (!sel || sel._extended) return;
+    var extras = [
+        {v: '2880',  l: '2D'},
+        {v: '4320',  l: '3D'},
+        {v: '10080', l: '1W'},
+    ];
+    extras.forEach(function(e) {
+        // Skip if already present
+        for (var i = 0; i < sel.options.length; i++) {
+            if (sel.options[i].value === e.v) return;
+        }
+        var opt = document.createElement('option');
+        opt.value = e.v; opt.textContent = e.l;
+        sel.appendChild(opt);
+    });
+    sel._extended = true;
+}
+
+// ===== FLOATING TICKER WIDGET (all tabs except DTCC) =====
+// A small bubble bottom-right that expands into a live tape panel. Reuses the
+// /api/dtcc_tape endpoint and the existing instrument color/filter logic.
+(function injectFloatingTicker() {
+    if (document.getElementById('float-tick-btn')) return;
+    var css = '#float-tick-btn{position:fixed;right:24px;bottom:24px;width:54px;height:54px;'
+      + 'border-radius:50%;background:linear-gradient(135deg,#1976d2,#42a5f5);color:white;'
+      + 'border:none;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.4);z-index:9999;'
+      + 'font-size:22px;display:flex;align-items:center;justify-content:center;transition:transform 0.15s}'
+      + '#float-tick-btn:hover{transform:scale(1.08)}'
+      + '#float-tick-btn .badge{position:absolute;top:-4px;right:-4px;background:#ef5350;color:white;'
+      + 'font-size:10px;font-weight:700;padding:2px 6px;border-radius:10px;min-width:18px;text-align:center}'
+      + '#float-tick-panel{position:fixed;right:24px;bottom:90px;width:640px;max-height:70vh;'
+      + 'background:#1e1e1e;border:1px solid #444;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,0.6);'
+      + 'z-index:9998;display:none;flex-direction:column;overflow:hidden;font-family:inherit}'
+      + '#float-tick-panel.open{display:flex}'
+      + '#float-tick-head{padding:10px 14px;background:#2d2d2d;border-bottom:1px solid #444;'
+      + 'display:flex;align-items:center;justify-content:space-between;gap:8px}'
+      + '#float-tick-list{overflow-y:auto;flex:1;padding:0 4px 4px}'
+      + '#float-tick-close{background:transparent;border:none;color:#aaa;cursor:pointer;font-size:18px;line-height:1}'
+      + '#float-tick-close:hover{color:white}'
+      + '.ft-row{display:grid;grid-template-columns:62px 70px 80px 56px 56px 60px 50px;gap:4px;'
+      + 'padding:5px 8px;font-size:10px;border-bottom:1px solid #2d2d2d}';
+    var style = document.createElement('style'); style.textContent = css;
+    document.head.appendChild(style);
+
+    var btn = document.createElement('button');
+    btn.id = 'float-tick-btn';
+    btn.title = 'Live FX option ticker';
+    btn.innerHTML = '\u23F1<span class="badge" id="float-tick-badge" style="display:none">0</span>';
+    btn.onclick = function(){ _toggleFloatTick(); };
+    document.body.appendChild(btn);
+
+    // 10-column grid: time, type, pair, mat, strike, vol, Δ, spot, notl, act
+    var gridCols = '54px 38px 64px 50px 56px 44px 32px 56px 46px 38px';
+    document.head.appendChild(Object.assign(document.createElement('style'),
+        {textContent: '.ft-row{grid-template-columns:' + gridCols + ' !important}'}));
+
+    var panel = document.createElement('div');
+    panel.id = 'float-tick-panel';
+    panel.innerHTML =
+      '<div id="float-tick-head">'
+      + '<span style="color:#fff;font-weight:700">Live Ticker</span>'
+      + '<span id="float-tick-count" style="color:#888;font-size:11px"></span>'
+      + '<select id="float-tick-filter" style="background:#1e1e1e;color:#ddd;border:1px solid #555;'
+      + 'border-radius:4px;padding:3px 6px;font-size:11px">'
+      + '<option value="ALL">All trades</option>'
+      + '<option value="VANILLA">Vanilla only</option>'
+      + '<option value="NDO">NDO only</option>'
+      + '<option value="OTHER">Exotics/MODI/NDFs</option>'
+      + '</select>'
+      + '<button id="float-tick-export" onclick="_exportDiagXlsx()" '
+      + 'style="background:#2e7d32;color:white;border:none;border-radius:4px;'
+      + 'padding:3px 10px;font-size:11px;cursor:pointer" '
+      + 'title="Download a diagnostic .xlsx with full DTCC row data — useful for debugging package decomposition">'
+      + '\u2913 Export</button>'
+      + '<button id="float-tick-close" onclick="_toggleFloatTick()" title="Close">\u2715</button>'
+      + '</div>'
+      + '<div id="float-tick-list"><div style="padding:20px;text-align:center;color:#888;font-size:11px">Loading...</div></div>';
+    document.body.appendChild(panel);
+
+    document.getElementById('float-tick-filter').onchange = function(){
+        window._floatTickFilter = this.value;
+        _renderFloatTick();
+    };
+})();
+
+var _floatTickOpen = false;
+var _floatTickTimer = null;
+window._floatTickFilter = 'ALL';
+
+function _toggleFloatTick() {
+    _floatTickOpen = !_floatTickOpen;
+    var panel = document.getElementById('float-tick-panel');
+    if (!panel) return;
+    if (_floatTickOpen) {
+        panel.classList.add('open');
+        _renderFloatTick();
+        if (_floatTickTimer) clearInterval(_floatTickTimer);
+        _floatTickTimer = setInterval(_renderFloatTick, 15000);
+    } else {
+        panel.classList.remove('open');
+        if (_floatTickTimer) { clearInterval(_floatTickTimer); _floatTickTimer = null; }
+    }
+}
+
+// Enriched ticker: builds rows from dAT (the processed trades with vol/delta/spot)
+// PLUS the raw tape (for non-option flow that didn't reach dAT). Sorted newest-first.
+function _exportDiagXlsx() {
+    // Update whichever button triggered this (DTCC tab or floating ticker)
+    var btns = [document.getElementById('float-tick-export'),
+                document.getElementById('dtcc-export-btn')].filter(Boolean);
+    btns.forEach(function(b) { b.disabled = true; b._origText = b.textContent; b.textContent = 'Building...'; });
+    // Trigger a real browser download — the endpoint sends Content-Disposition
+    // so a hidden iframe pulls the file as a download
+    var iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = '/api/export_diag';
+    document.body.appendChild(iframe);
+    setTimeout(function() {
+        try { document.body.removeChild(iframe); } catch (e) {}
+        btns.forEach(function(b) { b.disabled = false; b.textContent = b._origText || '\u2913 Export'; });
+    }, 5000);
+}
+
+function _renderFloatTick() {
+    // Collect from dAT — these have full pricing data
+    var enriched = [];
+    if (typeof dAT === 'object') {
+        Object.keys(dAT || {}).forEach(function(pk) {
+            (dAT[pk] || []).forEach(function(t) {
+                enriched.push({
+                    time: t.time || '', trade_date: t.trade_date || '',
+                    instrument: t.isNdo ? 'NDO' : 'VANILLA',
+                    pair: pk, opt_type: t.type, strike: t.strike,
+                    iv: t.iv, delta: (t.deltaHist != null) ? t.deltaHist : t.delta,
+                    spot: (t.histSpot > 0) ? t.histSpot : t.spot,
+                    usd_amt: t.notl, derived: !!t.derived,
+                    spotSrc: (t.histSpot > 0) ? 'hist' : 'live',
+                    action: 'NEWT',
+                    expiry: t.expiry || '', days: t.days || 0
+                });
+            });
+        });
+    }
+    // Collect from raw tape — non-option flow (exotics, NDFs, MODIs, TERMs)
+    fetch('/api/dtcc_tape').then(function(r){return r.json();}).then(function(data) {
+        var tape = (data && data.tape) || [];
+        var rawOther = tape.filter(function(t) {
+            return ['BARRIER','DIGITAL','DIGI-BARRIER','NDF','FORWARD','SWAP','OTHER'].indexOf(t.instrument) !== -1
+                || (t.action && t.action !== 'NEWT');
+        }).map(function(t) {
+            return {
+                time: t.time || '', trade_date: t.trade_date || '',
+                instrument: t.instrument, pair: t.pair,
+                opt_type: t.opt_type, strike: t.strike,
+                iv: null, delta: null, spot: null,
+                usd_amt: t.usd_amt, derived: false,
+                spotSrc: null, action: t.action || 'NEWT',
+                expiry: t.expiry || '', days: 0
+            };
+        });
+
+        var combined = enriched.concat(rawOther).sort(function(a, b) {
+            // Sort by trade_date+time descending (newest first)
+            var ak = (a.trade_date||'') + ' ' + (a.time||'');
+            var bk = (b.trade_date||'') + ' ' + (b.time||'');
+            return ak > bk ? -1 : ak < bk ? 1 : 0;
+        });
+
+        // Apply filter
+        var f = window._floatTickFilter;
+        if (f === 'VANILLA') combined = combined.filter(function(x){ return x.instrument === 'VANILLA'; });
+        else if (f === 'NDO') combined = combined.filter(function(x){ return x.instrument === 'NDO'; });
+        else if (f === 'OTHER') combined = combined.filter(function(x){
+            return x.instrument !== 'VANILLA' && x.instrument !== 'NDO';
+        });
+
+        var cnt = document.getElementById('float-tick-count');
+        var badge = document.getElementById('float-tick-badge');
+        if (cnt) cnt.textContent = combined.length + ' trades';
+        if (badge) {
+            if (combined.length > 0) { badge.style.display = ''; badge.textContent = String(Math.min(combined.length, 99)); }
+            else badge.style.display = 'none';
+        }
+        var list = document.getElementById('float-tick-list');
+        if (!list) return;
+        if (!combined.length) {
+            list.innerHTML = '<div style="padding:20px;text-align:center;color:#888;font-size:11px">No trades yet</div>';
+            return;
+        }
+
+        var instColor = {'VANILLA':'#66bb6a','NDO':'#26c6da','BARRIER':'#ffa726','DIGITAL':'#ef5350',
+                         'DIGI-BARRIER':'#ec407a','NDF':'#90caf9','FORWARD':'#90a4ae','SWAP':'#b39ddb','OTHER':'#777'};
+        var actColor = {'NEWT':'#66bb6a','CORR':'#ffa726','MODI':'#42a5f5','TERM':'#ef5350','EROR':'#999','REVI':'#ce93d8'};
+
+        var h = '<div class="ft-row" style="color:#888;font-weight:700;border-bottom:1px solid #444">'
+            + '<span>Time</span><span>Type</span><span>Pair</span><span>Mat</span><span>Strike</span>'
+            + '<span>Vol</span><span>\u0394</span><span>Spot</span><span>Notl</span><span>Act</span></div>';
+
+        // Helper to format days-to-expiry as compact maturity tag (1W, 3M, 1Y)
+        var matFromDays = function(d, expRaw) {
+            if (d > 0) {
+                if (d <= 3) return d + 'D';
+                if (d <= 10) return Math.round(d/7) + 'W';
+                if (d <= 60) return Math.round(d/30) + 'M';
+                if (d <= 730) return Math.round(d/30) + 'M';
+                return (d/365).toFixed(1) + 'Y';
+            }
+            // No days field — show truncated expiry date (YY-MM-DD)
+            return expRaw ? expRaw.slice(2) : '-';
+        };
+
+        combined.slice(0, 200).forEach(function(t) {
+            var notlR = Math.round((t.usd_amt||0)*2)/2;
+            var notlTxt = notlR >= 1000 ? (notlR/1000).toFixed(1)+'B' : notlR.toFixed(1)+'M';
+            var kTxt = !t.strike ? '-' : t.strike >= 1000 ? t.strike.toFixed(0)
+                       : t.strike < 10 ? t.strike.toFixed(4) : t.strike.toFixed(2);
+            var tc = t.opt_type === 'CALL' ? 'color:#66bb6a' : t.opt_type === 'PUT' ? 'color:#ef5350' : 'color:#777';
+
+            var ivTxt = (t.iv != null && !isNaN(t.iv)) ? t.iv.toFixed(1) + (t.derived ? '~' : '') : '-';
+            var ivStyle = (t.iv != null) ? (t.iv >= 15 ? 'color:#ffa726;font-weight:700'
+                : t.iv >= 10 ? 'color:#90caf9;font-weight:600' : 'color:#aaa') : 'color:#555';
+
+            var dTxt = (t.delta != null && !isNaN(t.delta))
+                ? Math.round(Math.abs(t.delta)*100) + '\u0394' : '-';
+            var spotTxt = (t.spot && t.spot > 0)
+                ? (t.spot >= 1000 ? t.spot.toFixed(1) : t.spot < 10 ? t.spot.toFixed(4) : t.spot.toFixed(2))
+                : '-';
+            var spotStyle = (t.spotSrc === 'hist') ? 'color:#90caf9' : 'color:#aaa';
+
+            var actTxt = t.action || '-';
+            var ac = actColor[actTxt] || '#777';
+            var matTxt = matFromDays(t.days, t.expiry);
+
+            h += '<div class="ft-row" style="padding:5px 8px;font-size:10px;border-bottom:1px solid #2d2d2d">'
+              + '<span style="color:#aaa">' + (t.time||'-') + '</span>'
+              + '<span style="'+tc+';font-weight:700">' + (t.opt_type || t.instrument.slice(0,3)) + '</span>'
+              + '<span style="color:#ddd">' + (t.pair||'-') + '</span>'
+              + '<span style="color:#90caf9">' + matTxt + '</span>'
+              + '<span style="color:#bbb">' + kTxt + '</span>'
+              + '<span style="' + ivStyle + '">' + ivTxt + '</span>'
+              + '<span style="color:#888">' + dTxt + '</span>'
+              + '<span style="' + spotStyle + '">' + spotTxt + '</span>'
+              + '<span style="color:#999">' + notlTxt + '</span>'
+              + '<span style="color:' + ac + ';font-size:9px">' + actTxt + '</span></div>';
+        });
+        list.innerHTML = h;
+    }).catch(function(){
+        // Even if tape fetch fails, show what we have from dAT
+        var list = document.getElementById('float-tick-list');
+        if (list && enriched.length === 0) {
+            list.innerHTML = '<div style="padding:20px;text-align:center;color:#888;font-size:11px">No trades yet</div>';
+        }
+    });
+}
 
 console.log('mathfix.js: all overrides applied');
 """
@@ -2084,6 +3176,272 @@ def _current_trading_day():
     return _trading_day(datetime.now(timezone.utc))
 
 
+_DEFAULT_TN_LABELS = ['O/N','1W','2W','1M','2M','3M','6M','9M','1Y','2Y']
+_DEFAULT_TN_T      = [1/365, 7/365, 14/365, 30/365, 60/365, 90/365, 180/365, 270/365, 365/365, 730/365]
+
+# Default vol-surface levels per pair: (spot, ATM_3M, RR25_3M, FLY25_3M, r_d, r_f)
+# Numbers are ballpark realistic (as of roughly mid-2024 levels). Wrong for actual
+# trading but good enough that the heatmap renders and IV-sanity filters don't
+# reject everything on first run. User overwrites via Edit Mode + Publish.
+_DEFAULT_SURFACE_LEVELS = {
+    # G10
+    'EURUSD': (1.10,  7.5, -0.20, 0.20, 0.045, 0.035),
+    'GBPUSD': (1.27,  8.5, -0.30, 0.22, 0.045, 0.050),
+    'AUDUSD': (0.66,  9.5,  0.15, 0.25, 0.045, 0.040),
+    'NZDUSD': (0.61, 10.0,  0.20, 0.27, 0.045, 0.055),
+    'USDJPY': (150., 10.0, -1.20, 0.35, 0.045, 0.005),
+    'USDCHF': (0.88,  7.5, -0.30, 0.22, 0.045, 0.015),
+    'USDCAD': (1.36,  6.0,  0.15, 0.18, 0.045, 0.045),
+    'USDSEK': (10.5,  8.5,  0.40, 0.25, 0.045, 0.040),
+    'USDNOK': (10.6,  9.5,  0.50, 0.28, 0.045, 0.045),
+    # G10 crosses
+    'EURGBP': (0.86,  6.5,  0.10, 0.18, 0.050, 0.035),
+    'EURJPY': (165., 10.5, -1.00, 0.32, 0.005, 0.035),
+    'GBPJPY': (190., 11.0, -1.40, 0.40, 0.005, 0.050),
+    'AUDJPY': (99.,  11.5, -1.20, 0.42, 0.005, 0.040),
+    'EURCHF': (0.96,  6.0, -0.15, 0.15, 0.015, 0.035),
+    'AUDNZD': (1.08,  7.5,  0.05, 0.18, 0.055, 0.040),
+    # EM — LATAM
+    'USDMXN': (17.2, 11.5,  1.50, 0.55, 0.045, 0.105),
+    'USDBRL': (5.10, 13.0,  2.00, 0.70, 0.045, 0.105),
+    'USDCLP': (920., 12.5,  1.20, 0.50, 0.045, 0.055),
+    'USDCOP': (3950, 12.0,  1.30, 0.55, 0.045, 0.110),
+    'USDPEN': (3.75,  8.0,  0.60, 0.30, 0.045, 0.065),
+    # EM — EMEA
+    'USDZAR': (18.5, 14.0,  1.80, 0.60, 0.045, 0.080),
+    'USDTRY': (32.,  18.0,  3.00, 0.90, 0.045, 0.500),
+    'USDILS': (3.70, 11.0,  0.80, 0.35, 0.045, 0.045),
+    'EURILS': (4.05, 11.5,  0.70, 0.32, 0.035, 0.045),
+    # EM — ASIA (mostly NDF/NDO)
+    'USDKRW': (1355,  9.0,  0.70, 0.30, 0.045, 0.035),
+    'USDCNH': (7.22,  5.5,  0.40, 0.20, 0.045, 0.020),
+    'USDCNY': (7.22,  5.0,  0.35, 0.18, 0.045, 0.020),
+    'USDINR': (84.,   5.0,  0.30, 0.18, 0.045, 0.065),
+    'USDSGD': (1.34,  6.0,  0.20, 0.18, 0.045, 0.035),
+    'USDTWD': (32.0,  6.5,  0.30, 0.20, 0.045, 0.020),
+    'USDPHP': (57.,   6.5,  0.40, 0.22, 0.045, 0.065),
+    'USDTHB': (35.,   7.0,  0.40, 0.22, 0.045, 0.025),
+    'USDIDR': (15800, 7.5,  0.60, 0.28, 0.045, 0.060),
+    'USDHKD': (7.80,  2.5,  0.05, 0.10, 0.045, 0.045),
+}
+
+# Term-structure shape: O/N is rich, slopes down through 3M, then flat/slight contango out
+_DEFAULT_TENOR_MULTIPLIER = {
+    'O/N': 1.30, '1W': 1.15, '2W': 1.10, '1M': 1.05, '2M': 1.02,
+    '3M':  1.00, '6M': 0.98, '9M': 0.97, '1Y': 0.97, '2Y': 0.98,
+}
+
+def _build_diag_xlsx(dtcc_reader):
+    """Build a multi-sheet diagnostic xlsx capturing all the state we'd need to
+    debug package-decomposition issues. Returns bytes of the xlsx file.
+    Falls back to CSV if openpyxl isn't available."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        # Fallback — single CSV with the most important info as a zip
+        log("Export: openpyxl not installed, falling back to multi-CSV zip")
+        return _build_diag_zip_fallback(dtcc_reader)
+
+    wb = Workbook()
+    bold = Font(bold=True, name='Arial')
+    header_fill = PatternFill('solid', start_color='2D2D2D')
+    header_font = Font(bold=True, color='FFFFFF', name='Arial')
+
+    def write_sheet(sheet, headers, rows, freeze=True):
+        for col, h in enumerate(headers, 1):
+            c = sheet.cell(row=1, column=col, value=h)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = Alignment(horizontal='left')
+        for ri, row in enumerate(rows, 2):
+            for ci, v in enumerate(row, 1):
+                # Coerce non-scalar values to string so openpyxl doesn't choke
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v, default=str)[:32000]
+                elif v is None:
+                    v = ''
+                sheet.cell(row=ri, column=ci, value=v)
+        # Reasonable column widths
+        for col in range(1, len(headers) + 1):
+            sheet.column_dimensions[get_column_letter(col)].width = max(12, min(40, len(headers[col-1]) + 4))
+        if freeze:
+            sheet.freeze_panes = 'A2'
+
+    # Pull snapshots under lock
+    with dtcc_reader._lock:
+        tape = list(dtcc_reader._tape)
+        raw_packages = list(dtcc_reader._raw_packages)
+        ticker_trades = list(dtcc_reader._ticker_trades)
+        slice_trades_flat = [t for v in dtcc_reader._slice_trades.values() for t in v]
+        cumul_trades_flat = [t for v in dtcc_reader._cumul_trades.values() for t in v]
+
+    # ===== Sheet 1: Summary =====
+    s1 = wb.active
+    s1.title = 'Summary'
+    s1['A1'] = 'DTCC Diagnostic Export'
+    s1['A1'].font = Font(bold=True, name='Arial', size=14)
+    s1['A3'] = 'Generated'
+    s1['B3'] = datetime.now().isoformat(timespec='seconds')
+    rows = [
+        ('Tape rows', len(tape)),
+        ('Raw package rows captured', len(raw_packages)),
+        ('Ticker trades (parsed)', len(ticker_trades)),
+        ('Slice trades (parsed)', len(slice_trades_flat)),
+        ('Cumul trades (parsed)', len(cumul_trades_flat)),
+        ('Total rows seen', dtcc_reader.diag.get('total_rows', 0)),
+        ('Total accepted', dtcc_reader.diag.get('accepted', 0)),
+    ]
+    for i, (k, v) in enumerate(rows, 5):
+        s1.cell(row=i, column=1, value=k).font = bold
+        s1.cell(row=i, column=2, value=v)
+    # Rejection breakdown
+    s1.cell(row=14, column=1, value='Rejection reasons').font = bold
+    reasons = dtcc_reader.diag.get('rejected', {})
+    for i, (r, c) in enumerate(sorted(reasons.items(), key=lambda x: -x[1]), 15):
+        s1.cell(row=i, column=1, value=r)
+        s1.cell(row=i, column=2, value=c)
+    # Accepted by subtype
+    bysub = dtcc_reader.diag.get('accepted_by_subtype', {})
+    base_row = 15 + len(reasons) + 2
+    s1.cell(row=base_row, column=1, value='Accepted by subtype').font = bold
+    for i, (k, v) in enumerate(sorted(bysub.items(), key=lambda x: -x[1]), base_row + 1):
+        s1.cell(row=i, column=1, value=k)
+        s1.cell(row=i, column=2, value=v)
+    # Package detection source
+    pkgsrc = dtcc_reader.diag.get('package_detect_source', {})
+    base_row += len(bysub) + 3
+    s1.cell(row=base_row, column=1, value='Package detection source').font = bold
+    for i, (k, v) in enumerate(pkgsrc.items(), base_row + 1):
+        s1.cell(row=i, column=1, value=k)
+        s1.cell(row=i, column=2, value=v)
+    s1.column_dimensions['A'].width = 40
+    s1.column_dimensions['B'].width = 18
+
+    # ===== Sheet 2: PackageFields =====
+    # Parse out the package-relevant fields from each raw package row into
+    # columns so the user (and I) can see at a glance which fields DTCC is
+    # actually populating. This is the SMOKING GUN sheet for diagnosing why
+    # decomposition is failing.
+    s2 = wb.create_sheet('PackageFields')
+    pkg_headers = [
+        'disseminationIdentifier', 'executionTimestamp', 'actionType',
+        'packageIndicator', 'packageTransactionIdentifier',
+        'packageTransactionPrice', 'packageTransactionPriceNotation',
+        'uniqueProductIdentifierShortName', 'uniqueProductIdentifierUnderlierName',
+        'strikePrice', 'expirationDate',
+        'notionalAmountLeg1', 'notionalCurrencyLeg1',
+        'notionalAmountLeg2', 'notionalCurrencyLeg2',
+        'optionPremiumAmount', 'optionPremiumCurrency',
+        'callCurrencyLeg1',
+    ]
+    pkg_rows = []
+    for row in raw_packages:
+        pkg_rows.append([row.get(h, '') for h in pkg_headers])
+    write_sheet(s2, pkg_headers, pkg_rows)
+
+    # ===== Sheet 3: RawPackages =====
+    # Full raw row JSON, one row per package (everything DTCC sent for that row).
+    # Diagnostic sheet — useful if there's a field we didn't think to look at.
+    s3 = wb.create_sheet('RawPackages')
+    # Collect every key seen across all raw package rows
+    all_keys = set()
+    for row in raw_packages:
+        all_keys.update(row.keys())
+    all_keys = sorted(all_keys)
+    write_sheet(s3, all_keys, [[row.get(k, '') for k in all_keys] for row in raw_packages])
+
+    # ===== Sheet 4: Tape =====
+    s4 = wb.create_sheet('Tape')
+    tape_headers = ['time','trade_date','_ts','instrument','subtype','action',
+                    'pair','opt_type','strike','expiry','usd_amt','dissem_id']
+    write_sheet(s4, tape_headers, [[t.get(h,'') for h in tape_headers] for t in tape])
+
+    # ===== Sheet 5: ParsedTrades =====
+    s5 = wb.create_sheet('ParsedTrades')
+    trade_headers = ['_ts','time','trade_date','pair','opt_type','strike','expiry',
+                     'days','premium','premium_ccy','base_notl','terms_notl',
+                     'base_ccy','terms_ccy','usd_amt','iv','is_package','is_ndo',
+                     'subtype','pkg_id','pkg_price','pkg_notation','ts_source','_did']
+    all_parsed = ticker_trades + slice_trades_flat + cumul_trades_flat
+    # Dedup by _did
+    seen, deduped = set(), []
+    for t in all_parsed:
+        d = t.get('_did','')
+        if d and d in seen: continue
+        if d: seen.add(d)
+        deduped.append(t)
+    write_sheet(s5, trade_headers, [[t.get(h,'') for h in trade_headers] for t in deduped])
+
+    # Save to bytes
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def _build_diag_zip_fallback(dtcc_reader):
+    """Fallback when openpyxl is not installed — pack the same data as a zip
+    of CSVs. Less convenient but better than nothing."""
+    import io as _io, zipfile as _zip
+    bio = _io.BytesIO()
+    with _zip.ZipFile(bio, 'w', _zip.ZIP_DEFLATED) as zf:
+        with dtcc_reader._lock:
+            tape = list(dtcc_reader._tape)
+            raw_packages = list(dtcc_reader._raw_packages)
+        # PackageFields CSV
+        pkg_headers = ['disseminationIdentifier', 'executionTimestamp', 'actionType',
+            'packageIndicator', 'packageTransactionIdentifier',
+            'packageTransactionPrice', 'packageTransactionPriceNotation',
+            'uniqueProductIdentifierShortName', 'uniqueProductIdentifierUnderlierName',
+            'strikePrice', 'expirationDate']
+        buf = _io.StringIO()
+        w = csv.writer(buf); w.writerow(pkg_headers)
+        for row in raw_packages:
+            w.writerow([row.get(h,'') for h in pkg_headers])
+        zf.writestr('PackageFields.csv', buf.getvalue())
+        # RawPackages JSON (one object per line, NDJSON)
+        zf.writestr('RawPackages.ndjson',
+                    '\n'.join(json.dumps(r, default=str) for r in raw_packages))
+        # Tape CSV
+        if tape:
+            tape_headers = list(tape[0].keys())
+            buf = _io.StringIO(); w = csv.writer(buf); w.writerow(tape_headers)
+            for r in tape:
+                w.writerow([r.get(h,'') for h in tape_headers])
+            zf.writestr('Tape.csv', buf.getvalue())
+    return bio.getvalue()
+
+
+def _default_surfaces():
+    """Build a complete default surface dict for every supported pair.
+    Returns a dict shaped like saved_marks.json's 'surfaces' field so the JS
+    load path doesn't need a special code path."""
+    out = {}
+    for pair, (spot, atm3m, rr3m, fly3m, rd, rf) in _DEFAULT_SURFACE_LEVELS.items():
+        tenors = []
+        for label, T in zip(_DEFAULT_TN_LABELS, _DEFAULT_TN_T):
+            mult = _DEFAULT_TENOR_MULTIPLIER.get(label, 1.0)
+            atm = round(atm3m * mult, 2)
+            # RR and fly attenuate slightly at the very long end
+            rr_mult = 1.0 if label not in ('1Y','2Y') else 0.85
+            fly_mult = 1.0 if label not in ('1Y','2Y') else 0.90
+            tenors.append({
+                'tenor': label, 'T': T,
+                'atm': atm, 'rr25': round(rr3m * rr_mult, 3),
+                'rr10': round(rr3m * 1.7 * rr_mult, 3),
+                'fly25': round(fly3m * fly_mult, 3),
+                'fly10': round(fly3m * 2.5 * fly_mult, 3),
+                'fwdPts': 0,
+            })
+        out[pair] = {
+            'spot': spot, 'r_d': rd, 'r_f': rf,
+            'pipScale': 1 if pair in ('USDIDR', 'USDCOP') else (100 if spot > 50 else 10000),
+            'tenors': tenors,
+        }
+    return out
+
+
 def extract_tape_record(row):
     """Lightweight extraction for the RAW TAPE view — captures every row regardless
     of whether it is a surface-eligible vanilla option. Classifies instrument type
@@ -2267,9 +3625,24 @@ def parse_trade(row, stats=None):
         base_notl = n2
     else:
         base_notl = n1
+    # Also resolve the TERMS-currency notional. base_notl and terms_notl are
+    # related by the forward (terms_notl = base_notl * fwd), so whichever one
+    # DTCC populated lets the JS reconstruct the other without a USD cross-rate.
+    if nc1 == terms_ccy:
+        terms_notl = n1
+    elif nc2 == terms_ccy:
+        terms_notl = n2
+    else:
+        terms_notl = 0
     iv = ''
     pkg_p, pkg_n = get_field(row,'pkg_price'), get_field(row,'pkg_notation')
-    if pkg_n == '3' and pkg_p:
+    # IMPORTANT: pkg_price with notation 3 is the STRUCTURE's vol (the RR or fly
+    # itself), NOT a per-leg implied vol. Attaching it to a leg's iv field would
+    # cause the JS site-IV fallback to use a structure quote as if it were a leg
+    # vol — producing nonsense like both legs of a fly showing as 0.25 vol.
+    # Only populate iv from pkg_price when this is NOT a package (rare but
+    # possible — a single-leg quote tagged with vol notation).
+    if pkg_n == '3' and pkg_p and not is_package:
         try:
             v = float(pkg_p)
             if 0.5 < v < 80: iv = v
@@ -2296,6 +3669,7 @@ def parse_trade(row, stats=None):
     return {
         'pair':pair,'spot':0,'strike':strike,'fwd_rate':0,'fwd_pts':'','opt_type':opt_type,
         'days':days,'premium':prem,'premium_ccy':prem_ccy,'base_notl':base_notl,
+        'terms_notl':terms_notl,
         'base_ccy':base_ccy,'terms_ccy':terms_ccy,'usd_amt':usd,'iv':iv,
         'is_package': is_package, 'is_ndo': (opt_subtype == 'NDO'), 'subtype': opt_subtype,
         'pkg_id': get_field(row, 'pkg_id'),
@@ -2334,6 +3708,10 @@ class DTCCReader:
         # Raw tape: every recent row (all instruments/actions) for the stream view
         self._tape = []
         self._tape_max = 1000  # keep most recent N tape records
+        # Raw package rows — full original DTCC row JSON for anything tagged as a
+        # package. Used by the Excel export for diagnostics; otherwise inert.
+        self._raw_packages = []
+        self._raw_packages_max = 500
         threading.Thread(target=self._bg_loop, daemon=True).start()
 
     def _bg_loop(self):
@@ -2351,6 +3729,21 @@ class DTCCReader:
                 opts = list(filter(None, (parse_trade(t, self.diag) for t in raw)))
                 # Build raw tape records for ALL rows (every instrument/action)
                 tape = list(filter(None, (extract_tape_record(t) for t in raw)))
+                # Capture raw package rows for diagnostics — the original row JSON
+                # for anything that parse_trade flagged as a package, OR anything
+                # that looks like a package by field presence (broad net).
+                pkg_rows = []
+                for row in raw:
+                    pkg_ind = get_field(row, 'package_ind').upper()
+                    pkg_id_val = get_field(row, 'pkg_id')
+                    pkg_p = get_field(row, 'pkg_price')
+                    pkg_n = get_field(row, 'pkg_notation')
+                    has_any = (pkg_ind in ('TRUE','T','Y','YES','1')
+                               or (pkg_id_val and pkg_id_val.strip() not in ('','N/A','NA','NONE','0'))
+                               or (pkg_p and pkg_p.strip())
+                               or (pkg_n and pkg_n.strip()))
+                    if has_any:
+                        pkg_rows.append(row)
                 with self._lock:
                     self._ticker_trades = opts
                     # Merge into tape, dedup by dissem_id, keep most recent N
@@ -2364,9 +3757,20 @@ class DTCCReader:
                     # Sort newest-first by _ts, trim
                     self._tape.sort(key=lambda r: r.get('_ts',''), reverse=True)
                     self._tape = self._tape[:self._tape_max]
+                    # Stash raw package rows, dedup by disseminationIdentifier
+                    seen_pkg = set(r.get('disseminationIdentifier') for r in self._raw_packages
+                                   if r.get('disseminationIdentifier'))
+                    for row in pkg_rows:
+                        did = row.get('disseminationIdentifier')
+                        if did and did in seen_pkg: continue
+                        self._raw_packages.append(row)
+                        if did: seen_pkg.add(did)
+                    # Trim
+                    if len(self._raw_packages) > self._raw_packages_max:
+                        self._raw_packages = self._raw_packages[-self._raw_packages_max:]
                 self._ticker_ts = time.time()
                 self.stats.update(ticker_raw=len(raw), ticker_opts=len(opts))
-                log(f"Ticker: {len(raw)} -> {len(opts)} opts")
+                log(f"Ticker: {len(raw)} -> {len(opts)} opts, {len(pkg_rows)} pkg-like rows")
             except Exception as e: log(f"Ticker ERROR: {e}")
 
         if time.time() - self._slice_list_ts > 45:
@@ -2467,7 +3871,11 @@ class DTCCReader:
                 if ccy_set:
                     p = t.get('pair','')
                     if '/' in p and not {p[:3],p[4:]}.intersection(ccy_set): continue
-                out.append({k:v for k,v in t.items() if not k.startswith('_')})
+                # Keep the dissem id (_did) and trade timestamp (_ts) on the wire
+                # so the JS can dedup across ticker/slice/cumul sources. The
+                # underscore prefix was originally used to mark "internal only",
+                # but JS dedup is more important than internal/external hygiene.
+                out.append({k:v for k,v in t.items() if k not in ('_pkg_id_internal',)})
         self.stats['total_opts'] = len(out)
         return {'trades':out,'count':len(out),'source':'DTCC SDR Direct','stats':self.stats.copy()}
 
@@ -2650,6 +4058,130 @@ def pull_bbg_surfaces(pairs=None):
 
     session.stop()
     return {'source':'Bloomberg','timestamp':datetime.now().isoformat(),'surfaces':surfaces}
+
+
+def get_bbg_hist_spots_batch(requests, bucket_minutes=5):
+    """Batched historic spot lookup. `requests` is a list of {pair, date, time} dicts.
+    Trade times are snapped to the nearest `bucket_minutes` bucket and grouped by
+    (pair, date) so we issue one IntradayBarRequest per pair-date covering the full
+    minute range. Returns a dict: 'pair|YYYY-MM-DD|HH:MM' -> spot value.
+
+    No Bloomberg session needed if blpapi isn't installed — returns empty.
+    """
+    out = {}
+    if not requests:
+        return out
+    try:
+        import blpapi
+    except ImportError:
+        return {'_error': 'blpapi not installed'}
+
+    # Group requests by (pair, date); also snap each trade time to nearest bucket
+    from collections import defaultdict
+    groups = defaultdict(list)  # (pair, date) -> list of (hh, mm_snapped, original_time)
+    for r in requests:
+        pair = r.get('pair'); date = r.get('date'); ttime = r.get('time') or ''
+        if not pair or not date or not ttime: continue
+        try:
+            hh, mm = int(ttime[:2]), int(ttime[3:5])
+        except Exception:
+            continue
+        mm_snapped = (mm // bucket_minutes) * bucket_minutes
+        groups[(pair, date)].append((hh, mm_snapped, ttime))
+
+    if not groups:
+        return out
+
+    opts = blpapi.SessionOptions()
+    opts.setServerHost("localhost"); opts.setServerPort(8194)
+    session = blpapi.Session(opts)
+    if not session.start():
+        return {'_error': 'Cannot connect to Bloomberg'}
+    if not session.openService("//blp/refdata"):
+        session.stop()
+        return {'_error': 'Cannot open refdata'}
+    svc = session.getService("//blp/refdata")
+
+    try:
+        for (pair, date), buckets in groups.items():
+            # Build a minute-bar series covering the full needed range for this (pair, date)
+            if not buckets: continue
+            # Time range covers earliest minute through latest minute + bucket window
+            start_hh = min(b[0] for b in buckets); start_mm = min(b[1] for b in buckets if b[0] == start_hh)
+            end_hh   = max(b[0] for b in buckets); end_mm   = max(b[1] for b in buckets if b[0] == end_hh)
+            # Times in the dashboard are NEW YORK; Bloomberg IntradayBar uses UTC.
+            # Convert NY -> UTC for the request boundaries.
+            try:
+                from datetime import datetime as _dt
+                ny_start = _dt.strptime(f"{date} {start_hh:02d}:{start_mm:02d}", "%Y-%m-%d %H:%M")
+                ny_end   = _dt.strptime(f"{date} {end_hh:02d}:{end_mm:02d}",   "%Y-%m-%d %H:%M")
+                if _NY_TZ is not None:
+                    ny_start = ny_start.replace(tzinfo=_NY_TZ)
+                    ny_end   = ny_end.replace(tzinfo=_NY_TZ)
+                    utc_start = ny_start.astimezone(timezone.utc)
+                    utc_end   = ny_end.astimezone(timezone.utc)
+                else:
+                    # Fallback: rough EDT offset
+                    utc_start = ny_start.replace(tzinfo=timezone(timedelta(hours=-4))).astimezone(timezone.utc)
+                    utc_end   = ny_end.replace(tzinfo=timezone(timedelta(hours=-4))).astimezone(timezone.utc)
+            except Exception as e:
+                log(f"hist_spots_batch: time parse failed for {pair} {date}: {e}")
+                continue
+
+            ticker = f"{pair} Curncy"
+            req = svc.createRequest("IntradayBarRequest")
+            req.set("security", ticker)
+            req.set("eventType", "TRADE")
+            req.set("interval", bucket_minutes)
+            # Pad the range a little so the snapped buckets at the edges are covered
+            req.set("startDateTime", utc_start.strftime("%Y-%m-%dT%H:%M:00"))
+            # Add an extra bucket on the end so the bar containing utc_end is captured
+            utc_end_padded = utc_end + timedelta(minutes=bucket_minutes)
+            req.set("endDateTime",   utc_end_padded.strftime("%Y-%m-%dT%H:%M:00"))
+            session.sendRequest(req)
+
+            # Collect all bars: time -> close
+            bars_by_minute = {}  # 'HH:MM' (in NY) -> close
+            while True:
+                ev = session.nextEvent(5000)
+                for msg in ev:
+                    if not msg.hasElement("barData"): continue
+                    bd = msg.getElement("barData")
+                    if not bd.hasElement("barTickData"): continue
+                    bars = bd.getElement("barTickData")
+                    for i in range(bars.numValues()):
+                        b = bars.getValueAsElement(i)
+                        if not b.hasElement("time") or not b.hasElement("close"): continue
+                        bar_time_utc = b.getElementAsDatetime("time")
+                        if bar_time_utc.tzinfo is None:
+                            bar_time_utc = bar_time_utc.replace(tzinfo=timezone.utc)
+                        bar_ny = _to_ny(bar_time_utc)
+                        if not bar_ny: continue
+                        bars_by_minute[bar_ny.strftime('%H:%M')] = b.getElementAsFloat("close")
+                if ev.eventType() == blpapi.Event.RESPONSE:
+                    break
+
+            # Map each bucket-snap back to its trade's original key and find the closest bar
+            sorted_bar_times = sorted(bars_by_minute.keys())
+            for hh, mm_snap, original_time in buckets:
+                key = f"{pair}|{date}|{original_time}"
+                if key in out: continue
+                target = f"{hh:02d}:{mm_snap:02d}"
+                # Exact bucket match wins; else find the LAST bar at or before the target
+                if target in bars_by_minute:
+                    out[key] = bars_by_minute[target]
+                else:
+                    chosen = 0
+                    for bt in sorted_bar_times:
+                        if bt <= target: chosen = bars_by_minute[bt]
+                        else: break
+                    if chosen > 0: out[key] = chosen
+    except Exception as e:
+        log(f"hist_spots_batch error: {e}")
+    finally:
+        try: session.stop()
+        except Exception: pass
+    return out
 
 
 def get_bbg_hist_spot(pair, date_str, time_str=''):
@@ -3146,6 +4678,21 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as e:
                 log(f"Save marks error: {e}")
                 self._json({'ok': False, 'error': str(e)})
+        elif self.path == '/api/bbg_hist_spots_batch':
+            # POST body: {requests: [{pair, date, time}, ...], bucket_minutes: 5}
+            # Returns: {results: {key: spot}}  where key = 'pair|date|time'
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length)
+                payload = json.loads(body) if body else {}
+                reqs = payload.get('requests', [])
+                bucket = int(payload.get('bucket_minutes', 5))
+                results = get_bbg_hist_spots_batch(reqs, bucket_minutes=bucket)
+                err = results.pop('_error', None) if isinstance(results, dict) else None
+                self._json({'results': results, 'count': len(results), 'error': err})
+            except Exception as e:
+                log(f"Hist spots batch error: {e}")
+                self._json({'results': {}, 'error': str(e)})
         else:
             self.send_error(404)
 
@@ -3181,6 +4728,27 @@ class Handler(SimpleHTTPRequestHandler):
                     tape = [r for r in tape if r.get('instrument','').upper() == inst]
                 self._json({'tape': tape[:500], 'count': len(tape)})
             except Exception as e:
+                self.send_error(500, str(e))
+
+        elif p.path == '/api/export_diag' and _dtcc:
+            # Build a multi-sheet xlsx with the full diagnostic snapshot:
+            #  - Tape: all recent rows (parsed view)
+            #  - Trades: surface-eligible vanilla/NDO trades (parsed view)
+            #  - RawPackages: original DTCC row JSON for any package-tagged row
+            #  - PackageFields: same packages with the package-relevant fields
+            #    pulled out into columns so the failure modes are obvious
+            try:
+                xlsx_bytes = _build_diag_xlsx(_dtcc)
+                fname = 'dtcc_diag_' + datetime.now().strftime('%Y-%m-%d-%H-%M-%S') + '.xlsx'
+                self.send_response(200)
+                self.send_header('Content-Type',
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                self.send_header('Content-Disposition', 'attachment; filename="' + fname + '"')
+                self.send_header('Content-Length', str(len(xlsx_bytes)))
+                self.end_headers()
+                self.wfile.write(xlsx_bytes)
+            except Exception as e:
+                log(f"Export diag error: {e}")
                 self.send_error(500, str(e))
 
         elif p.path == '/api/bbg_refresh':
@@ -3226,7 +4794,14 @@ class Handler(SimpleHTTPRequestHandler):
                 except Exception as e:
                     self._json({'error': str(e), 'surfaces': {}})
             else:
+                # No saved marks. Don't auto-load defaults — the user can
+                # explicitly hit "Restore Defaults" if they want them.
                 self._json({'surfaces': {}})
+
+        elif p.path == '/api/load_defaults':
+            # Always returns the generated default surfaces regardless of
+            # whether saved_marks.json exists. Backs the "Restore Defaults" button.
+            self._json({'surfaces': _default_surfaces(), 'default': True})
 
         elif p.path == '/api/status' and _dtcc:
             self._json(_dtcc.stats)
