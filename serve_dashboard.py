@@ -33,6 +33,73 @@ MATHFIX_JS = r"""
 // === serve_dashboard.py v3.0 math overrides ===
 console.log('mathfix.js loaded — fwd pts, spot delta, prints, premium diagnostics');
 
+// ===== TENOR GRID: insert 18M between 1Y and 2Y =====
+// The base HTML defines a 10-tenor grid (..., 9M, 1Y, 2Y). We add an 18M (T=1.5)
+// pillar. Because every consumer reads these globals at runtime (inside render
+// functions), reassigning them here — before any rendering — propagates the new
+// pillar everywhere: heatmaps, surface tables, interpolation, bucketing.
+(function add18MTenor() {
+    var want = ['O/N','1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y'];
+    var wantT = [1/365,7/365,14/365,1/12,2/12,3/12,6/12,9/12,1.0,1.5,2.0];
+    try {
+        if (typeof TENORS !== 'undefined' && TENORS.indexOf('18M') < 0) {
+            TENORS.length = 0; want.forEach(function(t){ TENORS.push(t); });
+        }
+        if (typeof TENOR_T !== 'undefined') {
+            TENOR_T.length = 0; wantT.forEach(function(t){ TENOR_T.push(t); });
+        }
+        if (typeof DT !== 'undefined' && DT.indexOf('18M') < 0) {
+            DT.length = 0; want.forEach(function(t){ DT.push(t); });
+        }
+    } catch (e) { console.log('18M tenor insert issue:', e); }
+})();
+
+// Ensure a surface has an 18M tenor; if missing, interpolate it from the
+// bracketing 1Y and 2Y pillars (variance-flat in T for ATM, linear for RR/fly).
+function _ensure18M(surf) {
+    if (!surf || !surf.tenors) return;
+    var existing = surf.tenors.find(function(t){ return t.tenor === '18M'; });
+    // If an 18M entry exists AND already has a real ATM, keep it as-is.
+    if (existing && existing.atm > 0) return;
+    var oneY = surf.tenors.find(function(t){ return t.tenor === '1Y'; });
+    var twoY = surf.tenors.find(function(t){ return t.tenor === '2Y'; });
+    var vals;
+    if (oneY && twoY && (oneY.atm > 0 || twoY.atm > 0)) {
+        var f = (1.5 - 1.0) / (2.0 - 1.0); // = 0.5
+        var vInterp = function(a, b) {
+            var wa = a * a * 1.0, wb = b * b * 2.0;   // total variance at each pillar
+            var w = wa + f * (wb - wa);               // linear in total variance
+            return Math.sqrt(Math.max(0, w) / 1.5);   // back out vol at T=1.5
+        };
+        var lin = function(a, b) { return a + f * (b - a); };
+        vals = {
+            tenor: '18M', T: 1.5,
+            atm: vInterp(oneY.atm || 0, twoY.atm || 0),
+            rr25: lin(oneY.rr25 || 0, twoY.rr25 || 0),
+            rr10: lin(oneY.rr10 || 0, twoY.rr10 || 0),
+            fly25: lin(oneY.fly25 || 0, twoY.fly25 || 0),
+            fly10: lin(oneY.fly10 || 0, twoY.fly10 || 0),
+            fwdPts: lin(oneY.fwdPts || 0, twoY.fwdPts || 0)
+        };
+    } else if (oneY && oneY.atm > 0) {
+        vals = {tenor:'18M', T:1.5, atm:oneY.atm, rr25:oneY.rr25||0, rr10:oneY.rr10||0,
+                fly25:oneY.fly25||0, fly10:oneY.fly10||0, fwdPts:oneY.fwdPts||0};
+    } else {
+        vals = {tenor:'18M', T:1.5, atm:0, rr25:0, rr10:0, fly25:0, fly10:0, fwdPts:0};
+    }
+    if (existing) {
+        // Fill the empty placeholder in place
+        existing.T = 1.5; existing.atm = vals.atm; existing.rr25 = vals.rr25;
+        existing.rr10 = vals.rr10; existing.fly25 = vals.fly25;
+        existing.fly10 = vals.fly10;
+        if (!existing.fwdPts) existing.fwdPts = vals.fwdPts;
+    } else {
+        var idx2Y = surf.tenors.findIndex(function(t){ return t.tenor === '2Y'; });
+        if (idx2Y >= 0) surf.tenors.splice(idx2Y, 0, vals);
+        else surf.tenors.push(vals);
+    }
+}
+
 // Current DTCC trading day as YYYY-MM-DD, applying the 5pm-ET rollover.
 // The FX/DTCC trading day ends at 17:00 New York time — trades at/after 5pm ET
 // belong to the NEXT trading day. Must NOT use the UTC calendar date.
@@ -328,8 +395,57 @@ if (_origBuildSurf) {
 
 // Fix dProcTrades: correct fwd scaling, spot delta, premium handling, better diagnostics
 var _origDProcTrades = typeof dProcTrades === 'function' ? dProcTrades : null;
+
+// Per-trade frozen-vol cache (keyed by dissem id). A trade's implied vol is the
+// vol it printed at and must not drift as spot moves; once solved it is frozen
+// here and reused on every subsequent poll.
+window._solvedVolCache = window._solvedVolCache || {};
+
+// Current trading day (NY, 5pm-ET roll). Used to detect an overnight roll so we
+// can clear the freeze cache: at the roll the day-count and forward basis change
+// and yesterday's frozen solves should be re-derived cleanly on the new day.
+function _tradingDayNYString() {
+    try {
+        var now = new Date();
+        // Shift to NY, then roll the "trading day" at 17:00 ET.
+        var ny = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+        if (ny.getHours() >= 17) ny.setDate(ny.getDate() + 1);
+        return ny.getFullYear() + '-' + ('0'+(ny.getMonth()+1)).slice(-2) + '-' + ('0'+ny.getDate()).slice(-2);
+    } catch (e) {
+        return new Date().toISOString().slice(0, 10);
+    }
+}
+window._lastTradingDay = window._lastTradingDay || _tradingDayNYString();
+
+// Watchdog: every 60s, if the NY trading day has rolled, clear the freeze cache
+// and the cached batch so the next poll re-solves cleanly against the new day's
+// day-counts and forwards. Fixes the "overnight calibration drifts / bad vols"
+// problem when the app is left running across the 5pm-ET roll.
+setInterval(function() {
+    var td = _tradingDayNYString();
+    if (td !== window._lastTradingDay) {
+        console.log('Trading day rolled ' + window._lastTradingDay + ' -> ' + td + '; clearing frozen-vol cache');
+        window._lastTradingDay = td;
+        window._solvedVolCache = {};
+        window._totalDidsSeen = {};
+        window._totalTaggedKeys = {};
+        if (window._histSpotBatchCache) window._histSpotBatchCache = {};
+        // Force a clean re-solve on the next available batch
+        if (window._lastTradesBatch && typeof dProcTrades === 'function') {
+            try { dProcTrades(window._lastTradesBatch); if (typeof dRA === 'function') dRA(); } catch (e) {}
+        }
+    }
+}, 60000);
+
 if (_origDProcTrades) {
     dProcTrades = function(trades) {
+        // Date-roll guard inside the hot path too: if the day rolled since the
+        // last process, clear the cache before solving this batch.
+        var _td = _tradingDayNYString();
+        if (_td !== window._lastTradingDay) {
+            window._lastTradingDay = _td;
+            window._solvedVolCache = {};
+        }
         dAT = {}; dPM = {};
         DTCC_G10.concat(DTCC_EM).forEach(function(p) { dAT[p] = []; });
         var solved = 0, fallback = 0, skipped = 0, noPrem = 0, noSpot = 0, noPkg = 0;
@@ -384,7 +500,32 @@ if (_origDProcTrades) {
                 return;
             }
             var days = parseInt(t.days) || 0; if (days <= 0) { skipped++; if (isNdo) ndoStats.filtered++; return; }
+
+            // FREEZE-CACHE SHORT-CIRCUIT: if we've already solved this trade
+            // (by dissem id), reuse the frozen vol/delta. Do NOT re-solve — the
+            // trade's vol is fixed at what it printed. We only refresh the
+            // days-to-expiry (it shrinks daily) and re-push the frozen row.
+            if (t._did && window._solvedVolCache[t._did]) {
+                var cached = window._solvedVolCache[t._did];
+                // Refresh days-to-expiry from the current trading day so tenor
+                // bucketing stays correct as time passes, without touching vol.
+                var freshDays = days;
+                var frozen = {
+                    time: cached.time, type: cached.type, strike: cached.strike,
+                    spot: cached.spot, fwd: cached.fwd, days: freshDays,
+                    iv: cached.iv, notl: cached.notl, expiry: cached.expiry,
+                    ic: cached.ic, delta: cached.delta, bucketDelta: cached.bucketDelta,
+                    ivSrc: cached.ivSrc, isNdo: cached.isNdo, fwdSrc: cached.fwdSrc,
+                    trade_date: cached.trade_date, pair: pk
+                };
+                dAT[pk].push(frozen);
+                ivSrcStats[cached.ivSrc] = (ivSrcStats[cached.ivSrc] || 0) + 1;
+                if (isNdo) ndoStats.accepted++;
+                return;
+            }
+
             var notl = parseFloat(t.usd_amt) || 0;
+            var notlCcy = (t.notl_ccy || 'USD').toUpperCase();
             var spot = parseFloat(t.spot) || 0, strike = parseFloat(t.strike) || 0;
 
             if (spot <= 0 && pk && mktSurfaces[pk] && mktSurfaces[pk].spot > 0) {
@@ -434,8 +575,17 @@ if (_origDProcTrades) {
             }
 
             var T = days / 365;
-            var apiIsCall = (t.opt_type === 'CALL');
-            var ic = (strike >= fwd);
+            // Use the REAL option type from DTCC for pricing, delta sign, and the
+            // call/put label. Previously call/put was inferred from moneyness
+            // (strike >= fwd), which mislabels ITM options: an ITM call (strike
+            // below the forward) would have shown as a put with a negative delta
+            // and bucketed on the wrong wing of the surface. The true type is
+            // authoritative; fall back to moneyness only when DTCC gave no type.
+            var apiIsCall;
+            if (t.opt_type === 'CALL') apiIsCall = true;
+            else if (t.opt_type === 'PUT') apiIsCall = false;
+            else apiIsCall = (strike >= fwd);
+            var ic = apiIsCall;
 
             // IV from premium — CORRECT currency conversion
             // Skip premium-based solving for PACKAGE trades (premium is for whole structure)
@@ -460,22 +610,25 @@ if (_origDProcTrades) {
                 var termsNotl = t.terms_notl ? parseFloat(t.terms_notl) : 0;
                 if (termsNotl > 0 && fwd > 0) {
                     baseNotl = termsNotl / fwd;
-                } else if (baseCcy === 'USD') {
+                } else if (baseCcy === 'USD' && notlCcy === 'USD') {
                     baseNotl = notl * 1e6;
-                } else if (termsCcy === 'USD') {
+                } else if (termsCcy === 'USD' && notlCcy === 'USD') {
                     baseNotl = notl * 1e6 / spot;
+                } else if (notlCcy === baseCcy) {
+                    baseNotl = notl * 1e6;                 // usd_amt is the base-ccy notional
+                } else if (notlCcy === termsCcy && fwd > 0) {
+                    baseNotl = notl * 1e6 / fwd;           // usd_amt is the terms-ccy notional
                 } else {
-                    // Cross-pair: try to find a USD/base rate via mktSurfaces
+                    // Cross where usd_amt is USD (or unknown). Try a USD/base rate.
                     var usdBaseRate = 0;
                     var baseUsd = baseCcy + 'USD'; // e.g. EURUSD
                     var usdBase = 'USD' + baseCcy; // e.g. USDJPY
                     if (mktSurfaces[baseUsd] && mktSurfaces[baseUsd].spot > 0) {
-                        usdBaseRate = mktSurfaces[baseUsd].spot;  // base in USD
+                        usdBaseRate = mktSurfaces[baseUsd].spot;
                     } else if (mktSurfaces[usdBase] && mktSurfaces[usdBase].spot > 0) {
                         usdBaseRate = 1 / mktSurfaces[usdBase].spot;
                     }
-                    if (usdBaseRate > 0 && notl > 0) {
-                        // notl is USD-millions. base_notl = USD-amount / (USD per base)
+                    if (usdBaseRate > 0 && notl > 0 && notlCcy === 'USD') {
                         baseNotl = notl * 1e6 / usdBaseRate;
                     } else {
                         baseNotl = 0;  // truly unresolvable
@@ -626,11 +779,19 @@ if (_origDProcTrades) {
                 skipped++; if (isNdo) ndoStats.noIV++; return;
             }
 
-            // Spot delta with GK discount
+            // Spot delta (forward delta via dCD) using the TRUE option type.
             var delta = dCD(fwd, strike, iv / 100, T, ic, rd, spot);
 
             if (Math.abs(delta) < 0.05 || iv > 60 || iv < 0.5) { skipped++; if (isNdo) ndoStats.filtered++; return; }
-            var dBucket = dDB(delta);
+
+            // Bucket by OTM-EQUIVALENT delta so an ITM option lands on the correct
+            // smile wing. A 0.74d call shares a strike with a ~0.26d put, so for
+            // surface placement it belongs in the 25dP bucket, not ATM. Fold any
+            // |delta|>0.5 to its complement. True signed delta is kept for display.
+            var bucketDelta = delta;
+            if (delta > 0.5) bucketDelta = delta - 1;
+            else if (delta < -0.5) bucketDelta = delta + 1;
+            var dBucket = dDB(bucketDelta);
             if (dBucket === 0 || dBucket === 4) {
                 var tw = tenorWeights(days); var bti = tw[0].ti;
                 var base = dtccGetBase(pk, DT[bti]);
@@ -639,12 +800,25 @@ if (_origDProcTrades) {
             if (spot > 0 && (!dPM[pk] || t.time > (dPM[pk].lt || ''))) dPM[pk] = {spot: spot, lt: t.time};
             if (isNdo) ndoStats.accepted++;
             ivSrcStats[thisIvSrc] = (ivSrcStats[thisIvSrc] || 0) + 1;
-            dAT[pk].push({
+            var solvedRow = {
                 time: t.time || '', type: ic ? 'CALL' : 'PUT', strike: strike, spot: spot,
                 fwd: fwd, days: days, iv: iv, notl: notl, expiry: t.expiry || '',
-                ic: ic, delta: delta, ivSrc: thisIvSrc,
-                isNdo: isNdo, fwdSrc: fwdSource, trade_date: t.trade_date || ''
-            });
+                ic: ic, delta: delta, bucketDelta: bucketDelta, ivSrc: thisIvSrc,
+                isNdo: isNdo, fwdSrc: fwdSource, trade_date: t.trade_date || '', pair: pk,
+                // Record what kind of spot the IV was solved against, so a vol
+                // solved on a fallback/default spot (BBG down) is distinguishable
+                // from one solved on a live BBG spot. (The vol stays frozen either
+                // way — this is for transparency, not churn.)
+                solveSpotSrc: (t.histSpot > 0) ? 'historic'
+                              : ((mktSurfaces[pk] && mktSurfaces[pk].spotSource) || 'unknown')
+            };
+            // FREEZE the solved vol/delta keyed by dissem id. A trade's implied
+            // vol is a historical fact — the vol it printed at, using the spot and
+            // forward that existed when it traded. On later polls (and on spot
+            // edits) we REUSE this frozen result instead of re-solving against a
+            // moved spot, which would corrupt the historical vol.
+            if (t._did) window._solvedVolCache[t._did] = solvedRow;
+            dAT[pk].push(solvedRow);
         } catch(e) { skipped++; } });
 
         // ---- Surface-anchored package decomposition ----
@@ -702,10 +876,12 @@ if (_origDProcTrades) {
                 if (!lpk || !dAT[lpk]) return;
                 var dlt = (l.derivedDelta != null) ? l.derivedDelta : 0;
                 if (Math.abs(dlt) < 0.05 || l.derivedIV > 60 || l.derivedIV < 0.5) return;
+                var bdlt = dlt;
+                if (dlt > 0.5) bdlt = dlt - 1; else if (dlt < -0.5) bdlt = dlt + 1;
                 dAT[lpk].push({
                     time: l.time || '', type: l.type, strike: l.strike, spot: l.spot,
                     fwd: l.fwd, days: l.days, iv: l.derivedIV, notl: l.notl,
-                    expiry: l.expiry || '', ic: l.ic, delta: dlt,
+                    expiry: l.expiry || '', ic: l.ic, delta: dlt, bucketDelta: bdlt,
                     ivSrc: 'derived', isNdo: l.isNdo, fwdSrc: 'pkg',
                     trade_date: l.trade_date || '',
                     derived: true, structure: l.structure, anchorSrc: l.anchorSrc,
@@ -796,7 +972,7 @@ dRFeed = function() {
         // Strike formatting: 3 decimals for <10, 2 for <1000, 0 for >=1000
         var kTxt = t.strike >= 1000 ? t.strike.toFixed(0) : t.strike < 10 ? t.strike.toFixed(4) : t.strike.toFixed(2);
         // Expiry as MMM-DD
-        var expTxt = t.expiry ? t.expiry.slice(5) : '';
+        var expTxt = t.expiry ? (t.expiry.slice(5) + '-' + t.expiry.slice(2,4)) : '';
         var dTxt = Math.round(Math.abs(t.delta) * 100) + '\u0394';
         h += '<div class="dtcc-feed-item' + (i < 3 ? ' fresh' : '') + '">'
             + '<span style="' + tc + ';font-weight:700;font-size:10px">' + kTxt + '</span>'
@@ -816,7 +992,7 @@ dRFeed = function() {
                       SEK:0.03,NOK:0.035,MXN:0.1,BRL:0.12,TRY:0.4,ZAR:0.08,CNH:0.025,
                       INR:0.065,KRW:0.03,SGD:0.03,TWD:0.015,IDR:0.06,PHP:0.055,THB:0.02,
                       HKD:0.045,CLP:0.06,COP:0.1,PEN:0.06,ILS:0.045};
-    var TN_LABELS = ['O/N','1W','2W','1M','2M','3M','6M','9M','1Y','2Y'];
+    var TN_LABELS = ['O/N','1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y'];
     function pollBBG() {
         fetch('/api/bbg_spots')
         .then(function(r) { return r.json(); })
@@ -826,6 +1002,10 @@ dRFeed = function() {
             var fwdPts = data.fwd_pts || {};
             var rates = data.rates || {};
             var pipScales = data.pip_scales || {};
+            // Record whether Bloomberg is actually streaming. This is the
+            // source-of-truth flag the rest of the app uses to decide between
+            // live BBG spot (authoritative) and the input/default spot (fallback).
+            window._bbgConnected = !!data.streaming && Object.keys(spots).length > 0;
             // Stash raw spots globally — used as a spot fallback for DTCC trades
             // (esp. NDO/EM pairs that may not have a built mktSurface yet)
             window._bbgSpotsRaw = spots;
@@ -839,14 +1019,16 @@ dRFeed = function() {
                     var rd = (rates[pair] && rates[pair].r_d) ? rates[pair].r_d : (DEFAULT_RD[terms] || 0.04);
                     var rf = (rates[pair] && rates[pair].r_f) ? rates[pair].r_f : (DEFAULT_RD[base] || 0.03);
                     mktSurfaces[pair] = {
-                        spot: s, _pair: pair, r_d: rd, r_f: rf,
+                        spot: s, _pair: pair, r_d: rd, r_f: rf, spotSource: 'bbg',
                         pipScale: pipScales[pair] || null,  // null = unknown, fallback to spot heuristic
                         tenors: TN_LABELS.map(function(tn, ti) {
                             return {tenor: tn, T: TENOR_T[ti], atm: 8, rr25: 0, rr10: 0, fly25: 0.2, fly10: 0.5, fwdPts: 0};
                         })
                     };
                 } else {
+                    // BBG is authoritative for spot — overwrite, and tag the source.
                     mktSurfaces[pair].spot = s;
+                    mktSurfaces[pair].spotSource = 'bbg';
                     if (pipScales[pair]) mktSurfaces[pair].pipScale = pipScales[pair];
                 }
 
@@ -863,6 +1045,7 @@ dRFeed = function() {
                         if (fp !== undefined && fp !== null) tn.fwdPts = fp;
                     });
                 }
+                _ensure18M(mktSurfaces[pair]);
             });
 
             var el = document.getElementById('mkt-status');
@@ -930,7 +1113,19 @@ function _applyScaler(rawIV, markVol) {
 var _origDBuildSurf = typeof dBuildSurf === 'function' ? dBuildSurf : null;
 if (_origDBuildSurf) {
     dBuildSurf = function() {
+        // The base dBuildSurf buckets via dDB(t.delta). Temporarily expose the
+        // OTM-equivalent bucketDelta as delta so ITM options accumulate on the
+        // correct smile wing, then restore the true display delta afterward.
+        var swapped = [];
+        DTCC_G10.concat(DTCC_EM).forEach(function(p) {
+            (dAT[p] || []).forEach(function(t) {
+                if (t.bucketDelta != null && t.bucketDelta !== t.delta) {
+                    swapped.push(t); t._trueDelta = t.delta; t.delta = t.bucketDelta;
+                }
+            });
+        });
         _origDBuildSurf();
+        swapped.forEach(function(t) { t.delta = t._trueDelta; delete t._trueDelta; });
         // Apply markup scaler FIRST — pulls raw DTCC values toward marks
         DTCC_G10.concat(DTCC_EM).forEach(function(pair) {
             var raw = dCS[pair];
@@ -1004,7 +1199,7 @@ dRSurf = function() {
         var tenorLabel = tnrs[bestTi].tenor;
         var hmTi = DT.indexOf(tenorLabel);
         if (hmTi < 0) return;
-        var di = dDB(t.delta);  // 0=10dP, 1=25dP, 2=ATM, 3=25dC, 4=10dC
+        var di = dDB(t.bucketDelta != null ? t.bucketDelta : t.delta);  // 0=10dP, 1=25dP, 2=ATM, 3=25dC, 4=10dC
         var base = dtccGetBase(pk, tenorLabel);
         if (!base) return;
         var markVol = base.vols[di];
@@ -1179,7 +1374,7 @@ dRFeed = function() {
 
     var hdr = document.querySelector('.dtcc-feed-header');
     // 9-col grid (added Date column next to Time for multi-day lookback)
-    var gridCols = '52px 38px 60px 48px 48px 42px 46px 34px 56px';
+    var gridCols = '52px 38px 58px 58px 46px 42px 44px 32px 54px';
     if (hdr) {
         hdr.innerHTML = '<span>Date</span><span>Time</span><span>Strike</span><span>Expiry</span><span>Notl</span><span>Vol</span><span>vs Mk</span><span>\u0394</span><span>Spot@T</span>';
         hdr.style.gridTemplateColumns = gridCols;
@@ -1197,7 +1392,7 @@ dRFeed = function() {
         var notlR = Math.round(t.notl * 2) / 2;
         var notlTxt = notlR >= 1000 ? (notlR/1000).toFixed(1) + 'B' : notlR.toFixed(1) + 'M';
         var kTxt = t.strike >= 1000 ? t.strike.toFixed(0) : t.strike < 10 ? t.strike.toFixed(4) : t.strike.toFixed(2);
-        var expTxt = t.expiry ? t.expiry.slice(5) : '';
+        var expTxt = t.expiry ? (t.expiry.slice(5) + '-' + t.expiry.slice(2,4)) : '';
         // Prefer historic delta (computed from BBG spot at trade time) when available
         var dispDelta = (t.deltaHist != null) ? t.deltaHist : t.delta;
         var dTxt = Math.round(Math.abs(dispDelta) * 100) + '\u0394' + (t.deltaHist != null ? '\u2032' : '');
@@ -1213,7 +1408,7 @@ dRFeed = function() {
             }
             var base = dtccGetBase(pk, tnrs[bestTi].tenor);
             if (base) {
-                var di = dDB(t.delta);
+                var di = dDB(t.bucketDelta != null ? t.bucketDelta : t.delta);
                 var markVol = base.vols[di];
                 var scaledIV = _applyScaler(t.iv, markVol);
                 var diff = scaledIV - markVol;
@@ -1282,7 +1477,7 @@ dRFeed = function() {
                    : s.strike < 10 ? s.strike.toFixed(4) : s.strike.toFixed(2);
         var notlR = Math.round((s.notl||0) * 2) / 2;
         var notlTxt = notlR >= 1000 ? (notlR/1000).toFixed(1)+'B' : notlR.toFixed(1)+'M';
-        var expTxt = s.expiry ? s.expiry.slice(5) : '';
+        var expTxt = s.expiry ? (s.expiry.slice(5) + '-' + s.expiry.slice(2,4)) : '';
         var dateTxt = s.trade_date ? s.trade_date.slice(5) : '';
         var pid = s.pkg_id ? String(s.pkg_id).slice(-6) : '';
         // Friendlier structure labels
@@ -1334,7 +1529,7 @@ dRFeed = function() {
                    : s.strike < 10 ? s.strike.toFixed(4) : s.strike.toFixed(2);
         var notlR = Math.round((s.notl||0) * 2) / 2;
         var notlTxt = notlR >= 1000 ? (notlR/1000).toFixed(1)+'B' : notlR.toFixed(1)+'M';
-        var expTxt = s.expiry ? s.expiry.slice(5) : '';
+        var expTxt = s.expiry ? (s.expiry.slice(5) + '-' + s.expiry.slice(2,4)) : '';
         var dateTxt = s.trade_date ? s.trade_date.slice(5) : '';
         seh += '<div class="dtcc-feed-item" style="grid-template-columns:' + gridCols
             + ';background:rgba(239,83,80,0.08)" title="No spot available - shown for visibility, not mapped to surface">'
@@ -1463,7 +1658,7 @@ buildPortHm = function(cs, comp) {
         return Math.max(0, Math.min(Math.floor((k - portHmData.strikes[0]) / portHmData.bw), nb - 1));
     }
     function getTI(days) {
-        var bk = [['O/N',1],['1W',7],['2W',14],['1M',30],['2M',61],['3M',91],['6M',182],['9M',274],['1Y',365],['2Y',730]];
+        var bk = [['O/N',1],['1W',7],['2W',14],['1M',30],['2M',61],['3M',91],['6M',182],['9M',274],['1Y',365],['18M',547],['2Y',730]];
         for (var i = bk.length - 1; i >= 0; i--) { if (days >= bk[i][1] * 0.7) return TENORS.indexOf(bk[i][0]); }
         return 0;
     }
@@ -1636,7 +1831,7 @@ function _dtccHeatmapClick(data) {
         }
         var tenorLabel = tnrs[bestTi].tenor;
         var hmTi = DT.indexOf(tenorLabel);
-        var tdi = dDB(t.delta);
+        var tdi = dDB(t.bucketDelta != null ? t.bucketDelta : t.delta);
         return hmTi === ti && tdi === di;
     });
 
@@ -2027,19 +2222,23 @@ function dtccEditCell(el) {
     }
 }
 
-// Recompute trade pipeline when the user edits spot or rates on the Market
-// Data tab. Without this, deltas would stay stale and trades wouldn't move
-// to the correct delta buckets on the heatmap.
+// Spot/rate edits on the Market Data tab must NOT re-solve already-traded vols
+// — a printed trade's vol is the vol it traded at and is frozen in the cache.
+// Editing spot only affects how NEW trades (not yet seen) will be priced, plus
+// the live surface display. So on a spot edit we just re-render; the frozen
+// cache guarantees existing trades keep their original vols even though
+// dProcTrades runs again.
 (function hookOnMktP() {
     if (typeof onMktP !== 'function') { setTimeout(hookOnMktP, 500); return; }
     var orig = onMktP;
     onMktP = function() {
         var r = orig.apply(this, arguments);
-        // Debounce — multiple field changes in quick succession should batch
-        if (window._mktPRecomputeTimer) clearTimeout(window._mktPRecomputeTimer);
-        window._mktPRecomputeTimer = setTimeout(function() {
-            if (typeof _recomputeFromMarks === 'function') _recomputeFromMarks();
-        }, 400);
+        // Light re-render only — surface/marks display. No vol re-solve, because
+        // the freeze cache returns the original vols regardless of current spot.
+        if (window._mktPRenderTimer) clearTimeout(window._mktPRenderTimer);
+        window._mktPRenderTimer = setTimeout(function() {
+            if (typeof renderMktContent === 'function') { try { renderMktContent(); } catch (e) {} }
+        }, 300);
         return r;
     };
 })();
@@ -2142,17 +2341,20 @@ function saveMarks() {
     });
 }
 
-// Auto-load saved marks on startup
-(function loadSavedMarks() {
-    fetch('/api/load_marks')
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-        var surfs = data.surfaces || {};
+// Auto-load on startup: defaults FIRST as a base layer (so every pair — incl.
+// EM/NDO like USDBRL, USDCLP — has at least a spot and surface even when BBG is
+// off and the user never hand-marked it), THEN overlay saved marks on top.
+(function loadStartupSurfaces() {
+    function applySurfaces(surfs, overlay) {
         var count = 0;
-        Object.keys(surfs).forEach(function(pair) {
+        Object.keys(surfs || {}).forEach(function(pair) {
             var s = surfs[pair];
             if (!s.spot && !s.tenors) return;
-            mktSurfaces[pair] = {spot: s.spot || 1.0, r_d: s.r_d || 0.04, r_f: s.r_f || 0.02, _pair: pair, tenors: []};
+            // When overlaying saved marks, only replace if the saved entry has
+            // real content; otherwise keep the default base layer.
+            mktSurfaces[pair] = {spot: s.spot || (mktSurfaces[pair] && mktSurfaces[pair].spot) || 1.0,
+                                 r_d: s.r_d || 0.04, r_f: s.r_f || 0.02, _pair: pair,
+                                 spotSource: (overlay ? 'saved' : 'default'), tenors: []};
             var tnList = s.tenors || [];
             TENORS.forEach(function(tn, ti) {
                 var src = tnList.find(function(t) { return t.tenor === tn; }) || {};
@@ -2161,18 +2363,91 @@ function saveMarks() {
                     rr10: src.rr10 || 0, fly25: src.fly25 || 0, fly10: src.fly10 || 0, fwdPts: src.fwdPts || 0
                 });
             });
+            _ensure18M(mktSurfaces[pair]);
             count++;
         });
-        if (count > 0) {
+        return count;
+    }
+    // Step 1: defaults (base layer — every pair gets a spot even with BBG off)
+    fetch('/api/load_defaults')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        var dc = applySurfaces(data.surfaces, false);
+        console.log('Loaded ' + dc + ' default surfaces (base layer)');
+        // Step 2: overlay saved marks (user's hand-marks win where present)
+        return fetch('/api/load_marks').then(function(r){ return r.json(); });
+    })
+    .then(function(data) {
+        var sc = applySurfaces(data.surfaces, true);
+        if (!activeMktPair || !mktSurfaces[activeMktPair]) {
             activeMktPair = Object.keys(mktSurfaces)[0];
-            renderMktTabs(); renderMktContent();
-            var st = document.getElementById('mkt-status');
-            if (st) st.textContent = 'Loaded ' + count + ' saved marks';
-            console.log('Loaded ' + count + ' saved marks from server');
+        }
+        renderMktTabs(); renderMktContent();
+        var st = document.getElementById('mkt-status');
+        if (st) st.textContent = sc > 0 ? ('Loaded ' + sc + ' saved marks over defaults')
+                                        : 'Loaded default surfaces';
+        console.log('Overlaid ' + sc + ' saved marks');
+        // Step 3: Bloomberg is the AUTHORITATIVE source. Fire a one-shot full
+        // refresh on startup. If BBG is connected, this overwrites spots (and
+        // surfaces) with live data and tags spotSource='bbg'. If not reachable,
+        // the default/saved fallback above stays in place. The recurring
+        // pollBBG (every 5s) keeps spots live thereafter.
+        if (typeof refreshBloombergOnStartup === 'function') {
+            setTimeout(refreshBloombergOnStartup, 800);
         }
     })
-    .catch(function() { console.log('No saved marks found'); });
+    .catch(function(e) { console.log('Startup surface load issue:', e); });
 })();
+
+// One-shot Bloomberg refresh used at startup. Pulls full surfaces (vols + spots
+// + fwd points) for all pairs when BBG is reachable. Silent no-op on failure —
+// the default/saved fallback remains active and pollBBG will pick up spots if
+// BBG comes online later.
+function refreshBloombergOnStartup() {
+    var allPairs = DTCC_G10.concat(DTCC_EM).join(',');
+    fetch('/api/bbg_refresh?pairs=' + encodeURIComponent(allPairs))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        if (!data || !data.surfaces || !Object.keys(data.surfaces).length) {
+            console.log('BBG startup refresh: no Bloomberg data (using fallback spots)');
+            window._bbgConnected = false;
+            return;
+        }
+        var n = 0;
+        Object.keys(data.surfaces).forEach(function(pair) {
+            var s = data.surfaces[pair];
+            if (!s || !s.spot) return;
+            // BBG is authoritative — overwrite spot, rates, pip scale, and the
+            // full vol surface where Bloomberg provided one.
+            if (!mktSurfaces[pair]) mktSurfaces[pair] = {_pair: pair, tenors: []};
+            mktSurfaces[pair].spot = s.spot;
+            mktSurfaces[pair].spotSource = 'bbg';
+            if (s.r_d != null) mktSurfaces[pair].r_d = s.r_d;
+            if (s.r_f != null) mktSurfaces[pair].r_f = s.r_f;
+            if (s.pipScale) mktSurfaces[pair].pipScale = s.pipScale;
+            if (s.tenors && s.tenors.length) {
+                // Use each tenor's OWN T (BBG data is on the 10-pillar grid without
+                // 18M; positional TENOR_T would misalign now that TENOR_T has 18M).
+                mktSurfaces[pair].tenors = s.tenors.map(function(t) {
+                    return {tenor: t.tenor, T: t.T,
+                            atm: t.atm || 0, rr25: t.rr25 || 0, rr10: t.rr10 || 0,
+                            fly25: t.fly25 || 0, fly10: t.fly10 || 0, fwdPts: t.fwdPts || 0};
+                });
+                _ensure18M(mktSurfaces[pair]);
+            }
+            n++;
+        });
+        window._bbgConnected = n > 0;
+        console.log('BBG startup refresh: pulled ' + n + ' surfaces from Bloomberg (authoritative)');
+        if (typeof renderMktContent === 'function') { try { renderMktContent(); } catch (e) {} }
+        var st = document.getElementById('mkt-status');
+        if (st && n > 0) { st.textContent = 'Bloomberg: ' + n + ' live surfaces'; st.style.color = '#66bb6a'; }
+    })
+    .catch(function() {
+        console.log('BBG startup refresh failed — using fallback spots');
+        window._bbgConnected = false;
+    });
+}
 
 // ===== RESTORE DEFAULTS BUTTON =====
 // Adds a button next to Bloomberg refresh that loads default surfaces for all
@@ -2640,6 +2915,9 @@ function _hibernateWrap(fnName) {
         if (tab === 'dtcc') {
             setTimeout(_extendDtccLookback, 100);
         }
+        if (tab === 'volofvol') {
+            setTimeout(function(){ if (typeof renderVoV === 'function') renderVoV(); }, 80);
+        }
         return r;
     };
     // Also try once at load in case DTCC is the default tab
@@ -2906,6 +3184,337 @@ function _renderFloatTick() {
     });
 }
 
+// ============================================================================
+// ============================ VOL OF VOL TAB ================================
+// Two analyses:
+//   Panel A — REALIZED vol-of-vol: volatility of implied vol itself. Pulls a
+//     daily IV history (Bloomberg BDH via /api/bbg_hist_vol) for a chosen
+//     pair/tenor/point and reports the annualized stdev of daily log-changes
+//     plus a vol-points/day figure, with a rolling window.
+//   Panel B — IMPLIED vol-of-vol: SABR (beta=1) fit to the 5 smile points per
+//     tenor. nu = implied vol-of-vol, rho = skew. Off the current surface.
+//   Comparison: implied nu vs realized vol-of-vol (rich/cheap read on convexity).
+// ============================================================================
+
+var VOV_BETA = 1.0;   // lognormal SABR (FX default; fixed per design choice)
+
+// --- SABR Hagan (2002) lognormal implied vol (verified vs Python) ---
+function sabrLognormalVol(F, K, T, alpha, beta, rho, nu) {
+    if (F<=0 || K<=0 || T<=0 || alpha<=0) return 0;
+    if (Math.abs(F-K) < 1e-12) {
+        var t1 = alpha / Math.pow(F, 1-beta);
+        var t2 = (Math.pow(1-beta,2)/24)*(alpha*alpha/Math.pow(F,2-2*beta))
+               + (rho*beta*nu*alpha)/(4*Math.pow(F,1-beta))
+               + (2-3*rho*rho)*nu*nu/24;
+        return t1*(1 + t2*T);
+    }
+    var logFK = Math.log(F/K);
+    var fkbeta = Math.pow(F*K, (1-beta)/2);
+    var z = (nu/alpha)*fkbeta*logFK;
+    var xz = Math.log((Math.sqrt(1-2*rho*z+z*z)+z-rho)/(1-rho));
+    var zxz = Math.abs(xz)<1e-12 ? 1.0 : z/xz;
+    var A = alpha/(fkbeta*(1 + (Math.pow(1-beta,2)/24)*logFK*logFK + (Math.pow(1-beta,4)/1920)*Math.pow(logFK,4)));
+    var B = 1 + ((Math.pow(1-beta,2)/24)*(alpha*alpha/(fkbeta*fkbeta))
+               + (rho*beta*nu*alpha)/(4*fkbeta)
+               + (2-3*rho*rho)*nu*nu/24)*T;
+    return A*zxz*B;
+}
+
+// --- SABR calibration: fit (alpha, rho, nu) to market vols, beta fixed ---
+// Multi-start coordinate descent — robust, no external solver, runs in-browser.
+function calibrateSABR(F, T, strikes, mktVols, beta) {
+    var atmIdx=0,bd=1e9;
+    for(var i=0;i<strikes.length;i++){var d=Math.abs(strikes[i]-F);if(d<bd){bd=d;atmIdx=i;}}
+    var alpha0=mktVols[atmIdx]*Math.pow(F,1-beta);
+    function sse(a,r,n){var s=0;for(var i=0;i<strikes.length;i++){var m=sabrLognormalVol(F,strikes[i],T,a,beta,r,n);s+=(m-mktVols[i])*(m-mktVols[i]);}return s;}
+    var best=null,rhoSeeds=[-0.5,-0.25,0,0.25,0.5],nuSeeds=[0.1,0.3,0.6,1.0,1.5];
+    for(var ri=0;ri<rhoSeeds.length;ri++)for(var ni=0;ni<nuSeeds.length;ni++){
+        var a=alpha0,r=rhoSeeds[ri],n=nuSeeds[ni],sa=alpha0*0.1,sr=0.2,sn=0.3;
+        for(var it=0;it<80;it++){
+            var improved=false,moves=[[sa,0,0],[-sa,0,0],[0,sr,0],[0,-sr,0],[0,0,sn],[0,0,-sn]];
+            for(var mi=0;mi<moves.length;mi++){
+                var na=a+moves[mi][0],nr=Math.max(-0.999,Math.min(0.999,r+moves[mi][1])),nn=Math.max(0.001,n+moves[mi][2]);
+                if(na<=0)continue;
+                if(sse(na,nr,nn)<sse(a,r,n)){a=na;r=nr;n=nn;improved=true;}
+            }
+            if(!improved){sa*=0.5;sr*=0.5;sn*=0.5;if(sa<alpha0*1e-4)break;}
+        }
+        var e=sse(a,r,n);
+        if(best===null||e<best[3])best=[a,r,n,e];
+    }
+    return {alpha:best[0],rho:best[1],nu:best[2],rmse:Math.sqrt(best[3]/strikes.length)};
+}
+
+// Fit one tenor's smile: ATM/RR/fly -> 5 (strike,vol) points -> SABR.
+function fitTenorSABR(surf, tn) {
+    var F = surf.spot;
+    var rd = surf.r_d || 0.04, rf = surf.r_f || 0.02;
+    var pipScale = surf.pipScale || _fwdPtScale(surf._pair || '');
+    if (tn.fwdPts && pipScale) F = surf.spot + tn.fwdPts / pipScale;
+    var T = tn.T;
+    var dff = Math.exp(-rf*T);
+    var sm = solveSmile(tn.atm, tn.rr25, tn.fly25, tn.rr10, tn.fly10);
+    var pts = [
+        {label:'10dP', vol:sm['10P'], td:-0.10},
+        {label:'25dP', vol:sm['25P'], td:-0.25},
+        {label:'ATM',  vol:sm['ATM'], td:null},
+        {label:'25dC', vol:sm['25C'], td:0.25},
+        {label:'10dC', vol:sm['10C'], td:0.10}
+    ];
+    var strikes=[], vols=[];
+    pts.forEach(function(p){
+        var K;
+        if (p.td===null) K=F;
+        else if (p.td>0) K=kFromDC(F,T,p.vol,p.td,dff);
+        else K=kFromDP(F,T,p.vol,p.td,dff);
+        strikes.push(K); vols.push(p.vol);
+    });
+    var fit = calibrateSABR(F, T, strikes, vols, VOV_BETA);
+    return {tenor:tn.tenor, T:T, F:F, strikes:strikes, mktVols:vols, pts:pts,
+            alpha:fit.alpha, rho:fit.rho, nu:fit.nu, rmse:fit.rmse};
+}
+
+// --- Realized vol-of-vol from an IV series (vol points) ---
+function realizedVolOfVol(vols) {
+    // vols: array of daily implied vol in vol points (e.g. 8.5).
+    // Returns annualized stdev of log-changes (fraction), and vol-pts/day stdev.
+    if (!vols || vols.length < 3) return {annPct:null, ptsPerDay:null, n:(vols?vols.length:0)};
+    var logR=[], absD=[];
+    for (var i=1;i<vols.length;i++){
+        if (vols[i]>0 && vols[i-1]>0){
+            logR.push(Math.log(vols[i]/vols[i-1]));
+            absD.push(vols[i]-vols[i-1]);
+        }
+    }
+    if (logR.length < 2) return {annPct:null, ptsPerDay:null, n:logR.length};
+    var mean=logR.reduce(function(a,b){return a+b;},0)/logR.length;
+    var varr=logR.reduce(function(a,b){return a+(b-mean)*(b-mean);},0)/(logR.length-1);
+    var annPct = Math.sqrt(varr)*Math.sqrt(252);   // annualized, fraction
+    var meanD=absD.reduce(function(a,b){return a+b;},0)/absD.length;
+    var varD=absD.reduce(function(a,b){return a+(b-meanD)*(b-meanD);},0)/(absD.length-1);
+    var ptsPerDay=Math.sqrt(varD);                 // vol pts per day (stdev of daily change)
+    return {annPct:annPct, ptsPerDay:ptsPerDay, n:logR.length};
+}
+function rollingVolOfVol(vols, window) {
+    // Rolling annualized vol-of-vol over `window` observations.
+    var out=[];
+    for (var i=window;i<vols.length;i++){
+        var slice=vols.slice(i-window,i+1);
+        out.push(realizedVolOfVol(slice).annPct);
+    }
+    return out;
+}
+
+// ---- Inject the tab button + content div (base HTML is generated, so we add
+// the tab at runtime) ----
+(function injectVoVTab() {
+    if (typeof document==='undefined') return;
+    var tabBar = document.querySelector('.tab-btn');
+    if (!tabBar || !tabBar.parentElement) { setTimeout(injectVoVTab, 500); return; }
+    if (document.getElementById('tab-volofvol')) return;
+    // Button — insert after the last tab button
+    var btn = document.createElement('button');
+    btn.className='tab-btn'; btn.setAttribute('onclick',"showTab('volofvol')");
+    btn.textContent='Vol of Vol';
+    tabBar.parentElement.appendChild(btn);
+    // Content div
+    var content = document.createElement('div');
+    content.id='tab-volofvol'; content.className='tab-content';
+    content.innerHTML =
+      '<div style="padding:16px">'
+      + '<div style="display:flex;gap:16px;align-items:center;margin-bottom:14px;flex-wrap:wrap">'
+      +   '<h2 style="margin:0;color:#90caf9;font-size:18px">Vol of Vol</h2>'
+      +   '<span style="color:#888;font-size:12px">Realized (history) &amp; SABR-implied (smile)</span>'
+      + '</div>'
+      + '<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">'
+      +   '<label style="color:#aaa;font-size:12px">Pair</label>'
+      +   '<select id="vov-pair" onchange="renderVoV()" style="background:#3d3d3d;color:#e0e0e0;border:1px solid #555;padding:5px 8px;border-radius:4px;font-size:12px"></select>'
+      +   '<label style="color:#aaa;font-size:12px;margin-left:8px">Realized: Tenor</label>'
+      +   '<select id="vov-tenor" style="background:#3d3d3d;color:#e0e0e0;border:1px solid #555;padding:5px 8px;border-radius:4px;font-size:12px"></select>'
+      +   '<label style="color:#aaa;font-size:12px">Point</label>'
+      +   '<select id="vov-point" style="background:#3d3d3d;color:#e0e0e0;border:1px solid #555;padding:5px 8px;border-radius:4px;font-size:12px">'
+      +     '<option value="ATM">ATM</option><option value="RR25">25d RR</option><option value="RR10">10d RR</option><option value="FLY25">25d Fly</option><option value="FLY10">10d Fly</option></select>'
+      +   '<label style="color:#aaa;font-size:12px">Lookback</label>'
+      +   '<select id="vov-lookback" style="background:#3d3d3d;color:#e0e0e0;border:1px solid #555;padding:5px 8px;border-radius:4px;font-size:12px">'
+      +     '<option value="90">3M</option><option value="180">6M</option><option value="365" selected>1Y</option><option value="730">2Y</option></select>'
+      +   '<label style="color:#aaa;font-size:12px">Roll window</label>'
+      +   '<select id="vov-roll" style="background:#3d3d3d;color:#e0e0e0;border:1px solid #555;padding:5px 8px;border-radius:4px;font-size:12px">'
+      +     '<option value="21">21d</option><option value="42">42d</option><option value="63" selected>63d</option></select>'
+      +   '<button onclick="loadRealizedVoV()" style="background:#1976d2;color:#fff;border:none;padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer;font-weight:600">Load Realized (BBG)</button>'
+      + '</div>'
+      + '<div id="vov-realized" style="background:#2d2d2d;border-radius:6px;padding:14px;margin-bottom:16px;min-height:80px">'
+      +   '<div style="color:#888;font-size:12px">Panel A — Realized vol-of-vol. Pick pair/tenor/point and click "Load Realized (BBG)". Requires Bloomberg for history.</div></div>'
+      + '<div id="vov-implied" style="background:#2d2d2d;border-radius:6px;padding:14px;margin-bottom:16px">'
+      +   '<div style="color:#888;font-size:12px">Panel B — SABR-implied vol-of-vol loads from the current surface.</div></div>'
+      + '<div id="vov-compare" style="background:#2d2d2d;border-radius:6px;padding:14px"></div>'
+      + '</div>';
+    // Insert content div next to other tab-content divs
+    var anyContent = document.querySelector('.tab-content');
+    if (anyContent && anyContent.parentElement) anyContent.parentElement.appendChild(content);
+    else document.body.appendChild(content);
+})();
+
+// Populate the pair/tenor selectors and render Panel B (+ comparison shell).
+function renderVoV() {
+    var pairSel = document.getElementById('vov-pair');
+    if (!pairSel) return;
+    // Populate pairs from mktSurfaces (once)
+    if (!pairSel._filled) {
+        var pairs = Object.keys(mktSurfaces).sort();
+        pairSel.innerHTML = pairs.map(function(p){return '<option value="'+p+'">'+p+'</option>';}).join('');
+        pairSel._filled = true;
+    }
+    var tenorSel = document.getElementById('vov-tenor');
+    if (tenorSel && !tenorSel._filled) {
+        tenorSel.innerHTML = TENORS.map(function(t){return '<option value="'+t+'"'+(t==='3M'?' selected':'')+'>'+t+'</option>';}).join('');
+        tenorSel._filled = true;
+    }
+    renderImpliedVoV();
+}
+
+// Panel B: SABR fit across all tenors of the selected pair.
+function renderImpliedVoV() {
+    var pair = (document.getElementById('vov-pair')||{}).value;
+    var el = document.getElementById('vov-implied');
+    if (!pair || !mktSurfaces[pair] || !el) return;
+    var surf = mktSurfaces[pair];
+    surf._pair = surf._pair || pair;
+    var rows = [];
+    var fits = [];
+    (surf.tenors||[]).forEach(function(tn){
+        if (!tn.atm || tn.atm <= 0) return;
+        try {
+            var f = fitTenorSABR(surf, tn);
+            fits.push(f);
+            rows.push('<tr>'
+              + '<td style="padding:4px 10px">'+tn.tenor+'</td>'
+              + '<td style="padding:4px 10px;text-align:right">'+tn.atm.toFixed(2)+'</td>'
+              + '<td style="padding:4px 10px;text-align:right">'+tn.rr25.toFixed(2)+'</td>'
+              + '<td style="padding:4px 10px;text-align:right">'+tn.fly25.toFixed(3)+'</td>'
+              + '<td style="padding:4px 10px;text-align:right;color:#90caf9;font-weight:600">'+f.nu.toFixed(3)+'</td>'
+              + '<td style="padding:4px 10px;text-align:right;color:'+(f.rho<0?'#ef5350':'#66bb6a')+'">'+f.rho.toFixed(3)+'</td>'
+              + '<td style="padding:4px 10px;text-align:right;color:#888">'+(f.rmse*100).toFixed(3)+'</td>'
+              + '</tr>');
+        } catch(e) {}
+    });
+    window._vovFits = fits;  // stash for comparison panel
+    var html = '<div style="font-weight:600;color:#90caf9;margin-bottom:8px;font-size:14px">Panel B — SABR-Implied Vol-of-Vol ('+pair+', &beta;=1)</div>'
+      + '<div style="color:#888;font-size:11px;margin-bottom:10px">&nu; (nu) is the implied vol-of-vol — it drives smile convexity. &rho; (rho) is the skew. High &nu; short-dated decaying with tenor is the typical shape (a small &nu; can still produce a large fly at long T because convexity scales with &nu;&sup2;&middot;T).</div>'
+      + '<table style="border-collapse:collapse;font-size:12px;color:#e0e0e0;width:100%">'
+      + '<tr style="border-bottom:1px solid #555;color:#aaa;font-size:11px">'
+      + '<th style="padding:4px 10px;text-align:left">Tenor</th><th style="padding:4px 10px;text-align:right">ATM</th>'
+      + '<th style="padding:4px 10px;text-align:right">RR25</th><th style="padding:4px 10px;text-align:right">FLY25</th>'
+      + '<th style="padding:4px 10px;text-align:right">&nu; (volvol)</th><th style="padding:4px 10px;text-align:right">&rho; (skew)</th>'
+      + '<th style="padding:4px 10px;text-align:right">fit RMSE</th></tr>'
+      + rows.join('') + '</table>'
+      + '<div id="vov-nu-chart" style="height:260px;margin-top:12px"></div>';
+    el.innerHTML = html;
+    // Plot nu and rho term structures
+    try {
+        if (typeof Plotly !== 'undefined' && fits.length) {
+            var xs = fits.map(function(f){return f.tenor;});
+            Plotly.newPlot('vov-nu-chart', [
+                {x:xs, y:fits.map(function(f){return f.nu;}), name:'&nu; (vol-of-vol)', type:'scatter', mode:'lines+markers', line:{color:'#90caf9',width:2}, yaxis:'y'},
+                {x:xs, y:fits.map(function(f){return f.rho;}), name:'&rho; (skew)', type:'scatter', mode:'lines+markers', line:{color:'#ef5350',width:2,dash:'dot'}, yaxis:'y2'}
+            ], {
+                paper_bgcolor:'#2d2d2d', plot_bgcolor:'#2d2d2d', font:{color:'#e0e0e0',size:11},
+                margin:{l:50,r:50,t:20,b:40}, showlegend:true, legend:{orientation:'h',y:1.15},
+                xaxis:{title:'Tenor', gridcolor:'#444'},
+                yaxis:{title:'&nu;', gridcolor:'#444', side:'left'},
+                yaxis2:{title:'&rho;', overlaying:'y', side:'right', gridcolor:'transparent'}
+            }, {responsive:true, displayModeBar:false});
+        }
+    } catch(e) { console.log('nu chart error', e); }
+    _renderVoVCompare();
+}
+
+// Panel A: load realized vol-of-vol history from Bloomberg BDH.
+function loadRealizedVoV() {
+    var pair=(document.getElementById('vov-pair')||{}).value;
+    var tenor=(document.getElementById('vov-tenor')||{}).value;
+    var point=(document.getElementById('vov-point')||{}).value;
+    var lookback=(document.getElementById('vov-lookback')||{}).value;
+    var roll=parseInt((document.getElementById('vov-roll')||{}).value)||63;
+    var el=document.getElementById('vov-realized');
+    if (!pair||!el) return;
+    el.innerHTML='<div style="color:#888;font-size:12px">Loading '+pair+' '+tenor+' '+point+' history from Bloomberg…</div>';
+    var start=new Date(Date.now()-lookback*864e5).toISOString().slice(0,10);
+    fetch('/api/bbg_hist_vol?pair='+pair+'&tenor='+tenor+'&point='+point+'&start='+start)
+    .then(function(r){return r.json();})
+    .then(function(data){
+        if (data.error || !data.vols || data.vols.length<3) {
+            el.innerHTML='<div style="color:#ffa726;font-size:12px">Panel A — No Bloomberg history available'
+              +(data.error?(' ('+data.error+')'):'')+'. Realized vol-of-vol needs a live BBG connection for '
+              +'historical implied vol. Ticker attempted: '+(data.ticker||'n/a')+'</div>';
+            window._vovRealized=null; _renderVoVCompare(); return;
+        }
+        var rv=realizedVolOfVol(data.vols);
+        var roll_series=rollingVolOfVol(data.vols, roll);
+        window._vovRealized={pair:pair,tenor:tenor,point:point,rv:rv,vols:data.vols,dates:data.dates};
+        var last=data.vols[data.vols.length-1];
+        var html='<div style="font-weight:600;color:#90caf9;margin-bottom:8px;font-size:14px">Panel A — Realized Vol-of-Vol ('+pair+' '+tenor+' '+point+')</div>'
+          +'<div style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:10px">'
+          +'<div><div style="color:#888;font-size:11px">Annualized vol-of-vol</div><div style="color:#90caf9;font-size:20px;font-weight:700">'+(rv.annPct*100).toFixed(1)+'%</div></div>'
+          +'<div><div style="color:#888;font-size:11px">Daily move (1&sigma;)</div><div style="color:#e0e0e0;font-size:20px;font-weight:700">'+rv.ptsPerDay.toFixed(3)+' vol pts</div></div>'
+          +'<div><div style="color:#888;font-size:11px">Current level</div><div style="color:#e0e0e0;font-size:20px;font-weight:700">'+last.toFixed(2)+'</div></div>'
+          +'<div><div style="color:#888;font-size:11px">Observations</div><div style="color:#e0e0e0;font-size:20px;font-weight:700">'+rv.n+'</div></div>'
+          +'</div>'
+          +'<div id="vov-hist-chart" style="height:220px"></div>'
+          +'<div id="vov-roll-chart" style="height:180px;margin-top:8px"></div>';
+        el.innerHTML=html;
+        try {
+            if (typeof Plotly!=='undefined'){
+                Plotly.newPlot('vov-hist-chart',[{x:data.dates,y:data.vols,type:'scatter',mode:'lines',line:{color:'#90caf9',width:1.5},name:point+' vol'}],
+                  {paper_bgcolor:'#2d2d2d',plot_bgcolor:'#2d2d2d',font:{color:'#e0e0e0',size:10},margin:{l:45,r:20,t:24,b:35},
+                   title:{text:'Implied vol history',font:{size:12}},xaxis:{gridcolor:'#444'},yaxis:{title:'vol pts',gridcolor:'#444'}},
+                  {responsive:true,displayModeBar:false});
+                var rollDates=data.dates.slice(roll+1);
+                Plotly.newPlot('vov-roll-chart',[{x:rollDates,y:roll_series.map(function(v){return v*100;}),type:'scatter',mode:'lines',line:{color:'#ffa726',width:1.5},name:roll+'d vol-of-vol'}],
+                  {paper_bgcolor:'#2d2d2d',plot_bgcolor:'#2d2d2d',font:{color:'#e0e0e0',size:10},margin:{l:45,r:20,t:24,b:35},
+                   title:{text:'Rolling '+roll+'d annualized vol-of-vol (%)',font:{size:12}},xaxis:{gridcolor:'#444'},yaxis:{title:'%',gridcolor:'#444'}},
+                  {responsive:true,displayModeBar:false});
+            }
+        } catch(e){console.log('realized chart err',e);}
+        _renderVoVCompare();
+    })
+    .catch(function(e){
+        el.innerHTML='<div style="color:#ef5350;font-size:12px">Panel A — request failed: '+e+'</div>';
+    });
+}
+
+// Comparison: implied nu (at the selected realized tenor) vs realized vol-of-vol.
+function _renderVoVCompare() {
+    var el=document.getElementById('vov-compare');
+    if (!el) return;
+    var real=window._vovRealized, fits=window._vovFits;
+    if (!real || !fits || !fits.length) {
+        el.innerHTML='<div style="color:#888;font-size:12px">Comparison (implied &nu; vs realized) appears once both panels have loaded — Panel B loads automatically; click "Load Realized (BBG)" for Panel A.</div>';
+        return;
+    }
+    // Match the realized tenor to a SABR fit
+    var f=fits.find(function(x){return x.tenor===real.tenor;});
+    if (!f) { el.innerHTML='<div style="color:#888;font-size:12px">No SABR fit at '+real.tenor+' to compare.</div>'; return; }
+    // Implied nu is a stochastic-vol parameter (roughly the lognormal vol-of-vol,
+    // a fraction). Realized annPct is also a fraction — directly comparable in
+    // spirit (both "how much does vol move, proportionally"). This is a heuristic
+    // rich/cheap read, not an arbitrage identity.
+    var impliedNu=f.nu, realizedVoV=real.rv.annPct;
+    var ratio=realizedVoV>0 ? impliedNu/realizedVoV : null;
+    var signal, col;
+    if (ratio===null) { signal='n/a'; col='#888'; }
+    else if (ratio>1.15) { signal='Smile RICH — pricing more vol-of-vol than realized'; col='#ef5350'; }
+    else if (ratio<0.85) { signal='Smile CHEAP — pricing less vol-of-vol than realized'; col='#66bb6a'; }
+    else { signal='Roughly FAIR — implied ≈ realized'; col='#e0e0e0'; }
+    el.innerHTML='<div style="font-weight:600;color:#90caf9;margin-bottom:8px;font-size:14px">Comparison — '+real.pair+' '+real.tenor+'</div>'
+      +'<div style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:8px">'
+      +'<div><div style="color:#888;font-size:11px">Implied &nu; (SABR)</div><div style="color:#90caf9;font-size:18px;font-weight:700">'+impliedNu.toFixed(3)+'</div></div>'
+      +'<div><div style="color:#888;font-size:11px">Realized vol-of-vol</div><div style="color:#ffa726;font-size:18px;font-weight:700">'+(realizedVoV*100).toFixed(1)+'%</div></div>'
+      +'<div><div style="color:#888;font-size:11px">Ratio</div><div style="color:#e0e0e0;font-size:18px;font-weight:700">'+(ratio!==null?ratio.toFixed(2):'n/a')+'</div></div>'
+      +'</div>'
+      +'<div style="color:'+col+';font-size:13px;font-weight:600">'+signal+'</div>'
+      +'<div style="color:#666;font-size:10px;margin-top:6px">Heuristic read on fly rich/cheap, not an arbitrage relationship. Implied &nu; is a model parameter; realized is annualized stdev of IV log-changes.</div>';
+}
+
 console.log('mathfix.js: all overrides applied');
 """
 
@@ -2962,7 +3571,9 @@ function refreshBbg(){
             TENORS.forEach(function(tn,ti){
                 var src=tnList.find(function(t){return t.tenor===tn;})||{};
                 mktSurfaces[pair].tenors.push({tenor:tn,T:TENOR_T[ti],atm:src.atm||0,rr25:src.rr25||0,rr10:src.rr10||0,fly25:src.fly25||0,fly10:src.fly10||0,fwdPts:src.fwdPts||0});
-            });count++;
+            });
+            _ensure18M(mktSurfaces[pair]);
+            count++;
         });
         if(count>0){activeMktPair=Object.keys(mktSurfaces)[0];renderMktTabs();renderMktContent();}
         if(st)st.textContent='Bloomberg: '+count+' pairs at '+new Date().toLocaleTimeString();
@@ -3176,8 +3787,8 @@ def _current_trading_day():
     return _trading_day(datetime.now(timezone.utc))
 
 
-_DEFAULT_TN_LABELS = ['O/N','1W','2W','1M','2M','3M','6M','9M','1Y','2Y']
-_DEFAULT_TN_T      = [1/365, 7/365, 14/365, 30/365, 60/365, 90/365, 180/365, 270/365, 365/365, 730/365]
+_DEFAULT_TN_LABELS = ['O/N','1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y']
+_DEFAULT_TN_T      = [1/365, 7/365, 14/365, 30/365, 60/365, 90/365, 180/365, 270/365, 365/365, 547/365, 730/365]
 
 # Default vol-surface levels per pair: (spot, ATM_3M, RR25_3M, FLY25_3M, r_d, r_f)
 # Numbers are ballpark realistic (as of roughly mid-2024 levels). Wrong for actual
@@ -3228,7 +3839,7 @@ _DEFAULT_SURFACE_LEVELS = {
 # Term-structure shape: O/N is rich, slopes down through 3M, then flat/slight contango out
 _DEFAULT_TENOR_MULTIPLIER = {
     'O/N': 1.30, '1W': 1.15, '2W': 1.10, '1M': 1.05, '2M': 1.02,
-    '3M':  1.00, '6M': 0.98, '9M': 0.97, '1Y': 0.97, '2Y': 0.98,
+    '3M':  1.00, '6M': 0.98, '9M': 0.97, '1Y': 0.97, '18M': 0.975, '2Y': 0.98,
 }
 
 def _build_diag_xlsx(dtcc_reader):
@@ -3362,7 +3973,7 @@ def _build_diag_xlsx(dtcc_reader):
     s5 = wb.create_sheet('ParsedTrades')
     trade_headers = ['_ts','time','trade_date','pair','opt_type','strike','expiry',
                      'days','premium','premium_ccy','base_notl','terms_notl',
-                     'base_ccy','terms_ccy','usd_amt','iv','is_package','is_ndo',
+                     'base_ccy','terms_ccy','usd_amt','notl_ccy','iv','is_package','is_ndo',
                      'subtype','pkg_id','pkg_price','pkg_notation','ts_source','_did']
     all_parsed = ticker_trades + slice_trades_flat + cumul_trades_flat
     # Dedup by _did
@@ -3424,8 +4035,8 @@ def _default_surfaces():
             mult = _DEFAULT_TENOR_MULTIPLIER.get(label, 1.0)
             atm = round(atm3m * mult, 2)
             # RR and fly attenuate slightly at the very long end
-            rr_mult = 1.0 if label not in ('1Y','2Y') else 0.85
-            fly_mult = 1.0 if label not in ('1Y','2Y') else 0.90
+            rr_mult = 1.0 if label not in ('1Y','18M','2Y') else 0.85
+            fly_mult = 1.0 if label not in ('1Y','18M','2Y') else 0.90
             tenors.append({
                 'tenor': label, 'T': T,
                 'atm': atm, 'rr25': round(rr3m * rr_mult, 3),
@@ -3608,7 +4219,18 @@ def parse_trade(row, stats=None):
         return reject('expiry_parse_error', f'exp={exp_raw!r} err={e}')
     n1, n2 = parse_float(get_field(row,'notl1')), parse_float(get_field(row,'notl2'))
     c1 = get_field(row,'ccy1')[:3].upper()
-    usd = (n1 if c1=='USD' else n2 if n2>0 else n1) / 1e6
+    c2 = get_field(row,'ccy2')[:3].upper()
+    # "usd_amt" is a display magnitude AND the basis for the JS USD-cross fallback.
+    # Record which currency it is actually in (notl_ccy) so JS doesn't assume USD
+    # for a cross like EUR/GBP. Prefer an actual USD leg when present.
+    if c1 == 'USD' and n1 > 0:
+        usd = n1 / 1e6; notl_ccy = 'USD'
+    elif c2 == 'USD' and n2 > 0:
+        usd = n2 / 1e6; notl_ccy = 'USD'
+    elif n2 > 0:
+        usd = n2 / 1e6; notl_ccy = c2
+    else:
+        usd = n1 / 1e6; notl_ccy = c1
     if usd <= 0:
         return reject('usd_notional_zero', f'n1={n1} n2={n2} c1={c1}')
     upi_up = upi.upper()
@@ -3617,14 +4239,17 @@ def parse_trade(row, stats=None):
     prem_ccy = get_field(row, 'premium_ccy')[:3].upper()
     base_ccy = pair[:3]
     terms_ccy = pair[4:]
-    nc1 = get_field(row,'ccy1')[:3].upper()
-    nc2 = get_field(row,'ccy2')[:3].upper()
+    nc1 = c1
+    nc2 = c2
     if nc1 == base_ccy:
         base_notl = n1
     elif nc2 == base_ccy:
         base_notl = n2
     else:
-        base_notl = n1
+        # No notional leg is in the base currency. Don't guess — leave 0 so the JS
+        # can recover it (terms_notl/fwd or a USD cross-rate). A blind base_notl=n1
+        # would assign a wrong-currency amount and yield a bogus per-unit premium.
+        base_notl = 0
     # Also resolve the TERMS-currency notional. base_notl and terms_notl are
     # related by the forward (terms_notl = base_notl * fwd), so whichever one
     # DTCC populated lets the JS reconstruct the other without a USD cross-rate.
@@ -3670,7 +4295,7 @@ def parse_trade(row, stats=None):
         'pair':pair,'spot':0,'strike':strike,'fwd_rate':0,'fwd_pts':'','opt_type':opt_type,
         'days':days,'premium':prem,'premium_ccy':prem_ccy,'base_notl':base_notl,
         'terms_notl':terms_notl,
-        'base_ccy':base_ccy,'terms_ccy':terms_ccy,'usd_amt':usd,'iv':iv,
+        'base_ccy':base_ccy,'terms_ccy':terms_ccy,'usd_amt':usd,'notl_ccy':notl_ccy,'iv':iv,
         'is_package': is_package, 'is_ndo': (opt_subtype == 'NDO'), 'subtype': opt_subtype,
         'pkg_id': get_field(row, 'pkg_id'),
         'pkg_price': pkg_p, 'pkg_notation': pkg_n,
@@ -3893,6 +4518,7 @@ BBG_TENORS = [
     {'label':'6M','bbg':'6M','bbg_fwd':'6M','T':6/12},
     {'label':'9M','bbg':'9M','bbg_fwd':'9M','T':9/12},
     {'label':'1Y','bbg':'1Y','bbg_fwd':'12M','T':1.0},
+    {'label':'18M','bbg':'18M','bbg_fwd':'18M','T':1.5},
     {'label':'2Y','bbg':'2Y','bbg_fwd':'2Y','T':2.0},
 ]
 BBG_PAIRS = {
@@ -3938,6 +4564,86 @@ DEFAULT_RATES = {
     'INR':0.065,'KRW':0.03,'SGD':0.03,'TWD':0.015,'IDR':0.06,'PHP':0.055,'THB':0.02,
     'ILS':0.045,'HKD':0.045,'CLP':0.06,'COP':0.1,'PEN':0.06,
 }
+
+def pull_bbg_hist_vol(pair, tenor='3M', point='ATM', start=None, end=None):
+    """Pull a daily HISTORY of implied vol for a (pair, tenor, point) via BDH.
+    point in {ATM, RR25, RR10, FLY25, FLY10}. Returns
+    {dates:[...], vols:[...], ticker:...} in vol points. Used by Panel A of the
+    Vol of Vol tab to compute realized vol-of-vol. Empty result if BBG absent.
+
+    ATM uses the V-ticker (e.g. EURUSDV3M Curncy). The RR/FLY points use the
+    corresponding 25R/10R/25B/10B tickers so the caller can measure vol-of-vol
+    of the skew or the fly directly, not just ATM."""
+    import datetime as _dt
+    pair = pair.upper().replace('/','')
+    cfg = BBG_PAIRS.get(pair)
+    if not cfg:
+        return {'error': f'no ticker map for {pair}', 'dates': [], 'vols': []}
+    # tenor suffix as Bloomberg expects (matches BBG_TENORS 'bbg' field)
+    tn_bbg = None
+    for tn in BBG_TENORS:
+        if tn['label'] == tenor:
+            tn_bbg = tn['bbg']; break
+    if tn_bbg is None:
+        tn_bbg = tenor  # best effort
+    prefix_map = {'ATM': cfg['vol'], 'RR25': cfg['rr25'], 'RR10': cfg['rr10'],
+                  'FLY25': cfg['fly25'], 'FLY10': cfg['fly10']}
+    prefix = prefix_map.get(point.upper(), cfg['vol'])
+    ticker = f"{prefix}{tn_bbg} Curncy"
+
+    try:
+        import blpapi
+    except ImportError:
+        return {'error': 'blpapi not installed', 'dates': [], 'vols': [], 'ticker': ticker}
+
+    if not end:
+        end = _dt.date.today().strftime('%Y%m%d')
+    else:
+        end = end.replace('-', '')
+    if not start:
+        # default: ~1 year of history
+        start = (_dt.date.today() - _dt.timedelta(days=400)).strftime('%Y%m%d')
+    else:
+        start = start.replace('-', '')
+
+    opts = blpapi.SessionOptions(); opts.setServerHost("localhost"); opts.setServerPort(8194)
+    session = blpapi.Session(opts)
+    if not session.start():
+        return {'error': 'Cannot connect to Bloomberg', 'dates': [], 'vols': [], 'ticker': ticker}
+    if not session.openService("//blp/refdata"):
+        session.stop(); return {'error': 'Cannot open refdata', 'dates': [], 'vols': [], 'ticker': ticker}
+    svc = session.getService("//blp/refdata")
+    try:
+        req = svc.createRequest("HistoricalDataRequest")
+        req.getElement("securities").appendValue(ticker)
+        req.getElement("fields").appendValue("PX_LAST")
+        req.set("startDate", start); req.set("endDate", end)
+        req.set("periodicitySelection", "DAILY")
+        req.set("nonTradingDayFillOption", "ACTIVE_DAYS_ONLY")
+        session.sendRequest(req)
+        dates, vols = [], []
+        while True:
+            ev = session.nextEvent(8000)
+            for msg in ev:
+                if msg.hasElement("securityData"):
+                    sd = msg.getElement("securityData")
+                    if sd.hasElement("fieldData"):
+                        fd = sd.getElement("fieldData")
+                        for i in range(fd.numValues()):
+                            row = fd.getValueAsElement(i)
+                            if row.hasElement("date") and row.hasElement("PX_LAST"):
+                                dates.append(row.getElementAsDatetime("date").strftime('%Y-%m-%d'))
+                                vols.append(row.getElementAsFloat("PX_LAST"))
+            if ev.eventType() == blpapi.Event.RESPONSE:
+                break
+        session.stop()
+        return {'dates': dates, 'vols': vols, 'ticker': ticker,
+                'pair': pair, 'tenor': tenor, 'point': point}
+    except Exception as e:
+        try: session.stop()
+        except Exception: pass
+        return {'error': str(e), 'dates': [], 'vols': [], 'ticker': ticker}
+
 
 def pull_bbg_surfaces(pairs=None):
     import math
@@ -4381,6 +5087,7 @@ class BBGSpotStreamer:
         {'label':'6M','bbg':'6M','T':6/12},
         {'label':'9M','bbg':'9M','T':9/12},
         {'label':'1Y','bbg':'1Y','T':1.0},
+        {'label':'18M','bbg':'18M','T':1.5},
         {'label':'2Y','bbg':'2Y','T':2.0},
     ]
 
@@ -4750,6 +5457,22 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as e:
                 log(f"Export diag error: {e}")
                 self.send_error(500, str(e))
+
+        elif p.path == '/api/bbg_hist_vol':
+            # Historical implied-vol series for realized vol-of-vol (Panel A).
+            # Usage: /api/bbg_hist_vol?pair=EURUSD&tenor=3M&point=ATM&start=2025-06-01&end=2026-06-01
+            try:
+                pair = q.get('pair', [''])[0].upper().replace('/','')
+                tenor = q.get('tenor', ['3M'])[0]
+                point = q.get('point', ['ATM'])[0]
+                start = q.get('start', [''])[0] or None
+                end = q.get('end', [''])[0] or None
+                if not pair:
+                    self._json({'error': 'pair required', 'dates': [], 'vols': []})
+                else:
+                    self._json(pull_bbg_hist_vol(pair, tenor, point, start, end))
+            except Exception as e:
+                self._json({'error': str(e), 'dates': [], 'vols': []})
 
         elif p.path == '/api/bbg_refresh':
             try:
