@@ -1,0 +1,1747 @@
+"""
+cross_vol.py — Cross Vol Builder (single file: math engine + Bloomberg + web UI + self-test)
+==========================================================================================
+
+Pick two USD legs (EURUSD, USDCAD, USDJPY, ...). The tool pulls each leg's ATM / 25d RR /
+10d RR / 25d BF / 10d BF / fwd points from Bloomberg, pulls realized spot correlation,
+vol-vol correlation and vol-of-correlation from BDH, lets you edit any cell or override any
+input, and builds the cross surface (e.g. EURCAD).
+
+    python cross_vol.py                 # server + browser on http://localhost:8090
+    python cross_vol.py --port 9091 --no-browser
+    python cross_vol.py --selftest      # numerical checks, then exit
+    pip install numpy scipy blpapi      # blpapi optional: without it, placeholders load
+
+HOW THE CROSS IS BUILT (per tenor)
+----------------------------------
+ATM  Variance formula  sX^2 = sA^2 + sB^2 - 2 rho_Y sA sB   (desk convention for implied vs
+     realized correlation). A Gaussian copula is calibrated to reproduce it.
+RR   Gaussian copula of the two legs' full risk-neutral distributions:
+       - each leg smile (delta conventions, broker->smile fly solve) -> exact CDF from dsigma/dK
+       - both legs expressed as "USD value of 1 unit of ccy" under the USD T-forward measure
+         (USDxxx legs re-weighted by X_T/F)
+       - Call(K) = E_usd[(Y_base - K Y_quote)^+] / F_Yquote  (cross forward matched exactly)
+WINGS Vol-of-vol propagation. SABR (beta=1) fit to each leg -> nu_A, nu_B. Chain rule on the
+     variance formula:
+       (nu_X sX)^2 = (dA nu_A sA)^2 + (dB nu_B sB)^2 + 2 rho_sig (dA nu_A sA)(dB nu_B sB) + (dR sig_rho)^2
+     rho_sig = correlation of the legs' vol moves, sig_rho = vol of the correlation itself.
+     Weights dA sA/sX + dB sB/sX = 1, so with rho_sig = 1, sig_rho = 0, nu_X is the weighted
+     average of the legs' nus. Cross SABR: nu = nu_X, alpha -> ATM, rho -> copula 25 RR.
+     (The Gaussian copula's own wings are kept as a comparison; it has no tail dependence,
+     so its flies come out too thin.)
+
+SIGN CONVENTIONS
+rho_quoted = correlation of the legs AS QUOTED (EURUSD/USDCAD is normally negative).
+rho_Y = s_A s_B rho_quoted, s = +1 for xxxUSD, -1 for USDxxx.  RR = base-ccy calls - puts.
+Vols are decimals internally, vol points on screen.
+"""
+from __future__ import annotations
+
+import argparse
+import calendar
+import json
+import math
+import threading
+import time
+import traceback
+import webbrowser
+from datetime import date, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+import numpy as np
+from scipy.interpolate import CubicSpline
+from scipy.optimize import brentq, least_squares
+from scipy.special import log_ndtr, ndtr, ndtri
+
+try:
+    import blpapi  # noqa
+except ImportError:
+    blpapi = None
+
+# ######################################################################
+#                                CONFIG
+# ######################################################################
+BBG_HOST, BBG_PORT = 'localhost', 8194
+LEG_PAIRS = ['EURUSD', 'GBPUSD', 'AUDUSD', 'NZDUSD', 'USDCAD', 'USDJPY', 'USDCHF',
+             'USDSEK', 'USDNOK', 'USDMXN', 'USDZAR', 'USDCNH', 'USDSGD']
+FWD_TENOR_SUFFIX = {'1Y': '12M'}            # vol ticker tenor -> fwd-points ticker tenor
+FWD_PREFIX_OVERRIDE = {}                     # e.g. {'KRW': 'KWN'} if your fwd tickers differ
+CORR_HISTORY_YEARS = 3
+
+# ---- PLACEHOLDERS (not market data) — used only when Bloomberg is unavailable
+# (spot, ATM short end, ATM 2Y, 25d RR at 1Y, 25d BF at 1Y)   RR sign = base-ccy calls over
+PLACEHOLDER_SURF = {
+    'EURUSD': (1.0850, 7.0, 8.2, -0.90, 0.28), 'GBPUSD': (1.3000, 7.6, 8.6, -0.90, 0.30),
+    'AUDUSD': (0.6600, 9.0, 9.8, -1.10, 0.30), 'NZDUSD': (0.6000, 9.3, 10.0, -1.00, 0.30),
+    'USDCAD': (1.3700, 5.4, 6.6, 0.75, 0.25), 'USDJPY': (150.00, 9.5, 10.0, -1.60, 0.35),
+    'USDCHF': (0.8600, 7.0, 7.6, -0.60, 0.30), 'USDSEK': (10.500, 9.0, 9.6, 0.60, 0.30),
+    'USDNOK': (10.800, 10.0, 10.5, 0.90, 0.30), 'USDMXN': (18.500, 11.0, 13.0, 2.50, 0.45),
+    'USDZAR': (18.000, 13.5, 15.0, 2.20, 0.45), 'USDCNH': (7.1500, 4.0, 5.2, 0.90, 0.30),
+    'USDSGD': (1.3000, 4.5, 5.2, 0.40, 0.20)}
+PLACEHOLDER_RATES = {'USD': 4.0, 'EUR': 2.0, 'GBP': 3.9, 'AUD': 3.6, 'NZD': 3.0, 'CAD': 2.6,
+                     'JPY': 0.6, 'CHF': 0.0, 'SEK': 1.9, 'NOK': 4.0, 'MXN': 7.5, 'ZAR': 7.0,
+                     'CNH': 1.6, 'SGD': 1.8}
+PLACEHOLDER_RHO = {  # correlation of the legs AS QUOTED
+    ('EURUSD', 'GBPUSD'): 0.65, ('EURUSD', 'USDCAD'): -0.45, ('EURUSD', 'USDJPY'): -0.35,
+    ('EURUSD', 'AUDUSD'): 0.55, ('EURUSD', 'USDCHF'): -0.85, ('EURUSD', 'NZDUSD'): 0.50,
+    ('GBPUSD', 'USDJPY'): -0.25, ('GBPUSD', 'USDCAD'): -0.40, ('AUDUSD', 'USDJPY'): -0.15,
+    ('AUDUSD', 'NZDUSD'): 0.85, ('AUDUSD', 'USDCAD'): -0.60, ('USDCAD', 'USDJPY'): 0.25,
+    ('USDCHF', 'USDJPY'): 0.55, ('USDSEK', 'USDNOK'): 0.70, ('EURUSD', 'USDSEK'): -0.75,
+    ('EURUSD', 'USDNOK'): -0.65, ('USDMXN', 'USDZAR'): 0.55, ('USDCAD', 'USDMXN'): 0.45}
+PLACEHOLDER_VOL_VOL_CORR = 0.60
+PLACEHOLDER_CORR_VOL = 0.20
+PLACEHOLDER_RHO_HALF_LIFE = 0.5      # years
+DEFAULT_RHO_HALF_LIFE = 0.5          # used when history can't pin it down
+
+
+# ######################################################################
+#                              MATH ENGINE
+# ######################################################################
+SQRT2PI = math.sqrt(2.0 * math.pi)
+
+TENORS = ['1W', '2W', '1M', '2M', '3M', '6M', '9M', '1Y', '18M', '2Y']
+
+# Realized-correlation lookback per tenor (business days). Matched to the
+# option horizon, floored at 1M so short tenors aren't pure noise.
+CORR_WINDOW_BDAYS = {'1W': 21, '2W': 21, '1M': 21, '2M': 42, '3M': 63, '6M': 126,
+                     '9M': 189, '1Y': 252, '18M': 378, '2Y': 504}
+
+# Market base-currency priority for naming crosses (EURCAD, CADJPY, NOKSEK...)
+CCY_RANK = ['EUR', 'GBP', 'AUD', 'NZD', 'USD', 'CAD', 'CHF', 'NOK', 'SEK', 'DKK',
+            'PLN', 'CZK', 'HUF', 'ILS', 'TRY', 'ZAR', 'MXN', 'BRL', 'CLP', 'COP',
+            'CNH', 'CNY', 'HKD', 'SGD', 'TWD', 'KRW', 'INR', 'IDR', 'PHP', 'THB', 'JPY']
+
+EM_CCYS = {'PLN', 'CZK', 'HUF', 'ILS', 'TRY', 'ZAR', 'MXN', 'BRL', 'CLP', 'COP',
+           'CNH', 'CNY', 'HKD', 'SGD', 'TWD', 'KRW', 'INR', 'IDR', 'PHP', 'THB'}
+
+
+# ======================================================================
+# Pair / convention helpers
+# ======================================================================
+def split_pair(pair):
+    p = pair.upper().replace('/', '').strip()
+    if len(p) != 6:
+        raise ValueError(f'Bad pair {pair!r}')
+    return p[:3], p[3:]
+
+
+def leg_info(pair):
+    """Return (non-USD currency, orientation). +1 for cUSD, -1 for USDc."""
+    b, q = split_pair(pair)
+    if q == 'USD' and b != 'USD':
+        return b, +1
+    if b == 'USD' and q != 'USD':
+        return q, -1
+    raise ValueError(f'{pair} is not a USD pair')
+
+
+def _rank(c):
+    return CCY_RANK.index(c) if c in CCY_RANK else len(CCY_RANK) - 1.5
+
+
+def cross_ccys(pair_a, pair_b):
+    """(base, quote) of the cross implied by two USD legs."""
+    ca, _ = leg_info(pair_a)
+    cb, _ = leg_info(pair_b)
+    if ca == cb:
+        raise ValueError('Both legs are the same currency')
+    return (ca, cb) if _rank(ca) < _rank(cb) else (cb, ca)
+
+
+def default_premium_adjusted(pair):
+    """Premium-adjusted delta unless USD is the quote ccy (EURUSD, GBPUSD...).
+    USDxxx (premium in USD = base) and crosses (premium in base) are PA."""
+    _, q = split_pair(pair)
+    return q != 'USD'
+
+
+def default_delta_type(pair, T):
+    b, q = split_pair(pair)
+    if b in EM_CCYS or q in EM_CCYS:
+        return 'forward'
+    return 'spot' if T <= 1.0 + 1e-9 else 'forward'
+
+
+def pip_scale_from_spot(spot):
+    """Fallback fwd-point scale (same heuristic as the dashboard)."""
+    if spot > 500:
+        return 1.0
+    if spot > 50:
+        return 100.0
+    return 10000.0
+
+
+def _add_months(d, m):
+    y = d.year + (d.month - 1 + m) // 12
+    mo = (d.month - 1 + m) % 12 + 1
+    return date(y, mo, min(d.day, calendar.monthrange(y, mo)[1]))
+
+
+def tenor_to_T(tenor, today=None):
+    """ACT/365 year fraction to a simple calendar expiry (no spot lag / holidays)."""
+    today = today or date.today()
+    n, u = int(tenor[:-1]), tenor[-1].upper()
+    if u == 'W':
+        exp = today + timedelta(days=7 * n)
+    elif u == 'M':
+        exp = _add_months(today, n)
+    elif u == 'Y':
+        exp = _add_months(today, 12 * n)
+    else:
+        raise ValueError(tenor)
+    return max((exp - today).days, 1) / 365.0
+
+
+# ======================================================================
+# Black-76 (undiscounted, forward terms)
+# ======================================================================
+def npdf(x):
+    return np.exp(-0.5 * np.asarray(x) ** 2) / SQRT2PI
+
+
+def _d12(F, K, T, sig):
+    sd = sig * np.sqrt(T)
+    d1 = (np.log(F / K) + 0.5 * sd * sd) / sd
+    return d1, d1 - sd, sd
+
+
+def black(F, K, T, sig, cp):
+    d1, d2, _ = _d12(F, K, T, sig)
+    return cp * (F * ndtr(cp * d1) - K * ndtr(cp * d2))
+
+
+def implied_vol(price, F, K, T, cp, lo=1e-4, hi=4.0):
+    intrinsic = max(cp * (F - K), 0.0)
+    if not np.isfinite(price) or price <= intrinsic + 1e-15 * F:
+        return float('nan')
+    f = lambda s: float(black(F, K, T, s, cp)) - price
+    if f(lo) > 0 or f(hi) < 0:
+        return float('nan')
+    return brentq(f, lo, hi, xtol=1e-12, maxiter=200)
+
+
+def bs_delta(F, K, T, sig, cp, pa, dfb):
+    """Call/put delta. dfb = base-ccy discount factor for spot delta, 1.0 for forward."""
+    d1, d2, _ = _d12(F, K, T, sig)
+    if pa:
+        return cp * dfb * (K / F) * ndtr(cp * d2)
+    return cp * dfb * ndtr(cp * d1)
+
+
+def strike_from_delta(F, T, sig, target, cp, pa, dfb):
+    """Strike with |delta| = target at a FIXED vol sig (pillar / strangle strikes)."""
+    sd = sig * math.sqrt(T)
+    if not pa:
+        a = target / dfb
+        if not 0 < a < 1:
+            raise ValueError('delta target unreachable')
+        d1 = cp * float(ndtri(a))
+        return F * math.exp(-d1 * sd + 0.5 * sd * sd)
+
+    def f(k):
+        return abs(float(bs_delta(F, F * math.exp(k), T, sig, cp, True, dfb))) - target
+
+    span = 20 * sd + 1.0
+    if cp < 0:                          # PA put: |delta| increasing in K on OTM side
+        return F * math.exp(brentq(f, -span, 0.0, xtol=1e-13))
+    # PA call: |delta| = dfb*(K/F)*N(d2) rises then falls; OTM root is right of the peak
+    def g(k):
+        d2 = (-k - 0.5 * sd * sd) / sd
+        return float(ndtr(d2)) - float(npdf(d2)) / sd
+    # g>0 deep left (N(d2)->1); g<0 by d2=-3 (k = 3sd - sd^2/2) for any sd < 3.
+    # Don't bracket further right: N and phi both underflow to 0 there.
+    kp = brentq(g, -span, 3 * sd - 0.5 * sd * sd, xtol=1e-13)
+    if f(kp) < 0:
+        raise ValueError('PA call delta target above the delta peak')
+    return F * math.exp(brentq(f, kp, kp + span, xtol=1e-13))
+
+
+def dns_strike(F, T, sig, pa):
+    return F * math.exp((-0.5 if pa else 0.5) * sig * sig * T)
+
+
+# ======================================================================
+# Smile: natural cubic spline in k = ln(K/F) + C2 tanh tails
+# ======================================================================
+class Smile:
+    def __init__(self, F, T, ks, vols, tail_scale=1.0):
+        ks = np.asarray(ks, float)
+        vols = np.asarray(vols, float)
+        o = np.argsort(ks)
+        ks, vols = ks[o], vols[o]
+        if np.any(np.diff(ks) <= 0):
+            raise ValueError('smile strikes not strictly increasing')
+        self.F, self.T = F, T
+        self.ks, self.vols = ks, vols
+        self.cs = CubicSpline(ks, vols, bc_type='natural')
+        self.klo, self.khi = ks[0], ks[-1]
+        self.vlo, self.vhi = vols[0], vols[-1]
+        self.slo, self.shi = float(self.cs(self.klo, 1)), float(self.cs(self.khi, 1))
+        atm = float(self.cs(np.clip(0.0, self.klo, self.khi)))
+        self.L = max(tail_scale * atm * math.sqrt(T), 1e-4)
+        self.floor = 0.25 * float(vols.min())
+
+    def vol_k(self, k):
+        k = np.asarray(k, float)
+        out = np.empty_like(k)
+        lo, hi = k < self.klo, k > self.khi
+        mid = ~(lo | hi)
+        out[mid] = self.cs(k[mid])
+        out[hi] = self.vhi + self.shi * self.L * np.tanh((k[hi] - self.khi) / self.L)
+        out[lo] = self.vlo + self.slo * self.L * np.tanh((k[lo] - self.klo) / self.L)
+        return np.maximum(out, self.floor)
+
+    def dvol_dk(self, k):
+        k = np.asarray(k, float)
+        out = np.empty_like(k)
+        lo, hi = k < self.klo, k > self.khi
+        mid = ~(lo | hi)
+        out[mid] = self.cs(k[mid], 1)
+        out[hi] = self.shi / np.cosh((k[hi] - self.khi) / self.L) ** 2
+        out[lo] = self.slo / np.cosh((k[lo] - self.klo) / self.L) ** 2
+        raw = np.where(lo, self.vlo + self.slo * self.L * np.tanh((k - self.klo) / self.L),
+                       np.where(hi, self.vhi + self.shi * self.L * np.tanh((k - self.khi) / self.L), 1.0))
+        out[raw < self.floor] = 0.0
+        return out
+
+    def vol(self, K):
+        return self.vol_k(np.log(np.asarray(K, float) / self.F))
+
+    def dvol_dK(self, K):
+        K = np.asarray(K, float)
+        return self.dvol_dk(np.log(K / self.F)) / K
+
+
+# ======================================================================
+# Leg construction from ATM / RR / BF quotes
+# ======================================================================
+def pillar_smile(F, T, atm, rr25, rr10, bs25, bs10, pa, dfb):
+    vols = {'10P': atm + bs10 - rr10 / 2, '25P': atm + bs25 - rr25 / 2, 'ATM': atm,
+            '25C': atm + bs25 + rr25 / 2, '10C': atm + bs10 + rr10 / 2}
+    if min(vols.values()) <= 0:
+        raise ValueError('non-positive pillar vol')
+    K = {'10P': strike_from_delta(F, T, vols['10P'], 0.10, -1, pa, dfb),
+         '25P': strike_from_delta(F, T, vols['25P'], 0.25, -1, pa, dfb),
+         'ATM': dns_strike(F, T, atm, pa),
+         '25C': strike_from_delta(F, T, vols['25C'], 0.25, +1, pa, dfb),
+         '10C': strike_from_delta(F, T, vols['10C'], 0.10, +1, pa, dfb)}
+    order = ['10P', '25P', 'ATM', '25C', '10C']
+    ks = [math.log(K[p] / F) for p in order]
+    if any(b <= a for a, b in zip(ks, ks[1:])):
+        raise ValueError('pillar strikes not monotone (check RR/BF inputs)')
+    return Smile(F, T, ks, [vols[p] for p in order]), {p: (K[p], vols[p]) for p in order}
+
+
+def strangle_mismatch(smile, F, T, atm, bf_mkt, d, pa, dfb):
+    """Smile-priced market strangle minus flat-vol market strangle (forward units)."""
+    sm = atm + bf_mkt
+    Kc = strike_from_delta(F, T, sm, d, +1, pa, dfb)
+    Kp = strike_from_delta(F, T, sm, d, -1, pa, dfb)
+    target = black(F, Kc, T, sm, 1) + black(F, Kp, T, sm, -1)
+    on_smile = black(F, Kc, T, float(smile.vol(Kc)), 1) + black(F, Kp, T, float(smile.vol(Kp)), -1)
+    return float(on_smile - target)
+
+
+def _root_near(f, guess, step=0.002, max_step=0.06):
+    """Bracket a root around guess by expanding steps, then brentq."""
+    h = step
+    while h <= max_step + 1e-12:
+        a, b = guess - h, guess + h
+        try:
+            fa, fb = f(a), f(b)
+            if np.isfinite(fa) and np.isfinite(fb) and fa * fb <= 0:
+                return brentq(f, a, b, xtol=1e-12)
+        except ValueError:
+            pass
+        h *= 2
+    raise ValueError('could not bracket fly solve')
+
+
+def build_leg(pair, S, F, T, q, df_usd, fly_conv='broker', pa=None, dtype=None):
+    """q: dict with atm, rr25, rr10, bf25, bf10 (decimals)."""
+    ccy, orient = leg_info(pair)
+    pa = default_premium_adjusted(pair) if pa is None else pa
+    dtype = dtype or default_delta_type(pair, T)
+    df_base = df_usd * F / S if orient > 0 else df_usd          # base-ccy df via CIP
+    df_ccy = df_usd * F / S if orient > 0 else df_usd * S / F   # non-USD ccy df
+    dfb = df_base if dtype == 'spot' else 1.0
+    atm, rr25, rr10, bf25, bf10 = (q[k] for k in ('atm', 'rr25', 'rr10', 'bf25', 'bf10'))
+
+    if fly_conv == 'smile':
+        bs25, bs10 = bf25, bf10
+    else:
+        bs25, bs10 = bf25, bf10
+        for _ in range(40):
+            def e25(x):
+                s, _ = pillar_smile(F, T, atm, rr25, rr10, x, bs10, pa, dfb)
+                return strangle_mismatch(s, F, T, atm, bf25, 0.25, pa, dfb)
+            n25 = _root_near(e25, bs25)
+
+            def e10(x):
+                s, _ = pillar_smile(F, T, atm, rr25, rr10, n25, x, pa, dfb)
+                return strangle_mismatch(s, F, T, atm, bf10, 0.10, pa, dfb)
+            n10 = _root_near(e10, bs10)
+            done = abs(n25 - bs25) < 1e-9 and abs(n10 - bs10) < 1e-9
+            bs25, bs10 = n25, n10
+            if done:
+                break
+    smile, pillars = pillar_smile(F, T, atm, rr25, rr10, bs25, bs10, pa, dfb)
+    return {'pair': pair, 'ccy': ccy, 'orient': orient, 'S': S, 'F': F, 'T': T,
+            'pa': pa, 'dtype': dtype, 'dfb': dfb, 'df_ccy': df_ccy, 'atm': atm,
+            'smile': smile, 'pillars': pillars, 'bs25': bs25, 'bs10': bs10,
+            'bf25_in': bf25, 'bf10_in': bf10, 'fly_conv': fly_conv}
+
+
+# ======================================================================
+# Marginal of Y (USD per unit ccy) under the USD T-forward measure
+# ======================================================================
+class Marginal:
+    def __init__(self, leg, nz=2401, zmax=9.0, nk=6001):
+        sm, F, T, orient = leg['smile'], leg['F'], leg['T'], leg['orient']
+        rt = math.sqrt(T)
+        probe = sm.vol_k(np.linspace(-10, 10, 41) * leg['atm'] * rt)
+        span = 12.0 * float(probe.max()) * rt + 0.02
+        k = np.linspace(-span, span, nk)
+        K = F * np.exp(k)
+        sig = sm.vol_k(k)
+        ds = sm.dvol_dk(k) / K
+        sd = sig * rt
+        d1 = (-k + 0.5 * sd * sd) / sd
+        d2 = d1 - sd
+        if orient > 0:   # Y = X, X under its own (USD) measure
+            skew = F * npdf(d1) * rt * ds
+            cdf_x, sf_x = ndtr(-d2) + skew, ndtr(d2) - skew
+            y, cdf, sf = K, cdf_x, sf_x
+        else:            # Y = 1/X; X re-weighted to the USD measure
+            skew = K * npdf(d1) * rt * ds
+            G, Gs = ndtr(-d1) + skew, ndtr(d1) - skew
+            y, cdf, sf = (1.0 / K)[::-1], Gs[::-1], G[::-1]
+
+        # butterfly-arbitrage diagnostic: CDF must be non-decreasing
+        raw_drops = np.diff(cdf) < -1e-9
+        self.arb_points = int(raw_drops.sum())
+        tiny = 1e-300
+        cdf = np.maximum.accumulate(np.clip(cdf, tiny, 1.0))
+        sf = np.minimum.accumulate(np.clip(sf, tiny, 1.0))
+        lny = np.log(y)
+
+        z = np.linspace(-zmax, zmax, nz)
+        lnY = np.empty_like(z)
+        neg = z <= 0
+        lc, idx = np.unique(np.log(cdf), return_index=True)
+        lnY[neg] = np.interp(log_ndtr(z[neg]), lc, lny[idx])
+        ls, idx2 = np.unique(np.log(sf), return_index=True)        # ascending log sf
+        lnY[~neg] = np.interp(log_ndtr(-z[~neg]), ls, lny[idx2])
+        lnY = np.maximum.accumulate(lnY)
+        lnY += np.arange(nz) * 1e-14                               # strictly increasing
+
+        FY = F if orient > 0 else 1.0 / F
+        w = npdf(z) * np.gradient(z)
+        w[0] *= 0.5
+        w[-1] *= 0.5
+        mean = float(np.sum(w * np.exp(lnY)) / np.sum(w))
+        self.mean_err = mean / FY - 1.0                           # pre-normalisation drift
+        lnY += math.log(FY / mean)
+        self.z, self.lnY, self.FY = z, lnY, FY
+
+    def Q(self, z):
+        return np.exp(np.interp(z, self.z, self.lnY))
+
+    def Qinv(self, y):
+        return np.interp(np.log(y), self.lnY, self.z)
+
+
+# ======================================================================
+# Gaussian-copula cross pricer:  Call(K) = E_usd[(Y_A - K*Y_B)^+] / F_YB
+# ======================================================================
+class CrossPricer:
+    def __init__(self, MA, MB, rho_y, nz1=601, nw=1601, zmax=8.5):
+        rho = float(np.clip(rho_y, -0.999, 0.999))
+        self.MA, self.MB, self.rho = MA, MB, rho
+        self.sr = math.sqrt(1 - rho * rho)
+        z1 = np.linspace(-zmax, zmax, nz1)
+        w1 = npdf(z1) * (z1[1] - z1[0])
+        w1[0] *= 0.5
+        w1[-1] *= 0.5
+        self.z1, self.w1 = z1, w1 / w1.sum()
+        w = np.linspace(-zmax, zmax, nw)
+        self.w0, self.dw, self.nw = w[0], w[1] - w[0], nw
+        self.YA = MA.Q(z1)
+        YB = MB.Q(rho * z1[:, None] + self.sr * w[None, :])
+        f = YB * npdf(w)[None, :]
+        g = np.broadcast_to(npdf(w), f.shape)
+        cum = lambda a: np.concatenate([np.zeros((a.shape[0], 1)),
+                                        np.cumsum(0.5 * (a[:, 1:] + a[:, :-1]) * self.dw, axis=1)], axis=1)
+        self.cumB, self.cumP = cum(f), cum(g)
+        self.totB, self.totP = self.cumB[:, -1], self.cumP[:, -1]
+        self.FX = MA.FY / MB.FY
+        # forward check: E[Y_A]/E[Y_B] from the 2-D quadrature
+        self.fwd_err = float(np.sum(self.w1 * self.YA) / np.sum(self.w1 * self.totB) / self.FX - 1.0)
+
+    def _interp_rows(self, cum, wstar):
+        x = np.clip((wstar - self.w0) / self.dw, 0.0, self.nw - 1 - 1e-9)
+        i = np.floor(x).astype(int)
+        t = x - i
+        r = np.arange(cum.shape[0])
+        return cum[r, i] * (1 - t) + cum[r, i + 1] * t
+
+    def call_put(self, K):
+        zstar = self.MB.Qinv(self.YA / K)
+        wstar = (zstar - self.rho * self.z1) / self.sr
+        pB = self._interp_rows(self.cumB, wstar)
+        pP = self._interp_rows(self.cumP, wstar)
+        call = self.YA * pP - K * pB                       # Y_B < Y_A/K region
+        put = K * (self.totB - pB) - self.YA * (self.totP - pP)
+        FYB = self.MB.FY
+        return float(np.sum(self.w1 * call) / FYB), float(np.sum(self.w1 * put) / FYB)
+
+    def iv(self, K, T):
+        c, p = self.call_put(K)
+        F = self.FX
+        return implied_vol(c, F, K, T, 1) if K >= F else implied_vol(p, F, K, T, -1)
+
+
+# ======================================================================
+# Extract cross pillars from a strike-space smile
+# ======================================================================
+def dns_self_consistent(smile, T, pa):
+    k = 0.0
+    s = -0.5 if pa else 0.5
+    for _ in range(100):
+        k_new = s * float(smile.vol_k(k)) ** 2 * T
+        if abs(k_new - k) < 1e-14:
+            break
+        k = k_new
+    return k, float(smile.vol_k(k))
+
+
+def delta_strike_on_smile(smile, F, T, d, cp, pa, dfb, sd_ref):
+    """Strike where delta(K, sigma(K)) = d, on the OTM branch."""
+    def f(k):
+        return abs(float(bs_delta(F, F * math.exp(k), T, float(smile.vol_k(k)), cp, pa, dfb))) - d
+    grid = np.linspace(-10 * sd_ref, 10 * sd_ref, 801)
+    vals = np.abs(bs_delta(F, F * np.exp(grid), T, smile.vol_k(grid), cp, pa, dfb)) - d
+    if cp > 0:   # rightmost + -> - crossing
+        idx = [i for i in range(len(grid) - 1) if vals[i] > 0 >= vals[i + 1]]
+        if not idx:
+            raise ValueError('call delta not found')
+        i = idx[-1]
+    else:        # leftmost - -> + crossing
+        idx = [i for i in range(len(grid) - 1) if vals[i] < 0 <= vals[i + 1]]
+        if not idx:
+            raise ValueError('put delta not found')
+        i = idx[0]
+    k = brentq(f, grid[i], grid[i + 1], xtol=1e-13)
+    return k, float(smile.vol_k(k))
+
+
+def broker_fly_from_smile(smile, F, T, atm, d, pa, dfb):
+    f = lambda b: strangle_mismatch(smile, F, T, atm, b, d, pa, dfb)
+    guess = 0.5 * (float(smile.vol(strike_from_delta(F, T, atm, d, 1, pa, dfb))) +
+                   float(smile.vol(strike_from_delta(F, T, atm, d, -1, pa, dfb)))) - atm
+    return _root_near(f, guess)
+
+
+def smile_pillars(smile, F, T, pa, dfb):
+    sd = max(float(smile.vol_k(0.0)), 1e-3) * math.sqrt(T)
+    k_atm, v_atm = dns_self_consistent(smile, T, pa)
+    out = {'ATM': (F * math.exp(k_atm), v_atm)}
+    for lab, d, cp in (('25C', 0.25, 1), ('25P', 0.25, -1), ('10C', 0.10, 1), ('10P', 0.10, -1)):
+        k, v = delta_strike_on_smile(smile, F, T, d, cp, pa, dfb, sd)
+        out[lab] = (F * math.exp(k), v)
+    atm = v_atm
+    res = {'atm': atm,
+           'rr25': out['25C'][1] - out['25P'][1], 'rr10': out['10C'][1] - out['10P'][1],
+           'bf25s': 0.5 * (out['25C'][1] + out['25P'][1]) - atm,
+           'bf10s': 0.5 * (out['10C'][1] + out['10P'][1]) - atm,
+           'pillars': out}
+    try:
+        res['bf25b'] = broker_fly_from_smile(smile, F, T, atm, 0.25, pa, dfb)
+        res['bf10b'] = broker_fly_from_smile(smile, F, T, atm, 0.10, pa, dfb)
+    except ValueError:
+        res['bf25b'] = res['bf10b'] = float('nan')
+    return res
+
+
+# ======================================================================
+# Variance-formula ATM + sensitivities
+# ======================================================================
+def variance_formula(sa, sb, rho_y):
+    v = sa * sa + sb * sb - 2 * rho_y * sa * sb
+    s = math.sqrt(max(v, 1e-12))
+    return {'atm': s,
+            'd_sa': (sa - rho_y * sb) / s,       # d sigma_x / d sigma_A
+            'd_sb': (sb - rho_y * sa) / s,       # d sigma_x / d sigma_B
+            'd_rho_y': -sa * sb / s}             # d sigma_x / d rho_Y
+
+
+# ======================================================================
+# SABR (beta = 1, Hagan lognormal) — same model as the dashboard's Vol of Vol tab
+# ======================================================================
+def sabr_vol(F, K, T, a, r, n):
+    K = np.asarray(K, float)
+    z = n / a * np.log(F / K)
+    small = np.abs(z) < 1e-8
+    zs = np.where(small, 1e-8, z)
+    x = np.log((np.sqrt(1 - 2 * r * zs + zs * zs) + zs - r) / (1 - r))
+    zx = np.where(small, 1.0 - 0.5 * r * z, zs / x)
+    return a * zx * (1 + (r * n * a / 4 + (2 - 3 * r * r) * n * n / 24) * T)
+
+
+def fit_sabr(F, T, Ks, vols):
+    """Least-squares (alpha, rho, nu) through the 5 pillar strike/vol points."""
+    Ks, vols = np.asarray(Ks, float), np.asarray(vols, float)
+    best = None
+    for r0 in (-0.3, 0.0, 0.3):
+        res = least_squares(lambda p: sabr_vol(F, Ks, T, p[0], p[1], p[2]) - vols,
+                            [float(np.median(vols)), r0, 0.8],
+                            bounds=([1e-4, -0.999, 1e-4], [3.0, 0.999, 10.0]), xtol=1e-12, ftol=1e-14)
+        if best is None or res.cost < best.cost:
+            best = res
+    a, r, n = best.x
+    return {'alpha': float(a), 'rho': float(r), 'nu': float(n), 'err': float(np.max(np.abs(best.fun)))}
+
+
+def propagate_vov(sa, sb, rho_y, nu_a, nu_b, rho_sig, sig_rho):
+    """Cross vol-of-vol from leg vol-of-vols.
+    sigma_X^2 = sa^2 + sb^2 - 2 rho sa sb  ->  d sigma_X = dA d sa + dB d sb + dR d rho
+    (nu_X sigma_X)^2 = (dA nu_a sa)^2 + (dB nu_b sb)^2 + 2 rho_sig (dA nu_a sa)(dB nu_b sb) + (dR sig_rho)^2
+    rho_sig = correlation of the two legs' vol moves; sig_rho = annualized vol of rho (absolute).
+    The weights wA = dA sa / sX, wB = dB sb / sX sum to exactly 1, so with rho_sig = 1 and
+    sig_rho = 0, nu_X is the weighted average of nu_a and nu_b."""
+    vf = variance_formula(sa, sb, rho_y)
+    sx = vf['atm']
+    ea, eb = vf['d_sa'] * nu_a * sa, vf['d_sb'] * nu_b * sb
+    ec = vf['d_rho_y'] * sig_rho
+    var = ea * ea + eb * eb + 2 * rho_sig * ea * eb + ec * ec
+    return {'nu_x': math.sqrt(max(var, 0.0)) / sx, 'w_a': vf['d_sa'] * sa / sx, 'w_b': vf['d_sb'] * sb / sx,
+            # contributions to (nu_X sigma_X)^2, in (vol pts / yr)^2 — shows what drives the fly
+            'var_parts': {'leg_a': ea * ea * 1e4, 'leg_b': eb * eb * 1e4,
+                          'cross': 2 * rho_sig * ea * eb * 1e4, 'corr': ec * ec * 1e4}}
+
+
+def ou_factor(T, half_life):
+    """Correlation mean-reverts. For an OU rho with speed k = ln2/half_life, Var(rho_T) =
+    sig^2 (1 - e^{-2kT}) / (2k), so the vol of rho to use over horizon T is
+    sig * sqrt((1 - e^{-2kT}) / (2kT)). -> 1 for short tenors, ~1/sqrt(T) for long ones."""
+    if not half_life or half_life <= 0:
+        return 1.0
+    x = 2 * math.log(2) / half_life * T
+    return math.sqrt(-math.expm1(-x) / x) if x > 1e-10 else 1.0
+
+
+def sabr_smile(F, T, a, r, n, atm):
+    ks = np.linspace(-7, 7, 141) * atm * math.sqrt(T)
+    return Smile(F, T, ks, sabr_vol(F, F * np.exp(ks), T, a, r, n))
+
+
+def rr25_on(smile, F, T, pa, dfb):
+    sd = max(float(smile.vol_k(0.0)), 1e-3) * math.sqrt(T)
+    _, vc = delta_strike_on_smile(smile, F, T, 0.25, 1, pa, dfb, sd)
+    _, vp = delta_strike_on_smile(smile, F, T, 0.25, -1, pa, dfb, sd)
+    return vc - vp
+
+
+def cross_sabr(F, T, atm, nu_x, rr25_target, pa, dfb):
+    """Cross SABR: nu = propagated vol-of-vol, alpha so DNS ATM = atm, rho so 25 RR = target."""
+    k_atm = (-0.5 if pa else 0.5) * atm * atm * T
+    Katm = F * math.exp(k_atm)
+
+    def make(r):
+        # alpha*(1 + (r nu alpha/4 + ...)T) is not monotone for large alpha when r < 0, so bracket
+        # the root closest to the ATM vol rather than over a wide range
+        g = lambda a: float(sabr_vol(F, Katm, T, a, r, nu_x)) - atm
+        hi = 1.5 * atm
+        while g(hi) < 0 and hi < 8 * atm:
+            hi *= 1.25
+        a = brentq(g, 1e-6, hi, xtol=1e-14)
+        return a, sabr_smile(F, T, a, r, nu_x, atm)
+
+    def err(r):
+        return rr25_on(make(r)[1], F, T, pa, dfb) - rr25_target
+
+    note = ''
+    lo, hi = -0.95, 0.95
+    for _ in range(6):
+        try:
+            elo, ehi = err(lo), err(hi)
+            break
+        except ValueError:
+            lo, hi = 0.8 * lo, 0.8 * hi
+    else:
+        raise ValueError('cross SABR: no admissible rho range')
+    if elo * ehi <= 0:
+        r = brentq(err, lo, hi, xtol=1e-8)
+    else:
+        r = lo if abs(elo) < abs(ehi) else hi
+        note = 'cross SABR could not reach target 25 RR'
+    a, sm = make(r)
+    return {'alpha': a, 'rho': r, 'nu': nu_x, 'smile': sm, 'note': note}
+
+
+# ======================================================================
+# One tenor of the cross
+# ======================================================================
+def build_cross_tenor(legA, legB, rho_y, atm_anchor='formula', cross_pa=None, cross_dtype=None,
+                      rho_sig=0.6, sig_rho=0.0, wings='vov', nk=41, span=5.0):
+    """legA = leg holding the cross BASE ccy, legB = leg holding the QUOTE ccy.
+    Always computes both wing models; `wings` picks which one is the output surface."""
+    t0 = time.time()
+    T = legA['T']
+    MA, MB = Marginal(legA), Marginal(legB)
+    cross = legA['ccy'] + legB['ccy']
+    F = MA.FY / MB.FY
+    S_YA = legA['S'] if legA['orient'] > 0 else 1.0 / legA['S']
+    S_YB = legB['S'] if legB['orient'] > 0 else 1.0 / legB['S']
+    S = S_YA / S_YB
+    pa = default_premium_adjusted(cross) if cross_pa is None else cross_pa
+    dtype = cross_dtype or default_delta_type(cross, T)
+    dfb = legA['df_ccy'] if dtype == 'spot' else 1.0
+    notes = []
+
+    # ---- ATM + RR: Gaussian copula, ATM anchored to the variance formula by default
+    vf = variance_formula(legA['atm'], legB['atm'], rho_y)
+    rho_cop = rho_y
+    Kf = dns_strike(F, T, vf['atm'], pa)
+    raw_copula_atm = CrossPricer(MA, MB, rho_y, nz1=301, nw=801).iv(Kf, T)
+    if atm_anchor == 'formula':
+        def err(r):
+            return CrossPricer(MA, MB, r, nz1=301, nw=801).iv(Kf, T) - vf['atm']
+        try:
+            if err(-0.995) * err(0.995) > 0:
+                raise ValueError
+            rho_cop = brentq(err, -0.995, 0.995, xtol=1e-6)
+        except ValueError:
+            notes.append('copula ATM calibration failed; used input rho')
+            rho_cop = rho_y
+
+    pr = CrossPricer(MA, MB, rho_cop)
+    sd = vf['atm'] * math.sqrt(T)
+    ks = np.linspace(-span, span, nk) * sd
+    vols = np.array([pr.iv(F * math.exp(k), T) for k in ks])
+    ok = np.isfinite(vols)
+    if ok.sum() < 7:
+        raise ValueError('too few valid cross vols')
+    smile_cop = Smile(F, T, ks[ok], vols[ok])
+    piv_cop = smile_pillars(smile_cop, F, T, pa, dfb)
+
+    Kg = F * np.exp(ks[ok])
+    cg = np.array([black(F, K, T, v, 1) for K, v in zip(Kg, vols[ok])])
+    slope = np.diff(cg) / np.diff(Kg)
+    arb_cross = int((np.diff(slope) < -1e-10 * F).sum() + (slope > 1e-9).sum())
+
+    # ---- Wings: vol-of-vol propagation into a cross SABR
+    labs = ['10P', '25P', 'ATM', '25C', '10C']
+    sabr_a = fit_sabr(legA['F'], T, [legA['pillars'][l][0] for l in labs], [legA['pillars'][l][1] for l in labs])
+    sabr_b = fit_sabr(legB['F'], T, [legB['pillars'][l][0] for l in labs], [legB['pillars'][l][1] for l in labs])
+    vov = propagate_vov(legA['atm'], legB['atm'], rho_y, sabr_a['nu'], sabr_b['nu'], rho_sig, sig_rho)
+    xs = cross_sabr(F, T, piv_cop['atm'], vov['nu_x'], piv_cop['rr25'], pa, dfb)
+    if xs['note']:
+        notes.append(xs['note'])
+    piv_vov = smile_pillars(xs['smile'], F, T, pa, dfb)
+
+    final, smile_final = (piv_vov, xs['smile']) if wings == 'vov' else (piv_cop, smile_cop)
+    return {'tenor_T': T, 'cross': cross, 'S': S, 'F': F, 'pa': pa, 'dtype': dtype, 'wings': wings,
+            'rho_y': rho_y, 'rho_copula': rho_cop, 'raw_copula_atm': raw_copula_atm, 'atm_anchor': atm_anchor,
+            'formula': vf, 'res': final, 'res_copula': piv_cop, 'res_vov': piv_vov,
+            'smile_obj': smile_final, 'smile_copula': smile_cop, 'smile_vov': xs['smile'],
+            'curve_k': ks[ok].tolist(),
+            'sabr_legs': [sabr_a, sabr_b], 'vov': vov, 'rho_sig': rho_sig, 'sig_rho': sig_rho,
+            'sabr_cross': {k: xs[k] for k in ('alpha', 'rho', 'nu')},
+            'notes': notes,
+            'diag': {'fwd_err': pr.fwd_err, 'mean_err_A': MA.mean_err, 'mean_err_B': MB.mean_err,
+                     'arb_leg_A': MA.arb_points, 'arb_leg_B': MB.arb_points,
+                     'arb_cross': arb_cross, 'secs': time.time() - t0}}
+
+
+# ======================================================================
+# Full surface
+# ======================================================================
+def build_surface(legA_in, legB_in, rho_quoted_by_tenor, usd_rate=0.04, fly_conv='broker',
+                  atm_anchor='formula', delta_mode='auto', tenors=None, today=None,
+                  rho_sig_by_tenor=None, sig_rho_by_tenor=None, wings='vov', rho_half_life=0.5):
+    """
+    legX_in = {'pair': 'EURUSD', 'spot': 1.08, 'fwd_scale': 10000,
+               'rows': {tenor: {'fwd_pts', 'atm', 'rr25', 'rr10', 'bf25', 'bf10'}}}
+               (vols / RR / BF in VOL POINTS, fwd pts in pips — as on screen)
+    rho_quoted_by_tenor = {tenor: correlation of the legs as quoted}
+    rho_sig_by_tenor    = {tenor: correlation of the legs' vol moves}       (default 0.6)
+    sig_rho_by_tenor    = {tenor: instantaneous annualized vol of rho}       (default 0.0)
+    rho_half_life       = mean-reversion half-life of rho in years (None/0 = random walk)
+    """
+    rho_sig_by_tenor = rho_sig_by_tenor or {}
+    sig_rho_by_tenor = sig_rho_by_tenor or {}
+    pa_, pb_ = legA_in['pair'].upper(), legB_in['pair'].upper()
+    base, quote = cross_ccys(pa_, pb_)
+    if leg_info(pa_)[0] != base:
+        legA_in, legB_in = legB_in, legA_in
+    sA, sB = leg_info(legA_in['pair'])[1], leg_info(legB_in['pair'])[1]
+    tenors = tenors or [t for t in TENORS if t in legA_in['rows'] and t in legB_in['rows']]
+    dt = None if delta_mode == 'auto' else delta_mode
+    out, errors = [], {}
+    for t in tenors:
+        try:
+            T = tenor_to_T(t, today)
+            df_usd = math.exp(-usd_rate * T)
+            legs = []
+            for L in (legA_in, legB_in):
+                r = L['rows'][t]
+                S = float(L['spot'])
+                scale = float(L.get('fwd_scale') or pip_scale_from_spot(S))
+                F = S + float(r.get('fwd_pts') or 0.0) / scale
+                q = {k: float(r[k]) / 100.0 for k in ('atm', 'rr25', 'rr10', 'bf25', 'bf10')}
+                legs.append(build_leg(L['pair'].upper(), S, F, T, q, df_usd, fly_conv, dtype=dt))
+            rq = float(rho_quoted_by_tenor[t])
+            rs = rho_sig_by_tenor.get(t)
+            sr = sig_rho_by_tenor.get(t)
+            sr = 0.0 if sr is None else float(sr)
+            sr_eff = sr * ou_factor(T, rho_half_life)
+            res = build_cross_tenor(legs[0], legs[1], sA * sB * rq, atm_anchor, cross_dtype=dt,
+                                    rho_sig=0.6 if rs is None else float(rs), sig_rho=sr_eff, wings=wings)
+            res['sig_rho_inst'] = sr
+            if rs is None:
+                res['notes'].append('vol-vol corr defaulted to 0.6')
+            res['tenor'] = t
+            res['rho_quoted'] = rq
+            res['legs'] = [{'pair': l['pair'], 'pa': l['pa'], 'dtype': l['dtype'], 'F': l['F'],
+                            'bs25': l['bs25'], 'bs10': l['bs10'],
+                            'bf25_in': l['bf25_in'], 'bf10_in': l['bf10_in']} for l in legs]
+            out.append(res)
+        except Exception as e:
+            errors[t] = f'{type(e).__name__}: {e}'
+
+    cal_flags = []
+    for a, b in zip(out, out[1:]):
+        if b['res']['atm'] ** 2 * b['tenor_T'] < a['res']['atm'] ** 2 * a['tenor_T'] - 1e-10:
+            cal_flags.append(f"{a['tenor']}->{b['tenor']}: ATM total variance decreases")
+    return {'cross': base + quote, 'base': base, 'quote': quote,
+            'leg_base': legA_in['pair'].upper(), 'leg_quote': legB_in['pair'].upper(),
+            'sign_note': f'rho_Y = ({sA:+d})*({sB:+d})*rho_quoted',
+            'tenors': out, 'errors': errors, 'calendar_flags': cal_flags}
+
+
+# ======================================================================
+# Realized estimators (spot correlation, vol-vol correlation, vol of correlation)
+# ======================================================================
+def realized_corr(px_a, px_b, pair_a, pair_b, windows=None):
+    """px_a, px_b: aligned daily closes. Per-tenor rho as quoted and rho_Y."""
+    windows = windows or CORR_WINDOW_BDAYS
+    a = np.diff(np.log(np.asarray(px_a, float)))
+    b = np.diff(np.log(np.asarray(px_b, float)))
+    sA, sB = leg_info(pair_a)[1], leg_info(pair_b)[1]
+    out = {}
+    for t, n in windows.items():
+        m = min(n, len(a))
+        if m < 10:
+            out[t] = {'window': n, 'n': m, 'rho_quoted': None, 'rho_y': None}
+            continue
+        r = float(np.corrcoef(a[-m:], b[-m:])[0, 1])
+        out[t] = {'window': n, 'n': m, 'rho_quoted': r, 'rho_y': sA * sB * r}
+    return out
+
+
+def vol_vol_corr(vol_a, vol_b, window):
+    """Correlation of daily log-changes of two aligned implied-vol series.
+    Window floored at 63 business days (vol changes are noisy)."""
+    a = np.diff(np.log(np.asarray(vol_a, float)))
+    b = np.diff(np.log(np.asarray(vol_b, float)))
+    m = min(max(window, 63), len(a))
+    if m < 20:
+        return None, m
+    return float(np.corrcoef(a[-m:], b[-m:])[0, 1]), m
+
+
+def corr_vol(px_a, px_b, block=21):
+    """Annualized vol of the correlation itself (absolute rho units).
+    Rho is estimated on consecutive non-overlapping blocks; the sampling noise of each
+    block estimate, (1-rho^2)^2/(block-3), is removed from the variance of block-to-block changes:
+        var(true d rho) = var(d rho_hat) - 2 * noise,   annualized x (252 / block)."""
+    a = np.diff(np.log(np.asarray(px_a, float)))
+    b = np.diff(np.log(np.asarray(px_b, float)))
+    nb = len(a) // block
+    if nb < 8:
+        return {'value': None, 'n_blocks': nb}
+    a, b = a[-nb * block:], b[-nb * block:]
+    rhos = np.array([np.corrcoef(a[i * block:(i + 1) * block], b[i * block:(i + 1) * block])[0, 1]
+                     for i in range(nb)])
+    raw = float(np.var(np.diff(rhos), ddof=1))
+    noise = float(np.mean((1 - rhos ** 2) ** 2)) / (block - 3)    # Fisher-z: var ~ 1/(n-3)
+    true = max(raw - 2 * noise, 0.0)
+    # mean reversion: lag-1 autocorrelation of the block series. Sampling noise inflates the
+    # level variance but not the lag-1 covariance, so phi = cov1 / (var - noise).
+    dev = rhos - rhos.mean()
+    cov1 = float(np.mean(dev[1:] * dev[:-1]))
+    lvl = float(np.var(rhos)) - noise
+    half_life = None
+    if lvl > 1e-6 and cov1 > 0:
+        phi = min(cov1 / lvl, 0.999)
+        half_life = min(max(math.log(2) / (-math.log(phi) / (block / 252)), 1 / 12), 3.0)
+    return {'value': math.sqrt(true * 252 / block), 'raw': math.sqrt(raw * 252 / block),
+            'n_blocks': nb, 'block': block, 'half_life': half_life}
+
+
+# ######################################################################
+#                       DATA: BLOOMBERG + PLACEHOLDERS
+# ######################################################################
+def log(msg):
+    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+
+
+class BBG:
+    def __init__(self):
+        self.session = None
+        self.svc = None
+        self.lock = threading.Lock()
+        self.last_error = '' if blpapi else 'blpapi not installed'
+
+    def available(self):
+        with self.lock:
+            return self._ensure()
+
+    def _ensure(self):
+        if self.session is not None:
+            return True
+        if blpapi is None:
+            return False
+        try:
+            opts = blpapi.SessionOptions()
+            opts.setServerHost(BBG_HOST)
+            opts.setServerPort(BBG_PORT)
+            s = blpapi.Session(opts)
+            if not s.start():
+                self.last_error = 'session start failed (is the Terminal running?)'
+                return False
+            if not s.openService('//blp/refdata'):
+                self.last_error = 'could not open //blp/refdata'
+                return False
+            self.session, self.svc = s, s.getService('//blp/refdata')
+            self.last_error = ''
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            return False
+
+    def _drain(self, timeout_s=20):
+        msgs, t_end = [], time.time() + timeout_s
+        while time.time() < t_end:
+            ev = self.session.nextEvent(500)
+            for m in ev:
+                msgs.append(m)
+            if ev.eventType() == blpapi.Event.RESPONSE:
+                return msgs
+        raise TimeoutError('Bloomberg request timed out')
+
+    def ref(self, tickers, fields):
+        with self.lock:
+            if not self._ensure():
+                raise RuntimeError(self.last_error)
+            req = self.svc.createRequest('ReferenceDataRequest')
+            for t in tickers:
+                req.getElement('securities').appendValue(t)
+            for f in fields:
+                req.getElement('fields').appendValue(f)
+            self.session.sendRequest(req)
+            out = {}
+            for m in self._drain():
+                if not m.hasElement('securityData'):
+                    continue
+                sd = m.getElement('securityData')
+                for i in range(sd.numValues()):
+                    s = sd.getValueAsElement(i)
+                    tk = s.getElementAsString('security')
+                    fd = s.getElement('fieldData')
+                    out[tk] = {f: fd.getElementAsFloat(f) for f in fields if fd.hasElement(f)}
+            return out
+
+    def hist(self, tickers, field, start, end):
+        with self.lock:
+            if not self._ensure():
+                raise RuntimeError(self.last_error)
+            req = self.svc.createRequest('HistoricalDataRequest')
+            for t in tickers:
+                req.getElement('securities').appendValue(t)
+            req.getElement('fields').appendValue(field)
+            req.set('periodicitySelection', 'DAILY')
+            req.set('startDate', start.strftime('%Y%m%d'))
+            req.set('endDate', end.strftime('%Y%m%d'))
+            self.session.sendRequest(req)
+            out = {t: {} for t in tickers}
+            for m in self._drain(60):
+                if not m.hasElement('securityData'):
+                    continue
+                sd = m.getElement('securityData')
+                tk = sd.getElementAsString('security')
+                fd = sd.getElement('fieldData')
+                for i in range(fd.numValues()):
+                    row = fd.getValueAsElement(i)
+                    if row.hasElement(field):
+                        d = row.getElementAsDatetime('date')
+                        out.setdefault(tk, {})[date(d.year, d.month, d.day)] = row.getElementAsFloat(field)
+            return out
+
+
+BB = BBG()
+
+
+def _px(rec):
+    if not rec:
+        return None
+    for f in ('PX_MID', 'PX_LAST'):
+        v = rec.get(f)
+        if v is not None and math.isfinite(v):
+            return v
+    return None
+
+
+def placeholder_surface(pair):
+    spot, a0, a1, rr1y, bf1y = PLACEHOLDER_SURF.get(pair, (1.0, 10.0, 10.0, 0.0, 0.25))
+    base, quote = split_pair(pair)
+    rb, rq = PLACEHOLDER_RATES.get(base, 3.0), PLACEHOLDER_RATES.get(quote, 3.0)
+    scale = pip_scale_from_spot(spot)
+    rows, n = {}, len(TENORS)
+    for i, t in enumerate(TENORS):
+        T = tenor_to_T(t)
+        f = min(max(T ** 0.25, 0.5), 1.15)
+        F = spot * math.exp((rq - rb) / 100 * T)
+        rows[t] = {'fwd_pts': round((F - spot) * scale, 2), 'atm': round(a0 + (a1 - a0) * i / (n - 1), 3),
+                   'rr25': round(rr1y * f, 3), 'rr10': round(1.85 * rr1y * f, 3),
+                   'bf25': round(bf1y * f, 3), 'bf10': round(3.3 * bf1y * f, 3)}
+    return {'pair': pair, 'spot': spot, 'fwd_scale': scale, 'rows': rows, 'source': 'PLACEHOLDER',
+            'note': 'Placeholder values — not market data. ' + (BB.last_error or '')}
+
+
+def bbg_surface(pair):
+    ccy, _ = leg_info(pair)
+    fpre = FWD_PREFIX_OVERRIDE.get(ccy, ccy)
+    spot_tk = f'{pair} Curncy'
+    tk = {'spot': spot_tk}
+    for t in TENORS:
+        tk[('atm', t)] = f'{pair}V{t} Curncy'
+        tk[('rr25', t)] = f'{pair}25R{t} Curncy'
+        tk[('rr10', t)] = f'{pair}10R{t} Curncy'
+        tk[('bf25', t)] = f'{pair}25B{t} Curncy'
+        tk[('bf10', t)] = f'{pair}10B{t} Curncy'
+        tk[('fwd', t)] = f'{fpre}{FWD_TENOR_SUFFIX.get(t, t)} Curncy'
+    data = BB.ref(sorted(set(tk.values())), ['PX_MID', 'PX_LAST', 'FWD_SCALE'])
+    spot = _px(data.get(spot_tk))
+    if spot is None:
+        raise RuntimeError(f'no spot for {spot_tk}')
+    fs = None
+    for t in TENORS:
+        v = (data.get(tk[('fwd', t)]) or {}).get('FWD_SCALE')
+        if v is not None and math.isfinite(v):
+            fs = 10.0 ** v
+            break
+    scale = fs or pip_scale_from_spot(spot)
+    rows, missing = {}, []
+    for t in TENORS:
+        r = {k: _px(data.get(tk[(k, t)])) for k in ('atm', 'rr25', 'rr10', 'bf25', 'bf10')}
+        fwd = _px(data.get(tk[('fwd', t)]))
+        if fwd is not None and abs(fwd) > 0.5 * spot:      # outright forward, not points
+            fwd = (fwd - spot) * scale
+        r['fwd_pts'] = fwd
+        if r['atm'] is None:
+            missing.append(t)
+            continue
+        for k in ('rr25', 'rr10', 'bf25', 'bf10', 'fwd_pts'):
+            if r[k] is None:
+                r[k] = 0.0
+                missing.append(f'{t} {k}')
+        rows[t] = r
+    return {'pair': pair, 'spot': spot, 'fwd_scale': scale, 'rows': rows, 'source': 'BBG',
+            'note': ('Missing: ' + ', '.join(missing)) if missing else '',
+            'asof': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+
+def get_surface(pair):
+    pair = pair.upper()
+    if BB.available():
+        try:
+            return bbg_surface(pair)
+        except Exception as e:
+            log(f'BBG surface {pair} failed: {e}')
+            BB.last_error = f'BBG pull failed: {e}'
+    return placeholder_surface(pair)
+
+
+def get_corr(a, b):
+    """Spot correlation per tenor, vol-vol correlation per tenor, and vol of correlation."""
+    a, b = a.upper(), b.upper()
+    if BB.available():
+        try:
+            end = date.today()
+            start = end - timedelta(days=365 * CORR_HISTORY_YEARS + 10)
+            ta, tb = f'{a} Curncy', f'{b} Curncy'
+            vtk = {(p, t): f'{p}V{t} Curncy' for p in (a, b) for t in TENORS}
+            h = BB.hist([ta, tb] + list(vtk.values()), 'PX_LAST', start, end)
+            dates = sorted(set(h.get(ta, {})) & set(h.get(tb, {})))
+            if len(dates) < 30:
+                raise RuntimeError(f'only {len(dates)} common spot dates')
+            pa_ = [h[ta][d] for d in dates]
+            pb_ = [h[tb][d] for d in dates]
+            vv = {}
+            for t in TENORS:
+                ha, hb = h.get(vtk[(a, t)], {}), h.get(vtk[(b, t)], {})
+                vd = sorted(d for d in set(ha) & set(hb) if ha[d] > 0 and hb[d] > 0)
+                r, n = vol_vol_corr([ha[d] for d in vd], [hb[d] for d in vd], CORR_WINDOW_BDAYS[t]) \
+                    if len(vd) > 30 else (None, len(vd))
+                vv[t] = {'rho_sig': r, 'n': n}
+            return {'source': 'BBG', 'from': dates[0].isoformat(), 'to': dates[-1].isoformat(),
+                    'n_obs': len(dates), 'by_tenor': realized_corr(pa_, pb_, a, b),
+                    'vol_vol': vv, 'corr_vol': corr_vol(pa_, pb_)}
+        except Exception as e:
+            log(f'BBG corr {a}/{b} failed: {e}')
+            BB.last_error = f'BDH failed: {e}'
+    v = PLACEHOLDER_RHO.get((a, b), PLACEHOLDER_RHO.get((b, a)))
+    sA, sB = leg_info(a)[1], leg_info(b)[1]
+    by = {t: {'window': n, 'n': 0, 'rho_quoted': v, 'rho_y': None if v is None else sA * sB * v}
+          for t, n in CORR_WINDOW_BDAYS.items()}
+    return {'source': 'PLACEHOLDER', 'by_tenor': by,
+            'vol_vol': {t: {'rho_sig': PLACEHOLDER_VOL_VOL_CORR, 'n': 0} for t in TENORS},
+            'corr_vol': {'value': PLACEHOLDER_CORR_VOL, 'n_blocks': 0, 'half_life': PLACEHOLDER_RHO_HALF_LIFE},
+            'note': ('Placeholder correlations — not market data.' if v is not None
+                     else 'No placeholder spot correlation for this pair — enter overrides.')}
+
+
+# ######################################################################
+#                                BUILD
+# ######################################################################
+def _fine_curve(F, smile, ks, n=241):
+    k = np.linspace(min(ks), max(ks), n)
+    return {'K': [F * math.exp(x) for x in k], 'vol': [round(float(v) * 100, 4) for v in smile.vol_k(k)]}
+
+
+def run_build(body):
+    t0 = time.time()
+    num = lambda d: {t: float(v) for t, v in (d or {}).items() if v is not None and v != ''}
+    rho, rs, sr = num(body.get('rho')), num(body.get('rho_sig')), num(body.get('sig_rho'))
+    legA, legB = body['legA'], body['legB']
+    tenors = [t for t in TENORS if t in rho and t in legA['rows'] and t in legB['rows']]
+    wings = body.get('wings', 'vov')
+    s = build_surface(legA, legB, rho, usd_rate=float(body.get('usd_rate', 4.0)) / 100,
+                      fly_conv=body.get('fly_conv', 'broker'), atm_anchor=body.get('atm_anchor', 'formula'),
+                      delta_mode=body.get('delta_mode', 'auto'), tenors=tenors,
+                      rho_sig_by_tenor=rs, sig_rho_by_tenor=sr, wings=wings,
+                      rho_half_life=float(body.get('rho_half_life') or 0) or None)
+    sA, sB = leg_info(s['leg_base'])[1], leg_info(s['leg_quote'])[1]
+    pts = lambda x: None if x is None or not math.isfinite(x) else round(x * 100, 4)
+    piv = lambda v: {k: pts(v[k]) for k in ('atm', 'rr25', 'rr10', 'bf25s', 'bf10s', 'bf25b', 'bf10b')}
+    rows = []
+    for r in s['tenors']:
+        v, f, d = r['res'], r['formula'], r['diag']
+        flags = list(r['notes'])
+        if d['arb_leg_A'] or d['arb_leg_B']:
+            flags.append(f"leg density <0 ({d['arb_leg_A']}/{d['arb_leg_B']} pts)")
+        if d['arb_cross']:
+            flags.append(f"copula convexity ({d['arb_cross']})")
+        if abs(d['fwd_err']) > 1e-6:
+            flags.append(f"fwd err {d['fwd_err']:.1e}")
+        for sb in r['sabr_legs']:
+            if sb['err'] > 0.002:
+                flags.append(f"leg SABR fit err {sb['err'] * 100:.2f} vol")
+        row = {'tenor': r['tenor'], 'T': r['tenor_T'], 'S': r['S'], 'F': r['F'], 'pa': r['pa'], 'dtype': r['dtype'],
+               **piv(v), 'cop': piv(r['res_copula']), 'vov': piv(r['res_vov']),
+               'atm_formula': pts(f['atm']), 'atm_raw_copula': pts(r['raw_copula_atm']),
+               'rho_quoted': r['rho_quoted'], 'rho_copula': r['rho_copula'] * sA * sB,
+               'rho_sig': r['rho_sig'], 'sig_rho': r['sig_rho_inst'], 'sig_rho_eff': r['sig_rho'],
+               'nu_a': r['sabr_legs'][0]['nu'], 'nu_b': r['sabr_legs'][1]['nu'], 'nu_x': r['vov']['nu_x'],
+               'w_a': r['vov']['w_a'], 'w_b': r['vov']['w_b'], 'var_parts': r['vov']['var_parts'],
+               'sabr_legs': r['sabr_legs'], 'sabr_cross': r['sabr_cross'],
+               'd_base_leg': f['d_sa'], 'd_quote_leg': f['d_sb'], 'd_rho10': f['d_rho_y'] * sA * sB * 0.10 * 100,
+               'pillars': {k: [K, pts(vv)] for k, (K, vv) in v['pillars'].items()},
+               'curve': _fine_curve(r['F'], r['smile_vov'], r['curve_k']),
+               'curve_cop': _fine_curve(r['F'], r['smile_copula'], r['curve_k']),
+               'legs': [{'pair': l['pair'], 'pa': l['pa'], 'dtype': l['dtype'],
+                         'bf25_in': pts(l['bf25_in']), 'bf10_in': pts(l['bf10_in']),
+                         'bs25': pts(l['bs25']), 'bs10': pts(l['bs10'])} for l in r['legs']],
+               'flags': flags, 'secs': round(d['secs'], 2)}
+        rows.append(row)
+    return {'cross': s['cross'], 'leg_base': s['leg_base'], 'leg_quote': s['leg_quote'],
+            'sign_note': s['sign_note'], 'rows': rows, 'errors': s['errors'],
+            'calendar_flags': s['calendar_flags'], 'secs': round(time.time() - t0, 2),
+            'atm_anchor': body.get('atm_anchor', 'formula'), 'fly_conv': body.get('fly_conv', 'broker'),
+            'wings': wings}
+
+
+# ######################################################################
+#                                 HTTP
+# ######################################################################
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, payload, ctype='application/json'):
+        data = payload if isinstance(payload, bytes) else json.dumps(payload, default=_jsonable).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        try:
+            if u.path in ('/', '/index.html'):
+                self._send(200, HTML.encode(), 'text/html; charset=utf-8')
+            elif u.path == '/api/status':
+                self._send(200, {'bbg': BB.available(), 'error': BB.last_error, 'pairs': LEG_PAIRS,
+                                 'tenors': TENORS, 'windows': CORR_WINDOW_BDAYS})
+            elif u.path == '/api/surface':
+                self._send(200, get_surface(q['pair']))
+            elif u.path == '/api/corr':
+                self._send(200, get_corr(q['a'], q['b']))
+            else:
+                self._send(404, {'error': 'not found'})
+        except Exception as e:
+            log(traceback.format_exc())
+            self._send(500, {'error': f'{type(e).__name__}: {e}'})
+
+    def do_POST(self):
+        try:
+            n = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(n) or b'{}')
+            if urlparse(self.path).path == '/api/build':
+                res = run_build(body)
+                log(f"built {res['cross']} {len(res['rows'])} tenors in {res['secs']}s"
+                    + (f" errors={res['errors']}" if res['errors'] else ''))
+                self._send(200, res)
+            else:
+                self._send(404, {'error': 'not found'})
+        except Exception as e:
+            log(traceback.format_exc())
+            self._send(500, {'error': f'{type(e).__name__}: {e}'})
+
+
+def _jsonable(o):
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, (date, datetime)):
+        return o.isoformat()
+    raise TypeError(type(o))
+
+
+# ######################################################################
+#                                 PAGE
+# ######################################################################
+HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cross Vol Builder</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.27.0/plotly.min.js"></script>
+<style>
+:root{color-scheme:dark;--bg:#121211;--surface-1:#1a1a19;--surface-2:#232321;--border:#353532;
+ --text-primary:#f0efec;--text-secondary:#c3c2b7;--text-muted:#8c8b84;--grid:#2c2c2a;
+ --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--ref:#8c8b84;
+ --good:#0ca30c;--warning:#fab219;--critical:#d03b3b;--input:#141413;--accent:#3987e5}
+@media (prefers-color-scheme: light){:root:where(:not([data-theme="dark"])){color-scheme:light;--bg:#f4f4f2;
+ --surface-1:#fcfcfb;--surface-2:#f0efec;--border:#dcdbd5;--text-primary:#0b0b0b;--text-secondary:#52514e;
+ --text-muted:#76756f;--grid:#e8e7e3;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--ref:#76756f;
+ --input:#ffffff;--accent:#2a78d6}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text-primary);font:13px/1.4 -apple-system,"Segoe UI",Roboto,Arial,sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:12px 18px;border-bottom:1px solid var(--border);background:var(--surface-1)}
+header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;background:var(--surface-2);color:var(--text-secondary);font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--text-muted)}
+.dot.ok{background:var(--good)}.dot.bad{background:var(--warning)}
+main{padding:14px 18px;display:flex;flex-direction:column;gap:14px;max-width:1750px;margin:0 auto}
+.card{background:var(--surface-1);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+.card h2{font-size:13px;margin:0 0 8px;font-weight:650;display:flex;align-items:center;gap:8px}
+.controls{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:end}
+label.f{display:flex;flex-direction:column;gap:3px;color:var(--text-secondary);font-size:11px}
+select,input{background:var(--input);color:var(--text-primary);border:1px solid var(--border);border-radius:6px;padding:5px 7px;font:inherit}
+input.num{width:64px;text-align:right;font-variant-numeric:tabular-nums;padding:3px 5px}
+input.num.wide{width:84px}
+input.num.ovr{border-style:dashed}
+input.num.dirty{border-color:var(--s4)}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.seg button{background:var(--input);color:var(--text-secondary);border:0;padding:5px 10px;font:inherit;cursor:pointer}
+.seg button.on{background:var(--accent);color:#fff}
+button.act{background:var(--surface-2);color:var(--text-primary);border:1px solid var(--border);border-radius:6px;padding:6px 12px;font:inherit;cursor:pointer}
+button.act:hover{border-color:var(--text-muted)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.cross{font-size:20px;font-weight:700;letter-spacing:.5px;padding:0 4px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:1150px){.grid2{grid-template-columns:1fr}}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th{color:var(--text-secondary);font-weight:600;font-size:11px;text-align:right;padding:4px 5px;border-bottom:1px solid var(--border);white-space:nowrap}
+th.grp{text-align:center;border-bottom:1px solid var(--border);color:var(--text-primary)}
+td{text-align:right;padding:2px 5px;border-bottom:1px solid var(--grid);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+td.lab{color:var(--text-secondary);font-weight:600}
+td.sep,th.sep{border-left:1px solid var(--border)}
+.badge{font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;letter-spacing:.4px}
+.badge.BBG{background:rgba(12,163,12,.15);color:var(--good)}
+.badge.PLACEHOLDER{background:rgba(250,178,25,.15);color:var(--warning)}
+.badge.info{background:var(--surface-2);color:var(--text-secondary)}
+.meta{display:flex;gap:12px;align-items:center;color:var(--text-secondary);font-size:11px;margin-bottom:6px;flex-wrap:wrap}
+.note{color:var(--text-muted);font-size:11px;margin-top:6px}
+.warn{color:var(--warning)}
+.err{color:var(--critical)}
+td.hl{font-weight:650}
+.charts{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:14px}
+@media (max-width:1250px){.charts{grid-template-columns:1fr}}
+.chart{height:330px}
+.scroll{overflow-x:auto}
+details summary{cursor:pointer;color:var(--text-secondary);margin-top:8px}
+.status{min-height:18px;font-size:12px;color:var(--text-secondary)}
+.empty{color:var(--text-muted);padding:20px 0;text-align:center}
+</style></head><body>
+<header><h1>Cross Vol Builder</h1><span class="pill"><span id="bbgDot" class="dot"></span><span id="bbgTxt">checking Bloomberg…</span></span>
+<span style="flex:1"></span><span class="pill">ATM: variance formula · RR: copula · wings: vol-of-vol</span></header>
+<main>
+<section class="card controls">
+  <label class="f">Leg A<select id="pairA"></select></label>
+  <label class="f">Leg B<select id="pairB"></select></label>
+  <div><div style="font-size:11px;color:var(--text-secondary)">Cross</div><div class="cross" id="crossName">—</div></div>
+  <label class="f">USD rate %<input id="usdRate" class="num" value="4.00"></label>
+  <div class="f"><label class="f">Fly input</label><div class="seg" data-k="fly_conv"><button data-v="broker">Broker</button><button data-v="smile">Smile</button></div></div>
+  <div class="f"><label class="f">Wings</label><div class="seg" data-k="wings"><button data-v="vov">Vol-of-vol</button><button data-v="copula">Copula</button></div></div>
+  <div class="f"><label class="f">Cross ATM</label><div class="seg" data-k="atm_anchor"><button data-v="formula">Variance formula</button><button data-v="copula">Raw copula</button></div></div>
+  <div class="f"><label class="f">Delta</label><div class="seg" data-k="delta_mode"><button data-v="auto">Auto</button><button data-v="spot">Spot</button><button data-v="forward">Fwd</button></div></div>
+  <span style="flex:1"></span>
+  <button class="act" id="btnPull">Pull Bloomberg</button>
+  <button class="act" id="btnCorr">Pull realized</button>
+  <button class="act primary" id="btnBuild">Generate cross surface</button>
+</section>
+<div class="status" id="status"></div>
+<section class="grid2"><div class="card" id="cardA"></div><div class="card" id="cardB"></div></section>
+<section class="card" id="cardC"></section>
+<section class="card" id="results"><h2>Cross surface</h2><div class="empty">Generate to build the cross surface.</div></section>
+</main>
+<script>
+const TENORS=['1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y'];
+const FIELDS=[['fwd_pts','Fwd pts'],['atm','ATM'],['rr25','25 RR'],['rr10','10 RR'],['bf25','25 BF'],['bf10','10 BF']];
+const LS='crossvol_state_v2';
+let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
+       legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M'};
+const $=id=>document.getElementById(id);
+function save(){try{localStorage.setItem(LS,JSON.stringify({...S,result:null}));}catch(e){}}
+function load(){try{const r=localStorage.getItem(LS);if(r)Object.assign(S,JSON.parse(r));}catch(e){}}
+function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+function status(msg,cls){const el=$('status');el.className='status '+(cls||'');el.textContent=msg||'';}
+function f(x,d=2){return (x===null||x===undefined||!isFinite(x))?'—':Number(x).toFixed(d);}
+function sgn(x,d=2){return (x===null||x===undefined||!isFinite(x))?'—':(x>=0?'+':'')+Number(x).toFixed(d);}
+function legCcy(p){return p.slice(3)==='USD'?p.slice(0,3):p.slice(3);}
+const RANK=['EUR','GBP','AUD','NZD','USD','CAD','CHF','NOK','SEK','DKK','PLN','CZK','HUF','ILS','TRY','ZAR','MXN','BRL','CLP','COP','CNH','CNY','HKD','SGD','TWD','KRW','INR','IDR','PHP','THB','JPY'];
+function crossName(a,b){const ca=legCcy(a),cb=legCcy(b);if(ca===cb)return null;return RANK.indexOf(ca)<RANK.indexOf(cb)?ca+cb:cb+ca;}
+async function api(path,opt){const r=await fetch(path,opt);const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j;}
+
+function segInit(){document.querySelectorAll('.seg').forEach(seg=>{const k=seg.dataset.k;
+  seg.querySelectorAll('button').forEach(b=>{b.classList.toggle('on',S[k]===b.dataset.v);
+   b.onclick=()=>{S[k]=b.dataset.v;seg.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));save();};});});}
+
+function renderLeg(which){
+  const L=S.legs[which],el=$('card'+which),pair=which==='A'?S.pairA:S.pairB;
+  if(!L){el.innerHTML='<h2>'+pair+'</h2><div class="empty">loading…</div>';return;}
+  let h='<h2>Leg '+which+' — '+L.pair+' <span class="badge '+L.source+'">'+L.source+'</span></h2>';
+  h+='<div class="meta"><label>Spot <input class="num wide" data-k="spot" value="'+L.spot+'"></label>'
+    +'<label>Fwd scale <input class="num" data-k="fwd_scale" value="'+L.fwd_scale+'"></label>'
+    +(L.asof?'<span>as of '+L.asof+'</span>':'')+'</div>';
+  h+='<div class="scroll"><table><thead><tr><th>Tenor</th>'+FIELDS.map(x=>'<th>'+x[1]+'</th>').join('')+'</tr></thead><tbody>';
+  TENORS.forEach(t=>{const r=L.rows[t];h+='<tr><td class="lab">'+t+'</td>';
+    FIELDS.forEach(([k])=>{const v=r?r[k]:'';h+='<td><input class="num" data-t="'+t+'" data-k="'+k+'" value="'+(v===null||v===undefined?'':v)+'"></td>';});
+    h+='</tr>';});
+  h+='</tbody></table></div>';
+  if(L.note)h+='<div class="note '+(L.source==='PLACEHOLDER'?'warn':'')+'">'+L.note+'</div>';
+  h+='<div class="note">RR = '+L.pair.slice(0,3)+' calls minus puts. Vols/RR/BF in vol points; fwd pts in pips (F = spot + pts / scale).</div>';
+  el.innerHTML=h;
+  el.querySelectorAll('input').forEach(inp=>inp.onchange=()=>{const v=parseFloat(inp.value);const k=inp.dataset.k;
+    if(inp.dataset.t){L.rows[inp.dataset.t]=L.rows[inp.dataset.t]||{};L.rows[inp.dataset.t][k]=isFinite(v)?v:null;}else L[k]=v;
+    inp.classList.add('dirty');save();});
+}
+
+function ovr(kind,t){const o=S.ov[kind][t];return (o!==undefined&&o!==null&&o!==''&&isFinite(o))?+o:null;}
+function realized(kind,t){const C=S.corr;if(!C)return null;
+  if(kind==='rho'){const c=C.by_tenor[t];return c&&c.rho_quoted!=null?c.rho_quoted:null;}
+  if(kind==='rs'){const c=C.vol_vol&&C.vol_vol[t];return c&&c.rho_sig!=null?c.rho_sig:null;}
+  return C.corr_vol&&C.corr_vol.value!=null?C.corr_vol.value:null;}
+function used(kind,t){const o=ovr(kind,t);return o!==null?o:realized(kind,t);}
+function usedHL(){if(S.hl_ov!=null&&isFinite(S.hl_ov)&&S.hl_ov>0)return +S.hl_ov;const C=S.corr;return (C&&C.corr_vol&&C.corr_vol.half_life)||0.5;}
+function renderCorr(){
+  const el=$('cardC'),C=S.corr;
+  let h='<h2>Correlation inputs — '+S.pairA+' vs '+S.pairB+(C?' <span class="badge '+C.source+'">'+C.source+'</span>':'')+'</h2>';
+  if(!C){el.innerHTML=h+'<div class="empty">loading…</div>';return;}
+  if(C.from)h+='<div class="meta">BDH daily closes '+C.from+' → '+C.to+' ('+C.n_obs+' obs)'
+    +(C.corr_vol&&C.corr_vol.n_blocks?' · vol of ρ from '+C.corr_vol.n_blocks+' blocks of '+C.corr_vol.block+'d (noise-corrected; raw '+f(C.corr_vol.raw,3)+')':'')+'</div>';
+  h+='<div class="scroll"><table><thead><tr><th></th><th class="grp sep" colspan="4">Spot correlation ρ (legs as quoted)</th><th class="grp sep" colspan="3">Vol-vol correlation ρσ</th><th class="grp sep" colspan="3">Vol of correlation σρ (instantaneous, abs / yr)</th></tr>'
+    +'<tr><th>Tenor</th><th class="sep">Window</th><th>Realized</th><th>Override</th><th>Used</th><th class="sep">Realized</th><th>Override</th><th>Used</th><th class="sep">Realized</th><th>Override</th><th>Used</th></tr></thead><tbody>';
+  TENORS.forEach(t=>{const c=C.by_tenor[t]||{};
+    const cell=k=>{const o=S.ov[k][t];return '<td><input class="num ovr" data-kind="'+k+'" data-t="'+t+'" value="'+(o===undefined||o===null?'':o)+'" placeholder="—"></td>';};
+    h+='<tr><td class="lab">'+t+'</td><td class="sep">'+(c.window||'')+'d</td><td>'+sgn(realized('rho',t),3)+'</td>'+cell('rho')+'<td class="hl">'+sgn(used('rho',t),3)+'</td>'
+     +'<td class="sep">'+f(realized('rs',t),3)+'</td>'+cell('rs')+'<td class="hl">'+f(used('rs',t),3)+'</td>'
+     +'<td class="sep">'+f(realized('sr',t),3)+'</td>'+cell('sr')+'<td class="hl">'+f(used('sr',t),3)+'</td></tr>';});
+  h+='</tbody></table></div>';
+  h+='<div class="note">ρ: log-return correlation of the legs as quoted; window = tenor in business days (min 21). '
+    +'ρσ: correlation of daily log-changes of the two legs\' ATM vols at that tenor (window min 63d) — drives the cross vol-of-vol, hence the cross fly. '
+    +'σρ: annualized vol of ρ itself — adds correlation risk to the cross vol-of-vol. Blank override = use realized.</div>';
+  const hlR=C.corr_vol&&C.corr_vol.half_life;
+  h+='<div class="meta" style="margin-top:8px">ρ mean-reversion half-life (yrs): realized '+(hlR?f(hlR,2):'n/a (default 0.50)')
+    +' · override <input class="num" id="hlOv" value="'+(S.hl_ov==null?'':S.hl_ov)+'" placeholder="—"> · used <b style="color:var(--text-primary)">'+f(usedHL(),2)+'</b>'
+    +' — σρ is scaled per tenor by √((1−e^(−2κT))/(2κT)), κ = ln2 / half-life</div>';
+  if(C.note)h+='<div class="note warn">'+C.note+'</div>';
+  el.innerHTML=h;
+  el.querySelectorAll('input.ovr').forEach(inp=>inp.onchange=()=>{const v=inp.value.trim();
+    S.ov[inp.dataset.kind][inp.dataset.t]=v===''?null:parseFloat(v);save();renderCorr();});
+  $('hlOv').onchange=e=>{const v=e.target.value.trim();S.hl_ov=v===''?null:parseFloat(v);save();renderCorr();};
+}
+
+async function loadLeg(which){
+  const pair=which==='A'?S.pairA:S.pairB;S.legs[which]=null;renderLeg(which);
+  try{S.legs[which]=await api('/api/surface?pair='+pair);}catch(e){status('Surface '+pair+': '+e.message,'err');}
+  renderLeg(which);save();
+}
+async function loadCorr(){S.corr=null;renderCorr();
+  try{S.corr=await api('/api/corr?a='+S.pairA+'&b='+S.pairB);}catch(e){status('Correlation: '+e.message,'err');}
+  renderCorr();save();}
+function updateCross(){const c=crossName(S.pairA,S.pairB);$('crossName').textContent=c||'same ccy';$('btnBuild').disabled=!c;}
+
+async function build(){
+  if(!S.legs.A||!S.legs.B){status('Legs not loaded','err');return;}
+  const pick=k=>{const o={};TENORS.forEach(t=>{const v=used(k,t);if(v!==null)o[t]=v;});return o;};
+  const legBody=L=>{const rows={};TENORS.forEach(t=>{const r=L.rows[t];if(r&&r.atm!==null&&isFinite(r.atm))rows[t]=r;});
+    return {pair:L.pair,spot:+L.spot,fwd_scale:+L.fwd_scale,rows};};
+  const body={legA:legBody(S.legs.A),legB:legBody(S.legs.B),rho:pick('rho'),rho_sig:pick('rs'),sig_rho:pick('sr'),rho_half_life:usedHL(),
+    usd_rate:parseFloat($('usdRate').value)||0,fly_conv:S.fly_conv,wings:S.wings,atm_anchor:S.atm_anchor,delta_mode:S.delta_mode};
+  status('Building '+crossName(S.pairA,S.pairB)+'…');$('btnBuild').disabled=true;
+  try{S.result=await api('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const R=S.result;if(!R.rows.find(r=>r.tenor===S.selTenor)&&R.rows.length)S.selTenor=R.rows[Math.min(4,R.rows.length-1)].tenor;
+    const ne=Object.keys(R.errors).length;
+    status('Built '+R.cross+' — '+R.rows.length+' tenors in '+R.secs+'s'+(ne?' · errors on '+Object.keys(R.errors).join(', '):''),ne?'warn':'');
+    renderResults();}
+  catch(e){status('Build failed: '+e.message,'err');}
+  $('btnBuild').disabled=false;
+}
+
+function renderResults(){
+  const R=S.result,el=$('results');if(!R)return;
+  const vov=R.wings==='vov';
+  let h='<h2>'+R.cross+' surface <span class="badge info">ATM '+(R.atm_anchor==='formula'?'variance formula':'raw copula')
+    +' · RR copula · wings '+(vov?'vol-of-vol (SABR)':'Gaussian copula')+' · fly input '+R.fly_conv+'</span>'
+    +'<span style="flex:1"></span><button class="act" id="btnCsv">Export CSV</button></h2>';
+  h+='<div class="meta"><span>base leg '+R.leg_base+' · quote leg '+R.leg_quote+'</span><span>'+R.sign_note+'</span>'
+    +(R.rows[0]?'<span>spot '+f(R.rows[0].S,5)+'</span><span>delta '+(R.rows[0].pa?'premium-adj':'unadjusted')+'</span>':'')+'</div>';
+  h+='<div class="scroll"><table><thead><tr><th></th><th class="grp sep" colspan="8">Cross surface</th><th class="grp sep" colspan="3">Inputs used</th><th class="grp sep" colspan="4">Vol-of-vol (SABR ν)</th><th class="grp sep" colspan="3">ATM sensitivities</th><th class="sep"></th><th></th></tr>'
+    +'<tr><th>Tenor</th><th class="sep">Fwd</th><th>ATM</th><th>25 RR</th><th>10 RR</th><th>25 BF brk</th><th>10 BF brk</th><th>25 BF sm</th><th>10 BF sm</th>'
+    +'<th class="sep">ρ</th><th>ρσ</th><th>σρ eff</th>'
+    +'<th class="sep">ν '+R.leg_base+'</th><th>ν '+R.leg_quote+'</th><th>ν cross</th><th>ρ SABR</th>'
+    +'<th class="sep">/σ '+R.leg_base+'</th><th>/σ '+R.leg_quote+'</th><th>/+0.10 ρ</th><th class="sep">Delta</th><th>Flags</th></tr></thead><tbody>';
+  R.rows.forEach(r=>{h+='<tr><td class="lab">'+r.tenor+'</td><td class="sep">'+f(r.F,5)+'</td><td class="hl">'+f(r.atm,3)+'</td><td>'+sgn(r.rr25,3)+'</td><td>'+sgn(r.rr10,3)+'</td>'
+    +'<td class="hl">'+f(r.bf25b,3)+'</td><td>'+f(r.bf10b,3)+'</td><td>'+f(r.bf25s,3)+'</td><td>'+f(r.bf10s,3)+'</td>'
+    +'<td class="sep">'+sgn(r.rho_quoted,3)+'</td><td>'+f(r.rho_sig,2)+'</td><td>'+f(r.sig_rho_eff,3)+'</td>'
+    +'<td class="sep">'+f(r.nu_a,3)+'</td><td>'+f(r.nu_b,3)+'</td><td class="hl">'+f(r.nu_x,3)+'</td><td>'+sgn(r.sabr_cross.rho,3)+'</td>'
+    +'<td class="sep">'+f(r.d_base_leg,3)+'</td><td>'+f(r.d_quote_leg,3)+'</td><td>'+sgn(r.d_rho10,3)+'</td>'
+    +'<td class="sep">'+(r.dtype==='spot'?'spot':'fwd')+(r.pa?' PA':'')+'</td>'
+    +'<td class="'+(r.flags.length?'warn':'')+'" style="text-align:left">'+(r.flags.length?'⚠ '+r.flags.join('; '):'✓')+'</td></tr>';});
+  Object.entries(R.errors).forEach(([t,e])=>{h+='<tr><td class="lab">'+t+'</td><td colspan="20" class="err" style="text-align:left">'+e+'</td></tr>';});
+  h+='</tbody></table></div>';
+  h+='<div class="note">ν cross = √[(w_A ν_A)² + (w_B ν_B)² + 2ρσ w_A ν_A w_B ν_B + (∂σ/∂ρ·σρ,eff/σ)²] with w_A + w_B = 1; σρ,eff is σρ decayed for mean reversion over the tenor. '
+    +'The cross SABR takes that ν, α set so the DNS ATM matches, and ρ set so the 25 RR matches the copula. '
+    +'Sensitivity columns are the change in cross ATM per 1 vol in each leg\'s ATM and per +0.10 in ρ.</div>';
+  if(R.calendar_flags.length)h+='<div class="note warn">Calendar: '+R.calendar_flags.join('; ')+'</div>';
+  h+='<div class="charts" style="margin-top:12px">'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Smile</b> <select id="selTenor">'+R.rows.map(r=>'<option'+(r.tenor===S.selTenor?' selected':'')+'>'+r.tenor+'</option>').join('')+'</select></div><div id="chSmile" class="chart"></div></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Vol-of-vol term structure</b> (SABR ν)</div><div id="chNu" class="chart"></div></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Skew & fly term structure</b> (broker flies)</div><div id="chSkew" class="chart"></div></div></div>';
+  h+='<details><summary>Vol-of-vol vs Gaussian copula wings</summary><div class="scroll"><table><thead><tr><th>Tenor</th><th class="grp sep" colspan="4">Vol-of-vol</th><th class="grp sep" colspan="4">Gaussian copula</th><th class="grp sep" colspan="4">(ν·σ)² parts, (vol pts/yr)²</th></tr>'
+    +'<tr><th></th><th class="sep">25 RR</th><th>10 RR</th><th>25 BF</th><th>10 BF</th><th class="sep">25 RR</th><th>10 RR</th><th>25 BF</th><th>10 BF</th><th class="sep">'+R.leg_base+'</th><th>'+R.leg_quote+'</th><th>vol-vol</th><th>corr</th></tr></thead><tbody>';
+  R.rows.forEach(r=>{const a=r.vov,b=r.cop,p=r.var_parts;h+='<tr><td class="lab">'+r.tenor+'</td><td class="sep">'+sgn(a.rr25,3)+'</td><td>'+sgn(a.rr10,3)+'</td><td>'+f(a.bf25b,3)+'</td><td>'+f(a.bf10b,3)+'</td>'
+    +'<td class="sep">'+sgn(b.rr25,3)+'</td><td>'+sgn(b.rr10,3)+'</td><td>'+f(b.bf25b,3)+'</td><td>'+f(b.bf10b,3)+'</td>'
+    +'<td class="sep">'+f(p.leg_a,2)+'</td><td>'+f(p.leg_b,2)+'</td><td>'+f(p.cross,2)+'</td><td>'+f(p.corr,2)+'</td></tr>';});
+  h+='</tbody></table></div></details>';
+  h+='<details><summary>Leg SABR fits, conventions & fly conversions</summary><div class="scroll"><table><thead><tr><th>Tenor</th><th>Leg</th><th>Delta</th><th class="sep">α</th><th>ρ</th><th>ν</th><th>max fit err</th><th class="sep">25 BF in</th><th>25 BF smile</th><th>10 BF in</th><th>10 BF smile</th><th class="sep">Cross 10P K</th><th>25P</th><th>ATM</th><th>25C</th><th>10C</th><th>secs</th></tr></thead><tbody>';
+  R.rows.forEach(r=>r.legs.forEach((l,i)=>{const p=r.pillars,sb=r.sabr_legs[i];
+    h+='<tr><td class="lab">'+(i?'':r.tenor)+'</td><td>'+l.pair+'</td><td>'+(l.dtype==='spot'?'spot':'fwd')+(l.pa?' PA':'')+'</td>'
+    +'<td class="sep">'+f(sb.alpha*100,3)+'</td><td>'+sgn(sb.rho,3)+'</td><td>'+f(sb.nu,3)+'</td><td>'+f(sb.err*100,3)+'</td>'
+    +'<td class="sep">'+f(l.bf25_in,3)+'</td><td>'+f(l.bs25,3)+'</td><td>'+f(l.bf10_in,3)+'</td><td>'+f(l.bs10,3)+'</td>'
+    +(i?'<td class="sep" colspan="6"></td>':'<td class="sep">'+f(p['10P'][0],5)+'</td><td>'+f(p['25P'][0],5)+'</td><td>'+f(p['ATM'][0],5)+'</td><td>'+f(p['25C'][0],5)+'</td><td>'+f(p['10C'][0],5)+'</td><td>'+r.secs+'</td>')+'</tr>';}));
+  h+='</tbody></table></div></details>';
+  el.innerHTML=h;
+  $('btnCsv').onclick=exportCsv;
+  $('selTenor').onchange=e=>{S.selTenor=e.target.value;drawSmile();};
+  drawSmile();drawTerms();
+}
+
+function baseLayout(ytitle){return {paper_bgcolor:css('--surface-1'),plot_bgcolor:css('--surface-1'),margin:{l:48,r:56,t:8,b:36},
+  font:{color:css('--text-secondary'),size:11},hovermode:'x unified',showlegend:true,legend:{orientation:'h',y:-0.18,x:0},
+  xaxis:{gridcolor:css('--grid'),zeroline:false,linecolor:css('--border')},yaxis:{title:{text:ytitle},gridcolor:css('--grid'),zerolinecolor:css('--border'),linecolor:css('--border')},
+  hoverlabel:{bgcolor:css('--surface-2'),bordercolor:css('--border'),font:{color:css('--text-primary')}}};}
+const CFG={displaylogo:false,responsive:true,modeBarButtonsToRemove:['lasso2d','select2d']};
+function clip(c,lo,hi){const K=[],V=[];c.K.forEach((k,i)=>{if(k>=lo&&k<=hi&&c.vol[i]!==null){K.push(k);V.push(c.vol[i]);}});return {K,V};}
+function drawSmile(){
+  if(typeof Plotly==='undefined'){$('chSmile').innerHTML='<div class="empty">Plotly failed to load (offline?)</div>';return;}
+  const R=S.result,r=R.rows.find(x=>x.tenor===S.selTenor);if(!r)return;
+  const labs=['10P','25P','ATM','25C','10C'];
+  const kp=labs.map(l=>r.pillars[l][0]),pad=0.45*(kp[4]-kp[0]),lo=kp[0]-pad,hi=kp[4]+pad;
+  const main=R.wings==='vov'?clip(r.curve,lo,hi):clip(r.curve_cop,lo,hi),alt=R.wings==='vov'?clip(r.curve_cop,lo,hi):clip(r.curve,lo,hi);
+  const nMain=R.wings==='vov'?'Vol-of-vol':'Copula',nAlt=R.wings==='vov'?'Gaussian copula':'Vol-of-vol';
+  const tr=[{x:main.K,y:main.V,mode:'lines',name:nMain,line:{color:css('--s1'),width:2},hovertemplate:'K %{x:.5f}<br>%{y:.3f}<extra>'+nMain+'</extra>'},
+    {x:alt.K,y:alt.V,mode:'lines',name:nAlt,line:{color:css('--s2'),width:2},hovertemplate:'K %{x:.5f}<br>%{y:.3f}<extra>'+nAlt+'</extra>'},
+    {x:kp,y:labs.map(l=>r.pillars[l][1]),mode:'markers+text',text:labs,textposition:'top center',cliponaxis:false,textfont:{color:css('--text-secondary'),size:10},
+     name:'Pillars',marker:{color:css('--s1'),size:9,line:{color:css('--surface-1'),width:2}},hovertemplate:'%{text} K %{x:.5f}<br>%{y:.3f}<extra></extra>'},
+    {x:[lo,hi],y:[r.atm_formula,r.atm_formula],mode:'lines',name:'Formula ATM',line:{color:css('--ref'),width:1.5,dash:'dash'},hoverinfo:'skip'}];
+  const L=baseLayout('vol');L.hovermode='closest';L.xaxis.title={text:'strike'};L.xaxis.range=[lo,hi];L.margin.r=20;
+  Plotly.react('chSmile',tr,L,CFG);
+}
+function endLabel(x,y,name){return {x:[x[x.length-1]],y:[y[y.length-1]],mode:'text',text:[name],textposition:'middle right',cliponaxis:false,
+  textfont:{color:css('--text-secondary'),size:10},showlegend:false,hoverinfo:'skip'};}
+function drawTerms(){
+  if(typeof Plotly==='undefined')return;
+  const R=S.result,x=R.rows.map(r=>r.tenor);
+  const nus=[['nu_a',R.leg_base,'--s2'],['nu_b',R.leg_quote,'--s3'],['nu_x',R.cross,'--s1']];
+  const t1=[];nus.forEach(([k,n,c])=>{const y=R.rows.map(r=>r[k]);t1.push({x,y,mode:'lines+markers',name:n,line:{color:css(c),width:2},marker:{size:8},hovertemplate:'%{y:.3f}'});});
+  const L1=baseLayout('ν (vol of vol)');L1.xaxis.type='category';L1.margin.r=20;Plotly.react('chNu',t1,L1,CFG);
+  const ser=[['rr25','25 RR','--s1'],['rr10','10 RR','--s2'],['bf25b','25 BF','--s3'],['bf10b','10 BF','--s4']];
+  const t2=[];ser.forEach(([k,n,c])=>{const y=R.rows.map(r=>r[k]);t2.push({x,y,mode:'lines+markers',name:n,line:{color:css(c),width:2},marker:{size:8},hovertemplate:'%{y:.3f}'});t2.push(endLabel(x,y,n));});
+  const L2=baseLayout('vol pts');L2.xaxis.type='category';L2.yaxis.zerolinecolor=css('--text-muted');Plotly.react('chSkew',t2,L2,CFG);
+}
+function exportCsv(){
+  const R=S.result;const cols=['tenor','F','atm','rr25','rr10','bf25b','bf10b','bf25s','bf10s','rho_quoted','rho_sig','sig_rho','sig_rho_eff','nu_a','nu_b','nu_x','atm_formula','atm_raw_copula','d_base_leg','d_quote_leg','d_rho10'];
+  const lines=[cols.join(',')].concat(R.rows.map(r=>cols.map(c=>r[c]).join(',')));
+  const blob=new Blob([lines.join('\n')],{type:'text/csv'});const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);a.download=R.cross+'_cross_surface_'+new Date().toISOString().slice(0,10)+'.csv';a.click();
+}
+
+async function init(){
+  load();
+  const st=await api('/api/status').catch(()=>({bbg:false,pairs:['EURUSD','USDCAD'],error:'server unreachable'}));
+  $('bbgDot').className='dot '+(st.bbg?'ok':'bad');$('bbgTxt').textContent=st.bbg?'Bloomberg connected':'Bloomberg offline — placeholders';
+  if(!st.bbg&&st.error)$('bbgTxt').title=st.error;
+  ['pairA','pairB'].forEach(id=>{$(id).innerHTML=st.pairs.map(p=>'<option>'+p+'</option>').join('');$(id).value=S[id];
+    $(id).onchange=async e=>{S[id]=e.target.value;S.ov={rho:{},rs:{},sr:{}};updateCross();save();await Promise.all([loadLeg(id==='pairA'?'A':'B'),loadCorr()]);};});
+  $('usdRate').value=S.usd_rate;$('usdRate').onchange=e=>{S.usd_rate=parseFloat(e.target.value)||0;save();};
+  segInit();updateCross();
+  $('btnPull').onclick=()=>Promise.all([loadLeg('A'),loadLeg('B')]);
+  $('btnCorr').onclick=loadCorr;$('btnBuild').onclick=build;
+  if(S.legs.A&&S.legs.A.pair===S.pairA)renderLeg('A');else loadLeg('A');
+  if(S.legs.B&&S.legs.B.pair===S.pairB)renderLeg('B');else loadLeg('B');
+  if(S.corr&&S.corr.vol_vol)renderCorr();else loadCorr();
+}
+init();
+</script></body></html>"""
+
+
+
+# ######################################################################
+#                              SELF-TEST
+# ######################################################################
+def selftest():
+    """python cross_vol.py --selftest   — numerical checks with the numbers they compare."""
+    T0 = date(2026, 10, 21)
+    results = []
+
+    def check(name, ok, detail=''):
+        results.append(bool(ok))
+        print(f"  [{'OK ' if ok else 'FAIL'}] {name} {detail}")
+
+    def rows_flat(atm, pts=0.0, tenors=TENORS):
+        return {t: {'fwd_pts': pts, 'atm': atm, 'rr25': 0.0, 'rr10': 0.0, 'bf25': 0.0, 'bf10': 0.0} for t in tenors}
+
+    print('\n1) Lognormal limit: flat smiles -> flat cross, ATM = variance formula (both wing models)')
+    A = {'pair': 'EURUSD', 'spot': 1.08, 'fwd_scale': 10000, 'rows': rows_flat(7.5, 20)}
+    B = {'pair': 'USDCAD', 'spot': 1.37, 'fwd_scale': 10000, 'rows': rows_flat(6.0, -15)}
+    for wings in ('copula', 'vov'):
+        s = build_surface(A, B, {t: -0.45 for t in TENORS}, fly_conv='smile', atm_anchor='copula',
+                          tenors=['1M', '1Y', '2Y'], today=T0, wings=wings)
+        for r in s['tenors']:
+            v = r['res']
+            check(f"{wings:6} {r['tenor']:>2} ATM {v['atm']*100:.4f} vs formula {r['formula']['atm']*100:.4f}, flat smile",
+                  abs(v['atm'] - r['formula']['atm']) < 3e-4 and
+                  max(abs(v['rr25']), abs(v['bf25s']), abs(v['rr10']), abs(v['bf10s'])) < 3e-4,
+                  f"(RR25 {v['rr25']*100:+.4f} BF25 {v['bf25s']*100:+.4f})")
+    print(f"   hand calc sqrt(7.5^2 + 6^2 + 2(-0.45)(7.5)(6)) = {math.sqrt(51.75):.4f}")
+
+    print('\n2) Leg smile survives the USD-measure change (reprice pillars from the marginal)')
+    for pair, S0, pts, q in [('USDCAD', 1.37, -40, dict(atm=0.060, rr25=0.006, rr10=0.011, bf25=0.0025, bf10=0.008)),
+                             ('EURUSD', 1.08, 60, dict(atm=0.075, rr25=-0.004, rr10=-0.007, bf25=0.0020, bf10=0.0065))]:
+        Tt = tenor_to_T('6M', T0)
+        F = S0 + pts / 1e4
+        leg = build_leg(pair, S0, F, Tt, q, math.exp(-0.04 * Tt), 'smile')
+        M = Marginal(leg)
+        z = np.linspace(-9, 9, 200001)
+        w = npdf(z) * (z[1] - z[0])
+        Y = M.Q(z)
+        worst = 0.0
+        for lab, (K, vin) in leg['pillars'].items():
+            if leg['orient'] < 0:
+                c, p = F * np.sum(w * np.maximum(1 - K * Y, 0)), F * np.sum(w * np.maximum(K * Y - 1, 0))
+            else:
+                c, p = np.sum(w * np.maximum(Y - K, 0)), np.sum(w * np.maximum(K - Y, 0))
+            iv = implied_vol(c, F, K, Tt, 1) if K >= F else implied_vol(p, F, K, Tt, -1)
+            worst = max(worst, abs(iv - vin))
+        check(f'{pair} pillars recovered', worst < 5e-4, f'(worst {worst*100:.4f} vol)')
+
+    print('\n3) Broker <-> smile fly')
+    Tt = tenor_to_T('3M', T0)
+    q = dict(atm=0.075, rr25=-0.010, rr10=-0.019, bf25=0.0030, bf10=0.0095)
+    leg = build_leg('EURUSD', 1.08, 1.0830, Tt, q, math.exp(-0.04 * Tt), 'broker')
+    b25 = broker_fly_from_smile(leg['smile'], 1.0830, Tt, q['atm'], 0.25, leg['pa'], leg['dfb'])
+    b10 = broker_fly_from_smile(leg['smile'], 1.0830, Tt, q['atm'], 0.10, leg['pa'], leg['dfb'])
+    check('round trip', abs(b25 - q['bf25']) < 1e-6 and abs(b10 - q['bf10']) < 1e-6,
+          f"(0.300/0.950 -> smile {leg['bs25']*100:.3f}/{leg['bs10']*100:.3f} -> {b25*100:.4f}/{b10*100:.4f})")
+    check('smile fly > broker fly when RR != 0', leg['bs25'] > q['bf25'])
+    leg0 = build_leg('EURUSD', 1.08, 1.0830, Tt, dict(q, rr25=0.0, rr10=0.0), math.exp(-0.04 * Tt), 'broker')
+    check('smile fly = broker fly when RR = 0', abs(leg0['bs25'] - q['bf25']) < 2e-5)
+
+    print('\n4) Leg order, forward, JPY orientation')
+    A = {'pair': 'EURUSD', 'spot': 1.08, 'fwd_scale': 10000,
+         'rows': {'3M': dict(fwd_pts=28, atm=7.5, rr25=-0.80, rr10=-1.45, bf25=0.25, bf10=0.85)}}
+    B = {'pair': 'USDCAD', 'spot': 1.37, 'fwd_scale': 10000,
+         'rows': {'3M': dict(fwd_pts=-36, atm=6.0, rr25=0.55, rr10=1.00, bf25=0.22, bf10=0.72)}}
+    s1 = build_surface(A, B, {'3M': -0.45}, today=T0, rho_sig_by_tenor={'3M': 0.5})
+    s2 = build_surface(B, A, {'3M': -0.45}, today=T0, rho_sig_by_tenor={'3M': 0.5})
+    d = max(abs(s1['tenors'][0]['res'][k] - s2['tenors'][0]['res'][k]) for k in ('atm', 'rr25', 'bf25b', 'bf10b'))
+    check('leg order irrelevant', d < 1e-9, f'(max diff {d:.1e})')
+    check('cross forward = F_EURUSD x F_USDCAD', abs(s1['tenors'][0]['F'] - 1.0828 * 1.3664) < 1e-12)
+    J = {'pair': 'USDJPY', 'spot': 150.0, 'fwd_scale': 100, 'rows': rows_flat(9.5, -120, ['3M'])}
+    for X, rq, name in [({'pair': 'EURUSD', 'spot': 1.08, 'fwd_scale': 10000, 'rows': rows_flat(7.5, 28, ['3M'])}, -0.30, 'EURJPY'),
+                        ({'pair': 'USDCAD', 'spot': 1.37, 'fwd_scale': 10000, 'rows': rows_flat(6.0, -36, ['3M'])}, 0.25, 'CADJPY')]:
+        s = build_surface(X, J, {'3M': rq}, fly_conv='smile', today=T0)
+        sA, sB = leg_info(s['leg_base'])[1], leg_info(s['leg_quote'])[1]
+        hand = math.sqrt(X['rows']['3M']['atm'] ** 2 + 9.5 ** 2 - 2 * sA * sB * rq * X['rows']['3M']['atm'] * 9.5)
+        check(f'{name} name & ATM', s['cross'] == name and abs(s['tenors'][0]['res']['atm'] * 100 - hand) < 0.02,
+              f"({s['tenors'][0]['res']['atm']*100:.3f} vs {hand:.3f})")
+
+    print('\n5) SABR fit recovers known parameters from 5 delta pillars')
+    Tt = tenor_to_T('3M', T0)
+    F = 1.0830
+    true = (0.075, -0.25, 1.10)
+    sm = sabr_smile(F, Tt, *true, 0.075)
+    Ks, vs = [], []
+    for d_, cp in ((0.10, -1), (0.25, -1), (0.25, 1), (0.10, 1)):
+        k, v = delta_strike_on_smile(sm, F, Tt, d_, cp, False, 1.0, 0.075 * math.sqrt(Tt))
+        Ks.append(F * math.exp(k))
+        vs.append(v)
+    ka, va = dns_self_consistent(sm, Tt, False)
+    Ks.insert(2, F * math.exp(ka))
+    vs.insert(2, va)
+    fit = fit_sabr(F, Tt, Ks, vs)
+    check('SABR (alpha, rho, nu) recovered', abs(fit['alpha'] - true[0]) < 2e-4 and abs(fit['rho'] - true[1]) < 0.01
+          and abs(fit['nu'] - true[2]) < 0.01,
+          f"(fit {fit['alpha']*100:.3f}/{fit['rho']:+.3f}/{fit['nu']:.3f} vs 7.500/-0.250/1.100)")
+
+    print('\n6) Vol-of-vol propagation identities')
+    p = propagate_vov(0.075, 0.060, 0.45, 1.08, 1.13, 1.0, 0.0)
+    wavg = p['w_a'] * 1.08 + p['w_b'] * 1.13
+    check('weights sum to 1', abs(p['w_a'] + p['w_b'] - 1) < 1e-12, f"({p['w_a']:.4f} + {p['w_b']:.4f})")
+    check('rho_sig = 1, no corr vol -> nu_X = weighted average', abs(p['nu_x'] - wavg) < 1e-12,
+          f"({p['nu_x']:.4f} vs {wavg:.4f})")
+    p0 = propagate_vov(0.075, 0.060, 0.45, 1.08, 1.13, 0.3, 0.0)
+    p1 = propagate_vov(0.075, 0.060, 0.45, 1.08, 1.13, 0.3, 0.25)
+    check('nu_X rises with vol-vol corr and with corr vol', p0['nu_x'] < p['nu_x'] and p1['nu_x'] > p0['nu_x'],
+          f"({p0['nu_x']:.3f} -> {p['nu_x']:.3f}; +corr vol {p1['nu_x']:.3f})")
+
+    print('\n7) Cross SABR hits its ATM and 25 RR targets; fly rises with vol-vol corr')
+    xs = cross_sabr(1.4887, Tt, 0.07192, 0.97, -0.00195, True, 1.0)
+    pv = smile_pillars(xs['smile'], 1.4887, Tt, True, 1.0)
+    check('ATM & RR25 matched', abs(pv['atm'] - 0.07192) < 2e-5 and abs(pv['rr25'] + 0.00195) < 2e-5,
+          f"(ATM {pv['atm']*100:.4f}, RR25 {pv['rr25']*100:+.4f}, rho {xs['rho']:+.3f})")
+    flies = []
+    for rs in (0.3, 0.6, 0.9):
+        s = build_surface(A, B, {'3M': -0.45}, today=T0, rho_sig_by_tenor={'3M': rs})
+        flies.append(s['tenors'][0]['res']['bf25b'] * 100)
+    cop = s['tenors'][0]['res_copula']['bf25b'] * 100
+    check('25 BF increasing in rho_sig and above Gaussian copula', flies[0] < flies[1] < flies[2] and flies[0] > cop,
+          f"(rho_sig .3/.6/.9 -> {flies[0]:.3f}/{flies[1]:.3f}/{flies[2]:.3f}; copula {cop:.3f})")
+
+    print('\n8) Realized estimators')
+    rng = np.random.default_rng(7)
+    n = 756
+    z1, z2 = rng.standard_normal(n), rng.standard_normal(n)
+    eur = 1.08 * np.exp(np.concatenate([[0], np.cumsum(0.0047 * z1)]))
+    usdcad = 1.37 * np.exp(-np.concatenate([[0], np.cumsum(0.0038 * (0.45 * z1 + math.sqrt(1 - 0.45 ** 2) * z2))]))
+    rc = realized_corr(eur, usdcad, 'EURUSD', 'USDCAD')
+    zz = z1[-504:]
+    exact = np.corrcoef(zz, 0.45 * zz + math.sqrt(1 - 0.45 ** 2) * z2[-504:])[0, 1]   # sample corr of the shocks
+    check('spot rho = exact sample corr, quoted sign flipped for USDCAD',
+          abs(rc['2Y']['rho_y'] - exact) < 1e-10 and abs(rc['2Y']['rho_quoted'] + exact) < 1e-10,
+          f"(rho_Y {rc['2Y']['rho_y']:+.4f} vs shocks {exact:+.4f}; quoted {rc['2Y']['rho_quoted']:+.4f})")
+    cv_const = corr_vol(eur, usdcad)
+    regime = np.where((np.arange(n) // 63) % 2 == 0, 0.15, 0.75)
+    usdcad2 = 1.37 * np.exp(-np.concatenate([[0], np.cumsum(0.0038 * (regime * z1 + np.sqrt(1 - regime ** 2) * z2))]))
+    cv_reg = corr_vol(eur, usdcad2)
+    check('corr vol ~0 for constant rho, clearly >0 with regime switches',
+          cv_const['value'] < 0.25 and cv_reg['value'] > cv_const['value'] + 0.4,
+          f"(constant {cv_const['value']:.3f} [raw {cv_const['raw']:.3f}], regimes {cv_reg['value']:.3f})")
+    va = 7.5 * np.exp(np.concatenate([[0], np.cumsum(0.05 * z1)]))
+    vb = 6.0 * np.exp(np.concatenate([[0], np.cumsum(0.05 * (0.6 * z1 + 0.8 * z2))]))
+    r_, m_ = vol_vol_corr(va, vb, 252)
+    exact = np.corrcoef(z1[-252:], 0.6 * z1[-252:] + 0.8 * z2[-252:])[0, 1]
+    check('vol-vol corr = exact sample corr of vol shocks', abs(r_ - exact) < 1e-10,
+          f'({r_:.4f} vs {exact:.4f} over {m_}d; population 0.60)')
+
+    print('\n8b) Correlation mean reversion')
+    hl = 0.5
+    k = math.log(2) / hl
+    check('OU factor: ->1 short, exact at 2Y', abs(ou_factor(1 / 52, hl) - 1) < 0.02 and
+          abs(ou_factor(2.0, hl) - math.sqrt((1 - math.exp(-4 * k)) / (4 * k))) < 1e-12,
+          f"(1W {ou_factor(1/52, hl):.4f}, 3M {ou_factor(0.25, hl):.4f}, 2Y {ou_factor(2.0, hl):.4f})")
+    blk = 21
+    phi_true = 0.5 ** (blk / 252 / 0.5)                       # 6M half-life
+    hls = []
+    for seed in range(25):
+        rng2 = np.random.default_rng(100 + seed)
+        nb = 160
+        lv = [0.45]
+        for _ in range(nb - 1):
+            lv.append(0.45 + phi_true * (lv[-1] - 0.45) + 0.10 * rng2.standard_normal())
+        rp = np.repeat(np.clip(np.array(lv), -0.95, 0.95), blk)
+        g1, g2 = rng2.standard_normal(nb * blk), rng2.standard_normal(nb * blk)
+        sa_ = 1.08 * np.exp(np.concatenate([[0], np.cumsum(0.005 * g1)]))
+        sb_ = 1.37 * np.exp(-np.concatenate([[0], np.cumsum(0.004 * (rp * g1 + np.sqrt(1 - rp ** 2) * g2))]))
+        hls.append(corr_vol(sa_, sb_)['half_life'] or 0.0)
+    hls = np.array(hls)
+    check('half-life estimator centred on truth (25 paths, true 0.50y)', 0.38 < np.median(hls) < 0.65,
+          f"(median {np.median(hls):.2f}y, 10-90% {np.percentile(hls, 10):.2f}-{np.percentile(hls, 90):.2f}y: noisy, hence the override)")
+    s = build_surface(placeholder_surface('AUDUSD'), placeholder_surface('NZDUSD'), {t: 0.85 for t in TENORS},
+                      rho_sig_by_tenor={t: 0.6 for t in TENORS}, sig_rho_by_tenor={t: 0.2 for t in TENORS},
+                      rho_half_life=0.5, today=T0)
+    r2 = s['tenors'][-1]
+    legs_bf = max(placeholder_surface('AUDUSD')['rows']['2Y']['bf25'], placeholder_surface('NZDUSD')['rows']['2Y']['bf25'])
+    check('AUDNZD builds every tenor; 2Y fly no longer explodes', not s['errors'] and r2['res']['bf25b'] * 100 < 1.3 * legs_bf,
+          f"(2Y 25BF {r2['res']['bf25b']*100:.3f} vs legs {legs_bf:.3f}; nu_X {r2['vov']['nu_x']:.3f})")
+
+    print('\n9) Full 10-tenor build on placeholder legs')
+    t0 = time.time()
+    s = build_surface(placeholder_surface('EURUSD'), placeholder_surface('USDCAD'), {t: -0.45 for t in TENORS},
+                      rho_sig_by_tenor={t: 0.5 for t in TENORS}, today=T0)
+    el = time.time() - t0
+    r3 = [r for r in s['tenors'] if r['tenor'] == '3M'][0]
+    print(f"   3M: ATM {r3['res']['atm']*100:.3f}  RR25 {r3['res']['rr25']*100:+.3f}  25BF {r3['res']['bf25b']*100:.3f}"
+          f"  nu_X {r3['vov']['nu_x']:.3f}  (prototype: 7.192 / -0.195 / 0.130 / 0.971)")
+    check('no errors, no calendar flags', not s['errors'] and not s['calendar_flags'], str(s['errors']))
+    check('3M matches prototype', abs(r3['res']['bf25b'] * 100 - 0.130) < 0.004 and abs(r3['vov']['nu_x'] - 0.971) < 0.01)
+    check(f'speed ({el:.1f}s for 10 tenors)', el < 20)
+
+    print(f"\n{sum(results)}/{len(results)} checks passed")
+    return all(results)
+
+
+# ######################################################################
+#                                 MAIN
+# ######################################################################
+def main():
+    ap = argparse.ArgumentParser(description='Cross Vol Builder')
+    ap.add_argument('--port', type=int, default=8090)
+    ap.add_argument('--no-browser', action='store_true')
+    ap.add_argument('--selftest', action='store_true', help='run the numerical checks and exit')
+    args = ap.parse_args()
+    if args.selftest:
+        raise SystemExit(0 if selftest() else 1)
+    srv = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
+    url = f'http://localhost:{args.port}'
+    log(f'Cross Vol Builder on {url}  (Bloomberg: {"available" if BB.available() else "offline — " + BB.last_error})')
+    if not args.no_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        log('shutting down')
+
+
+if __name__ == '__main__':
+    main()
