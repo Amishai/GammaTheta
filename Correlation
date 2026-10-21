@@ -45,6 +45,7 @@ import threading
 import time
 import traceback
 import webbrowser
+import zlib
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -64,9 +65,21 @@ except ImportError:
 # ######################################################################
 BBG_HOST, BBG_PORT = 'localhost', 8194
 LEG_PAIRS = ['EURUSD', 'GBPUSD', 'AUDUSD', 'NZDUSD', 'USDCAD', 'USDJPY', 'USDCHF',
-             'USDSEK', 'USDNOK', 'USDMXN', 'USDZAR', 'USDCNH', 'USDSGD']
+             'USDSEK', 'USDNOK', 'USDMXN', 'USDBRL', 'USDCLP', 'USDZAR', 'USDILS',
+             'USDCNH', 'USDSGD']
 FWD_TENOR_SUFFIX = {'1Y': '12M'}            # vol ticker tenor -> fwd-points ticker tenor
-FWD_PREFIX_OVERRIDE = {}                     # e.g. {'KRW': 'KWN'} if your fwd tickers differ
+# Forward tickers per currency, tried in order; the first that returns data wins.
+#   'points'   -> value is forward points (F = spot + pts / scale)
+#   'outright' -> value is the forward rate itself (NDF tickers)
+# Anything not listed uses [(<CCY>, 'points')], e.g. EUR3M Curncy.
+# BRL / CLP are NDFs: BCN / CHN are Bloomberg's NDF outright tickers. Edit if your terminal differs.
+FWD_TICKERS = {
+    'BRL': [('BCN', 'outright'), ('BRL', 'points')],
+    'CLP': [('CHN', 'outright'), ('CLP', 'points')],
+    'KRW': [('KWN', 'outright'), ('KRW', 'points')],
+    'TWD': [('NTN', 'outright'), ('TWD', 'points')],
+    'INR': [('IRN', 'outright'), ('INR', 'points')],
+}
 CORR_HISTORY_YEARS = 3
 
 # ---- PLACEHOLDERS (not market data) — used only when Bloomberg is unavailable
@@ -78,17 +91,21 @@ PLACEHOLDER_SURF = {
     'USDCHF': (0.8600, 7.0, 7.6, -0.60, 0.30), 'USDSEK': (10.500, 9.0, 9.6, 0.60, 0.30),
     'USDNOK': (10.800, 10.0, 10.5, 0.90, 0.30), 'USDMXN': (18.500, 11.0, 13.0, 2.50, 0.45),
     'USDZAR': (18.000, 13.5, 15.0, 2.20, 0.45), 'USDCNH': (7.1500, 4.0, 5.2, 0.90, 0.30),
-    'USDSGD': (1.3000, 4.5, 5.2, 0.40, 0.20)}
+    'USDSGD': (1.3000, 4.5, 5.2, 0.40, 0.20), 'USDBRL': (5.4000, 13.0, 15.0, 2.80, 0.45),
+    'USDCLP': (950.00, 11.0, 12.5, 2.00, 0.40), 'USDILS': (3.7000, 8.5, 9.5, 1.20, 0.35)}
 PLACEHOLDER_RATES = {'USD': 4.0, 'EUR': 2.0, 'GBP': 3.9, 'AUD': 3.6, 'NZD': 3.0, 'CAD': 2.6,
                      'JPY': 0.6, 'CHF': 0.0, 'SEK': 1.9, 'NOK': 4.0, 'MXN': 7.5, 'ZAR': 7.0,
-                     'CNH': 1.6, 'SGD': 1.8}
+                     'CNH': 1.6, 'SGD': 1.8, 'BRL': 14.5, 'CLP': 4.75, 'ILS': 4.25}
 PLACEHOLDER_RHO = {  # correlation of the legs AS QUOTED
     ('EURUSD', 'GBPUSD'): 0.65, ('EURUSD', 'USDCAD'): -0.45, ('EURUSD', 'USDJPY'): -0.35,
     ('EURUSD', 'AUDUSD'): 0.55, ('EURUSD', 'USDCHF'): -0.85, ('EURUSD', 'NZDUSD'): 0.50,
     ('GBPUSD', 'USDJPY'): -0.25, ('GBPUSD', 'USDCAD'): -0.40, ('AUDUSD', 'USDJPY'): -0.15,
     ('AUDUSD', 'NZDUSD'): 0.85, ('AUDUSD', 'USDCAD'): -0.60, ('USDCAD', 'USDJPY'): 0.25,
     ('USDCHF', 'USDJPY'): 0.55, ('USDSEK', 'USDNOK'): 0.70, ('EURUSD', 'USDSEK'): -0.75,
-    ('EURUSD', 'USDNOK'): -0.65, ('USDMXN', 'USDZAR'): 0.55, ('USDCAD', 'USDMXN'): 0.45}
+    ('EURUSD', 'USDNOK'): -0.65, ('USDMXN', 'USDZAR'): 0.55, ('USDCAD', 'USDMXN'): 0.45,
+    ('USDBRL', 'USDMXN'): 0.60, ('USDBRL', 'USDCLP'): 0.55, ('USDCLP', 'USDMXN'): 0.50,
+    ('EURUSD', 'USDMXN'): -0.30, ('EURUSD', 'USDBRL'): -0.25, ('EURUSD', 'USDCLP'): -0.35,
+    ('EURUSD', 'USDILS'): -0.35, ('USDILS', 'USDJPY'): 0.15, ('AUDUSD', 'USDCLP'): -0.45}
 PLACEHOLDER_VOL_VOL_CORR = 0.60
 PLACEHOLDER_CORR_VOL = 0.20
 PLACEHOLDER_RHO_HALF_LIFE = 0.5      # years
@@ -796,7 +813,7 @@ def build_surface(legA_in, legB_in, rho_quoted_by_tenor, usd_rate=0.04, fly_conv
                 bad = [k for k, v in q.items() if not math.isfinite(v)]
                 if not (math.isfinite(S) and S > 0):
                     raise ValueError(f"{L['pair']} spot {S} is not a positive number")
-                if not (math.isfinite(F) and F > 0) or abs(F / S - 1) > 0.5:
+                if not (math.isfinite(F) and F > 0) or abs(math.log(F / S)) > 0.4 + 0.5 * T:
                     raise ValueError(f"{L['pair']} {t} forward {F:.6g} vs spot {S:.6g} is implausible "
                                      f"(fwd pts {r.get('fwd_pts')}, scale {scale:g}) - check fwd points / scale")
                 if bad or q['atm'] <= 0:
@@ -895,6 +912,180 @@ def corr_vol(px_a, px_b, block=21):
         half_life = min(max(math.log(2) / (-math.log(phi) / (block / 252)), 1 / 12), 3.0)
     return {'value': math.sqrt(true * 252 / block), 'raw': math.sqrt(raw * 252 / block),
             'n_blocks': nb, 'block': block, 'half_life': half_life}
+
+
+# ======================================================================
+# Implied correlation + correlation-trade analytics
+# ----------------------------------------------------------------------
+# Trading convention for these analytics: rho_Y = correlation of the two currencies' moves
+# vs USD, i.e. the rho in  sX^2 = sA^2 + sB^2 - 2 rho_Y sA sB.
+#   LONG correlation  = long rho_Y  = short cross vol, long leg vols (vega-neutral)
+#                     = wins if realized rho_Y over the option's life ends ABOVE implied.
+# (For EURCAD: rho_Y = corr(EUR vs USD, CAD vs USD) = -corr(EURUSD, USDCAD as quoted).)
+# ======================================================================
+TENOR_BDAYS = {'1W': 5, '2W': 10, '1M': 21, '2M': 42, '3M': 63, '6M': 126, '9M': 189,
+               '1Y': 252, '18M': 378, '2Y': 504}
+
+
+def implied_rho_y(sa, sb, sx):
+    """Invert the variance formula: rho_Y implied by three ATM vols."""
+    return (sa * sa + sb * sb - sx * sx) / (2 * sa * sb)
+
+
+def rolling_corr(a, b, n):
+    """Correlation of a[i-n:i], b[i-n:i] for every i (NaN until n points). O(len) via cumsums."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    c = lambda x: np.concatenate([[0.0], np.cumsum(x)])
+    sa, sb, saa, sbb, sab = c(a), c(b), c(a * a), c(b * b), c(a * b)
+    out = np.full(len(a) + 1, np.nan)
+    i = np.arange(n, len(a) + 1)
+    ma, mb = (sa[i] - sa[i - n]) / n, (sb[i] - sb[i - n]) / n
+    va = (saa[i] - saa[i - n]) / n - ma * ma
+    vb = (sbb[i] - sbb[i - n]) / n - mb * mb
+    cv = (sab[i] - sab[i - n]) / n - ma * mb
+    with np.errstate(invalid='ignore', divide='ignore'):
+        out[i] = cv / np.sqrt(va * vb)
+    return out          # out[i] uses returns 0..i-1 (i.e. the n returns ending at observation i)
+
+
+def corr_history(dates, spot_a, spot_b, vol_a, vol_b, vol_x, pair_a, pair_b, tenor):
+    """Daily series (aligned dates) -> implied rho_Y, trailing realized, subsequent realized.
+    trailing[t] = realized over the N returns ending at t (what you knew)
+    forward[t]  = realized over the N returns after t (what the option actually lived through)."""
+    n = TENOR_BDAYS[tenor]
+    sA, sB = leg_info(pair_a)[1], leg_info(pair_b)[1]
+    ra = sA * np.diff(np.log(np.asarray(spot_a, float)))     # returns of Y_A (USD value of ccy A)
+    rb = sB * np.diff(np.log(np.asarray(spot_b, float)))
+    va, vb, vx = (np.asarray(v, float) for v in (vol_a, vol_b, vol_x))
+    implied = implied_rho_y(va, vb, vx)
+    m = max(n, 5)
+    rc = rolling_corr(ra, rb, m)                             # length len(dates)
+    trailing = rc.copy()
+    forward = np.full(len(dates), np.nan)
+    forward[:len(dates) - m] = rc[m:]                         # realized over (t, t+m]
+    return {'dates': list(dates), 'implied': implied, 'trailing': trailing, 'forward': forward,
+            'vol_a': va, 'vol_b': vb, 'vol_x': vx, 'n': m, 'tenor': tenor}
+
+
+def _pct(x, arr):
+    arr = arr[np.isfinite(arr)]
+    return float(np.mean(arr <= x) * 100) if len(arr) and math.isfinite(x) else None
+
+
+def _stats(x):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return None
+    sd = float(np.std(x, ddof=1)) if len(x) > 1 else 0.0
+    return {'n': int(len(x)), 'mean': float(np.mean(x)), 'median': float(np.median(x)), 'std': sd,
+            'p10': float(np.percentile(x, 10)), 'p90': float(np.percentile(x, 90)),
+            'min': float(np.min(x)), 'max': float(np.max(x)),
+            't': float(np.mean(x) / (sd / math.sqrt(len(x)))) if sd > 0 and len(x) > 1 else None,
+            'hit': float(np.mean(x > 0) * 100)}
+
+
+def corr_trade_stats(h):
+    """Everything the long/short-correlation decision needs, from corr_history output."""
+    imp, tr, fw, n = h['implied'], h['trailing'], h['forward'], h['n']
+    va, vb, vx = h['vol_a'], h['vol_b'], h['vol_x']
+    ok_now = np.where(np.isfinite(imp) & np.isfinite(tr))[0]
+    if len(ok_now) == 0:
+        return {'error': 'no overlapping implied / realized history'}
+    i0 = ok_now[-1]
+    imp_now, tr_now = float(imp[i0]), float(tr[i0])
+    spread_now = imp_now - tr_now
+    spread_hist = imp - tr
+    imp_ok = imp[np.isfinite(imp)]
+
+    # premium: implied minus what subsequently realized (rho points)
+    prem = imp - fw
+    # non-overlapping hold-to-expiry entries (one every n days), latest-first so the most recent
+    # completed trade is always included
+    valid = np.where(np.isfinite(imp) & np.isfinite(fw))[0]
+    entries = valid[::-1][::n][::-1]
+    long_rho = fw[entries] - imp[entries]                    # correlation-swap style P&L of long rho_Y
+    # cross-vol equivalent: long rho_Y = short cross vol; d sigma_X / d rho_Y = -sA sB / sX
+    dvol = (va * vb / vx)[entries]
+    long_vol = long_rho * dvol                                # cross vol points earned per unit vega
+
+    # conditional: days whose implied-trailing spread was at least as extreme as today's
+    both = np.isfinite(imp) & np.isfinite(tr) & np.isfinite(fw)
+    if spread_now >= 0:
+        mask = both & (spread_hist >= spread_now)
+    else:
+        mask = both & (spread_hist <= spread_now)
+    cond_n = int(mask.sum())
+    cond = None
+    if cond_n:
+        cond = {'n': cond_n, 'short_hit': float(np.mean(fw[mask] < imp[mask]) * 100),
+                'mean_prem': float(np.mean(imp[mask] - fw[mask])),
+                'eff_n': max(1, cond_n // n)}               # overlapping days ~ cond_n / n independent
+    z = (imp_now - float(np.mean(imp_ok))) / float(np.std(imp_ok)) if len(imp_ok) > 1 and np.std(imp_ok) > 0 else None
+    sa, sb, sx = float(va[i0]), float(vb[i0]), float(vx[i0])
+    vf = variance_formula(sa / 100, sb / 100, imp_now)
+    return {
+        'asof': str(h['dates'][i0]), 'tenor': h['tenor'], 'window': n,
+        'now': {'implied': imp_now, 'trailing': tr_now, 'spread': spread_now,
+                'implied_pct': _pct(imp_now, imp), 'spread_pct': _pct(spread_now, spread_hist),
+                'implied_z': z, 'vol_a': sa, 'vol_b': sb, 'vol_x': sx,
+                'd_sa': vf['d_sa'], 'd_sb': vf['d_sb'], 'dvol_drho': sa * sb / sx},
+        'premium': _stats(prem),
+        'backtest_long': {**(_stats(long_rho) or {}), 'vol': _stats(long_vol)},
+        'backtest_entries': int(len(entries)),
+        'conditional': cond,
+        'implied_range': _stats(imp),
+    }
+
+
+def trade_construction(vega_x, sa, sb, sx, rho_y):
+    """Vega-neutral correlation position for a cross vega notional (P&L per vol pt).
+    Long rho_Y: sell vega_x of the cross, buy vega_x * dsX/dsA of leg A and vega_x * dsX/dsB of leg B.
+    The leg hedges zero the position's sensitivity to leg vol moves (to first order), leaving
+    P&L = vega_x * (sA sB / sX) * d rho_Y   (vols in vol points, rho_Y in correlation units)."""
+    vf = variance_formula(sa, sb, rho_y)
+    return {'cross_vega': -vega_x, 'leg_a_vega': vega_x * vf['d_sa'], 'leg_b_vega': vega_x * vf['d_sb'],
+            'pnl_per_rho_point': vega_x * sa * sb / sx / 100.0}      # per +0.01 rho_Y
+
+
+def synthetic_history(pair_a, pair_b, tenor, years=3, seed=None):
+    """SYNTHETIC data for running without Bloomberg — NOT market data. True rho_Y follows an OU
+    process (6M half-life); implied rho_Y = slow-moving view of it minus a premium, so the
+    cross trades rich (the usual pattern); vols follow OU paths."""
+    # stable seed (Python's hash() is randomized per process, which made the synthetic data change every run)
+    rng = np.random.default_rng(seed if seed is not None else zlib.crc32(f'{pair_a}|{pair_b}|{tenor}'.encode()))
+    nd = int(252 * years) + TENOR_BDAYS[tenor] + 5
+    sA, sB = leg_info(pair_a)[1], leg_info(pair_b)[1]
+    base_q = PLACEHOLDER_RHO.get((pair_a, pair_b), PLACEHOLDER_RHO.get((pair_b, pair_a), 0.3))
+    base_y = sA * sB * base_q
+    k = math.log(2) / 0.5 / 252
+    rho = np.empty(nd)
+    rho[0] = base_y
+    for i in range(1, nd):
+        rho[i] = rho[i - 1] + k * (base_y - rho[i - 1]) + 0.012 * rng.standard_normal()
+    rho = np.clip(rho, -0.95, 0.95)
+    pa_ = PLACEHOLDER_SURF.get(pair_a, (1.0, 8, 8, 0, 0))
+    pb_ = PLACEHOLDER_SURF.get(pair_b, (1.0, 8, 8, 0, 0))
+
+    def ou(level, sd):
+        v = np.empty(nd)
+        v[0] = level
+        for i in range(1, nd):
+            v[i] = v[i - 1] + 0.02 * (level - v[i - 1]) + sd * rng.standard_normal()
+        return np.maximum(v, 0.3 * level)
+    va, vb = ou(pa_[1], 0.12), ou(pb_[1], 0.10)
+    g1, g2 = rng.standard_normal(nd), rng.standard_normal(nd)
+    ya = va / 100 / math.sqrt(252) * g1
+    yb = vb / 100 / math.sqrt(252) * (rho * g1 + np.sqrt(1 - rho ** 2) * g2)
+    spot_a = pa_[0] * np.exp(sA * np.concatenate([[0], np.cumsum(ya[1:])]))
+    spot_b = pb_[0] * np.exp(sB * np.concatenate([[0], np.cumsum(yb[1:])]))
+    smooth = np.convolve(rho, np.ones(42) / 42, mode='full')[:nd]
+    smooth[:42] = rho[:42]
+    imp = np.clip(smooth - 0.06 + 0.03 * rng.standard_normal(nd), -0.97, 0.97)
+    vx = np.sqrt(np.maximum(va ** 2 + vb ** 2 - 2 * imp * va * vb, 0.01))
+    d0 = date.today() - timedelta(days=int(nd * 365 / 252))
+    dates = [d0 + timedelta(days=int(i * 365 / 252)) for i in range(nd)]
+    return dates, spot_a, spot_b, va, vb, vx
 
 
 # ######################################################################
@@ -1029,7 +1220,7 @@ def placeholder_surface(pair):
 
 def bbg_surface(pair):
     ccy, _ = leg_info(pair)
-    fpre = FWD_PREFIX_OVERRIDE.get(ccy, ccy)
+    cands = FWD_TICKERS.get(ccy, [(ccy, 'points')])
     spot_tk = f'{pair} Curncy'
     tk = {'spot': spot_tk}
     for t in TENORS:
@@ -1038,22 +1229,32 @@ def bbg_surface(pair):
         tk[('rr10', t)] = f'{pair}10R{t} Curncy'
         tk[('bf25', t)] = f'{pair}25B{t} Curncy'
         tk[('bf10', t)] = f'{pair}10B{t} Curncy'
-        tk[('fwd', t)] = f'{fpre}{FWD_TENOR_SUFFIX.get(t, t)} Curncy'
+        for i, (pre, _) in enumerate(cands):
+            tk[('fwd', t, i)] = f'{pre}{FWD_TENOR_SUFFIX.get(t, t)} Curncy'
     data = BB.ref(sorted(set(tk.values())), ['PX_MID', 'PX_LAST', 'FWD_SCALE'])
     spot = _px(data.get(spot_tk))
     if spot is None:
         raise RuntimeError(f'no spot for {spot_tk}')
-    fs = None
+    fs = None                                  # FWD_SCALE only means anything on a points ticker
     for t in TENORS:
-        v = (data.get(tk[('fwd', t)]) or {}).get('FWD_SCALE')
-        if v is not None and math.isfinite(v):
-            fs = 10.0 ** v
+        for i, (_, kind) in enumerate(cands):
+            v = (data.get(tk[('fwd', t, i)]) or {}).get('FWD_SCALE')
+            if kind == 'points' and v is not None and math.isfinite(v):
+                fs = 10.0 ** v
+                break
+        if fs:
             break
     scale = fs or pip_scale_from_spot(spot)
-    rows, missing = {}, []
+    rows, missing, used = {}, [], set()
     for t in TENORS:
         r = {k: _px(data.get(tk[(k, t)])) for k in ('atm', 'rr25', 'rr10', 'bf25', 'bf10')}
-        r['fwd_pts'] = fwd_to_points(_px(data.get(tk[('fwd', t)])), spot, scale)
+        r['fwd_pts'] = None
+        for i, (pre, kind) in enumerate(cands):
+            v = _px(data.get(tk[('fwd', t, i)]))
+            if v is not None:
+                r['fwd_pts'] = fwd_to_points(v, spot, scale, kind)
+                used.add(f'{pre} ({kind})')
+                break
         if r['atm'] is None:
             missing.append(t)
             continue
@@ -1062,20 +1263,30 @@ def bbg_surface(pair):
                 r[k] = 0.0
                 missing.append(f'{t} {k}')
         rows[t] = r
+    notes = ['fwd tickers: ' + ', '.join(sorted(used))] if used else ['no forward ticker returned data']
+    if missing:
+        notes.append('Missing: ' + ', '.join(missing))
     return {'pair': pair, 'spot': spot, 'fwd_scale': scale, 'rows': rows, 'source': 'BBG',
-            'note': ('Missing: ' + ', '.join(missing)) if missing else '',
+            'note': ' · '.join(notes),
             'asof': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 
-def fwd_to_points(v, spot, scale):
-    """Bloomberg fwd tickers usually return points (EUR3M = 54.8 -> 0.00548), but some (NDF
-    tickers) return the outright forward. Decide in PRICE units: points/scale is a small
-    fraction of spot; an outright is about spot itself."""
+def fwd_to_points(v, spot, scale, kind='auto'):
+    """Convert a Bloomberg forward-ticker value to points.
+    'points'   -> as is (EUR3M = 54.8 -> F = spot + 0.00548)
+    'outright' -> (v - spot) * scale (BCN3M = 5.52 vs spot 5.40)
+    'auto'     -> whichever reading puts F closer to spot (in log terms). Ambiguous only for
+                  small-magnitude outright tickers, which is why NDFs are configured explicitly."""
     if v is None:
         return None
-    if abs(v / scale) > 0.3 * spot:          # looks like an outright (e.g. KWN3M 1395 vs spot 1400)
+    if kind == 'points':
+        return v
+    if kind == 'outright':
         return (v - spot) * scale
-    return v
+    f_pts, f_out = spot + v / scale, v
+    d_pts = abs(math.log(f_pts / spot)) if f_pts > 0 else float('inf')
+    d_out = abs(math.log(f_out / spot)) if f_out > 0 else float('inf')
+    return (v - spot) * scale if d_out < d_pts else v
 
 
 def get_surface(pair):
@@ -1126,6 +1337,99 @@ def get_corr(a, b):
             'corr_vol': {'value': PLACEHOLDER_CORR_VOL, 'n_blocks': 0, 'half_life': PLACEHOLDER_RHO_HALF_LIFE},
             'note': ('Placeholder correlations — not market data.' if v is not None
                      else 'No placeholder spot correlation for this pair — enter overrides.')}
+
+
+def _clean(x):
+    """JSON-safe list: NaN/inf -> None (Python json would emit NaN, which browsers reject)."""
+    return [None if (v is None or not math.isfinite(float(v))) else round(float(v), 6) for v in x]
+
+
+def cross_tickers(cross, t):
+    return {'atm': f'{cross}V{t} Curncy', 'rr25': f'{cross}25R{t} Curncy', 'rr10': f'{cross}10R{t} Curncy',
+            'bf25': f'{cross}25B{t} Curncy', 'bf10': f'{cross}10B{t} Curncy'}
+
+
+def get_cross_market(a, b):
+    """Market quotes for the cross itself (to back out implied correlation, and to compare the
+    model's RR / flies against). Tries the cross both ways round; RR sign flips if inverted."""
+    a, b = a.upper(), b.upper()
+    base, quote = cross_ccys(a, b)
+    names = [(base + quote, 1.0), (quote + base, -1.0)]
+    if BB.available():
+        try:
+            tk = {(nm, t): cross_tickers(nm, t) for nm, _ in names for t in TENORS}
+            allt = sorted({v for d in tk.values() for v in d.values()})
+            data = BB.ref(allt, ['PX_MID', 'PX_LAST'])
+            for nm, sgn in names:
+                rows = {}
+                for t in TENORS:
+                    r = {k: _px(data.get(v)) for k, v in tk[(nm, t)].items()}
+                    if r['atm'] is None:
+                        continue
+                    for k in ('rr25', 'rr10'):
+                        if r[k] is not None:
+                            r[k] *= sgn
+                    rows[t] = r
+                if rows:
+                    return {'cross': base + quote, 'ticker_cross': nm, 'source': 'BBG', 'rows': rows,
+                            'note': '' if sgn > 0 else f'quoted as {nm} on Bloomberg; RR sign flipped'}
+            return {'cross': base + quote, 'source': 'BBG', 'rows': {},
+                    'note': f'no Bloomberg vol tickers found for {base + quote} or {quote + base}'}
+        except Exception as e:
+            log(f'BBG cross {base + quote} failed: {e}')
+            BB.last_error = f'cross pull failed: {e}'
+    # PLACEHOLDER: market cross ATM priced with implied rho_Y 0.06 below the placeholder rho
+    # (cross trades rich, the usual pattern) so the implied/realized machinery has something to show
+    La, Lb = placeholder_surface(a), placeholder_surface(b)
+    v = PLACEHOLDER_RHO.get((a, b), PLACEHOLDER_RHO.get((b, a), 0.3))
+    rho_y = leg_info(a)[1] * leg_info(b)[1] * v - 0.06
+    rows = {t: {'atm': round(math.sqrt(max(La['rows'][t]['atm'] ** 2 + Lb['rows'][t]['atm'] ** 2
+                                           - 2 * rho_y * La['rows'][t]['atm'] * Lb['rows'][t]['atm'], 0.01)), 3),
+                'rr25': None, 'rr10': None, 'bf25': None, 'bf10': None} for t in TENORS}
+    return {'cross': base + quote, 'source': 'PLACEHOLDER', 'rows': rows,
+            'note': 'Placeholder cross ATMs (not market data); no placeholder RR/BF.'}
+
+
+def get_corr_history(a, b, tenor, years):
+    a, b = a.upper(), b.upper()
+    base, quote = cross_ccys(a, b)
+    src, note = 'SYNTHETIC', 'SYNTHETIC history (no Bloomberg) — illustrates the tool, not the market.'
+    series = None
+    if BB.available():
+        try:
+            end = date.today()
+            start = end - timedelta(days=int(365 * years) + 400)       # extra for the forward window
+            tks = {'sa': f'{a} Curncy', 'sb': f'{b} Curncy', 'va': f'{a}V{tenor} Curncy',
+                   'vb': f'{b}V{tenor} Curncy'}
+            xn = [(base + quote), (quote + base)]
+            h = BB.hist(list(tks.values()) + [f'{x}V{tenor} Curncy' for x in xn], 'PX_LAST', start, end)
+            hx = next((h[f'{x}V{tenor} Curncy'] for x in xn if h.get(f'{x}V{tenor} Curncy')), {})
+            if not hx:
+                raise RuntimeError(f'no history for {base + quote}V{tenor} (either orientation)')
+            sets = [set(k for k, v in h[tks[k2]].items() if v and v > 0) for k2 in tks] + [set(k for k, v in hx.items() if v and v > 0)]
+            dates = sorted(set.intersection(*sets))
+            if len(dates) < TENOR_BDAYS[tenor] + 40:
+                raise RuntimeError(f'only {len(dates)} aligned dates')
+            series = (dates, [h[tks['sa']][d] for d in dates], [h[tks['sb']][d] for d in dates],
+                      [h[tks['va']][d] for d in dates], [h[tks['vb']][d] for d in dates], [hx[d] for d in dates])
+            src, note = 'BBG', f'BDH {dates[0]} -> {dates[-1]}, {len(dates)} aligned days'
+        except Exception as e:
+            log(f'BBG corr history failed: {e}')
+            note = f'Bloomberg history unavailable ({e}); showing SYNTHETIC data.'
+    if series is None:
+        series = synthetic_history(a, b, tenor, years)
+    hist = corr_history(*series, a, b, tenor)
+    # keep the requested lookback for display/stats, but the forward window needs no trimming:
+    # forward realized is simply NaN for the last N days
+    cut = max(0, len(hist['dates']) - int(252 * years))
+    for k in ('implied', 'trailing', 'forward', 'vol_a', 'vol_b', 'vol_x'):
+        hist[k] = hist[k][cut:]
+    hist['dates'] = hist['dates'][cut:]
+    stats = corr_trade_stats(hist)
+    return {'cross': base + quote, 'tenor': tenor, 'source': src, 'note': note, 'window': hist['n'],
+            'sign_note': f'rho_Y = corr({base} vs USD, {quote} vs USD); long correlation = short {base + quote} vol vs legs',
+            'dates': [str(d) for d in hist['dates']], 'implied': _clean(hist['implied']),
+            'trailing': _clean(hist['trailing']), 'forward': _clean(hist['forward']), 'stats': stats}
 
 
 # ######################################################################
@@ -1217,6 +1521,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, get_surface(q['pair']))
             elif u.path == '/api/corr':
                 self._send(200, get_corr(q['a'], q['b']))
+            elif u.path == '/api/cross_market':
+                self._send(200, get_cross_market(q['a'], q['b']))
+            elif u.path == '/api/corr_history':
+                self._send(200, get_corr_history(q['a'], q['b'], q.get('tenor', '3M'), float(q.get('years', 3))))
             else:
                 self._send(404, {'error': 'not found'})
         except Exception as e:
@@ -1314,6 +1622,12 @@ td.hl{font-weight:650}
 details summary{cursor:pointer;color:var(--text-secondary);margin-top:8px}
 .status{min-height:18px;font-size:12px;color:var(--text-secondary)}
 .empty{color:var(--text-muted);padding:20px 0;text-align:center}
+.an-top{display:grid;grid-template-columns:minmax(380px,.9fr) 1.1fr;gap:16px}
+@media (max-width:1150px){.an-top{grid-template-columns:1fr}}
+.kv td:first-child{color:var(--text-secondary);font-weight:400}
+.kv tr.h td{color:var(--text-primary);font-weight:650;padding-top:9px;border-bottom:1px solid var(--border)}
+.ev{margin:10px 0 0;padding-left:18px;color:var(--text-primary)} .ev li{margin:3px 0}
+.pos{color:var(--good)} .negv{color:var(--critical)}
 </style></head><body>
 <header><h1>Cross Vol Builder</h1><span class="pill"><span id="bbgDot" class="dot"></span><span id="bbgTxt">checking Bloomberg…</span></span>
 <span style="flex:1"></span><span class="pill">ATM: variance formula · RR: copula · wings: vol-of-vol</span></header>
@@ -1336,15 +1650,16 @@ details summary{cursor:pointer;color:var(--text-secondary);margin-top:8px}
 <section class="grid2"><div class="card" id="cardA"></div><div class="card" id="cardB"></div></section>
 <section class="card" id="cardC"></section>
 <section class="card" id="results"><h2>Cross surface</h2><div class="empty">Generate to build the cross surface.</div></section>
+<section class="card" id="cardAn"></section>
 </main>
 <script>
 const TENORS=['1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y'];
 const FIELDS=[['fwd_pts','Fwd pts'],['atm','ATM'],['rr25','25 RR'],['rr10','10 RR'],['bf25','25 BF'],['bf10','10 BF']];
-const LS='crossvol_state_v2';
+const LS='crossvol_state_v3';
 let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
-       legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M'};
+       legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null};
 const $=id=>document.getElementById(id);
-function save(){try{localStorage.setItem(LS,JSON.stringify({...S,result:null}));}catch(e){}}
+function save(){try{localStorage.setItem(LS,JSON.stringify({...S,result:null,hist:null}));}catch(e){}}
 function load(){try{const r=localStorage.getItem(LS);if(r)Object.assign(S,JSON.parse(r));}catch(e){}}
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 function status(msg,cls){const el=$('status');el.className='status '+(cls||'');el.textContent=msg||'';}
@@ -1384,19 +1699,30 @@ function realized(kind,t){const C=S.corr;if(!C)return null;
   if(kind==='rho'){const c=C.by_tenor[t];return c&&c.rho_quoted!=null?c.rho_quoted:null;}
   if(kind==='rs'){const c=C.vol_vol&&C.vol_vol[t];return c&&c.rho_sig!=null?c.rho_sig:null;}
   return C.corr_vol&&C.corr_vol.value!=null?C.corr_vol.value:null;}
-function used(kind,t){const o=ovr(kind,t);return o!==null?o:realized(kind,t);}
+function orient(p){return p.slice(3)==='USD'?1:-1;}
+function impliedQ(t){const M=S.mkt;if(!M||!M.rows||!M.rows[t]||!S.legs.A||!S.legs.B)return null;
+  const ra=S.legs.A.rows[t],rb=S.legs.B.rows[t];if(!ra||!rb)return null;
+  const a=+ra.atm,b=+rb.atm,x=+M.rows[t].atm;if(!(a>0&&b>0&&x>0))return null;
+  return orient(S.legs.A.pair)*orient(S.legs.B.pair)*(a*a+b*b-x*x)/(2*a*b);}
+function used(kind,t){const o=ovr(kind,t);if(o!==null)return o;
+  if(kind==='rho'&&S.rho_src==='implied'){const i=impliedQ(t);if(i!==null&&Math.abs(i)<1)return i;}
+  return realized(kind,t);}
 function usedHL(){if(S.hl_ov!=null&&isFinite(S.hl_ov)&&S.hl_ov>0)return +S.hl_ov;const C=S.corr;return (C&&C.corr_vol&&C.corr_vol.half_life)||0.5;}
 function renderCorr(){
   const el=$('cardC'),C=S.corr;
-  let h='<h2>Correlation inputs — '+S.pairA+' vs '+S.pairB+(C?' <span class="badge '+C.source+'">'+C.source+'</span>':'')+'</h2>';
+  let h='<h2>Correlation inputs — '+S.pairA+' vs '+S.pairB+(C?' <span class="badge '+C.source+'">'+C.source+'</span>':'')
+    +'<span style="flex:1"></span><span style="font-weight:400;color:var(--text-secondary);font-size:11px">ρ used for the build</span>'
+    +'<div class="seg" id="rhoSrc"><button data-v="implied">Implied (mkt cross ATM)</button><button data-v="realized">Realized</button></div></h2>';
   if(!C){el.innerHTML=h+'<div class="empty">loading…</div>';return;}
   if(C.from)h+='<div class="meta">BDH daily closes '+C.from+' → '+C.to+' ('+C.n_obs+' obs)'
     +(C.corr_vol&&C.corr_vol.n_blocks?' · vol of ρ from '+C.corr_vol.n_blocks+' blocks of '+C.corr_vol.block+'d (noise-corrected; raw '+f(C.corr_vol.raw,3)+')':'')+'</div>';
-  h+='<div class="scroll"><table><thead><tr><th></th><th class="grp sep" colspan="4">Spot correlation ρ (legs as quoted)</th><th class="grp sep" colspan="3">Vol-vol correlation ρσ</th><th class="grp sep" colspan="3">Vol of correlation σρ (instantaneous, abs / yr)</th></tr>'
-    +'<tr><th>Tenor</th><th class="sep">Window</th><th>Realized</th><th>Override</th><th>Used</th><th class="sep">Realized</th><th>Override</th><th>Used</th><th class="sep">Realized</th><th>Override</th><th>Used</th></tr></thead><tbody>';
+  h+='<div class="scroll"><table><thead><tr><th></th><th class="grp sep" colspan="5">Spot correlation ρ (legs as quoted)</th><th class="grp sep" colspan="3">Vol-vol correlation ρσ</th><th class="grp sep" colspan="3">Vol of correlation σρ (instantaneous, abs / yr)</th></tr>'
+    +'<tr><th>Tenor</th><th class="sep">Window</th><th>Realized</th><th>Implied</th><th>Override</th><th>Used</th><th class="sep">Realized</th><th>Override</th><th>Used</th><th class="sep">Realized</th><th>Override</th><th>Used</th></tr></thead><tbody>';
   TENORS.forEach(t=>{const c=C.by_tenor[t]||{};
     const cell=k=>{const o=S.ov[k][t];return '<td><input class="num ovr" data-kind="'+k+'" data-t="'+t+'" value="'+(o===undefined||o===null?'':o)+'" placeholder="—"></td>';};
-    h+='<tr><td class="lab">'+t+'</td><td class="sep">'+(c.window||'')+'d</td><td>'+sgn(realized('rho',t),3)+'</td>'+cell('rho')+'<td class="hl">'+sgn(used('rho',t),3)+'</td>'
+    const iq=impliedQ(t),bad=iq!==null&&Math.abs(iq)>=1;
+    h+='<tr><td class="lab">'+t+'</td><td class="sep">'+(c.window||'')+'d</td><td>'+sgn(realized('rho',t),3)+'</td>'
+     +'<td class="'+(bad?'err':'')+'" title="'+(bad?'|implied| >= 1: check leg / cross ATMs':'from market cross ATM')+'">'+sgn(iq,3)+'</td>'+cell('rho')+'<td class="hl">'+sgn(used('rho',t),3)+'</td>'
      +'<td class="sep">'+f(realized('rs',t),3)+'</td>'+cell('rs')+'<td class="hl">'+f(used('rs',t),3)+'</td>'
      +'<td class="sep">'+f(realized('sr',t),3)+'</td>'+cell('sr')+'<td class="hl">'+f(used('sr',t),3)+'</td></tr>';});
   h+='</tbody></table></div>';
@@ -1412,6 +1738,11 @@ function renderCorr(){
   el.querySelectorAll('input.ovr').forEach(inp=>inp.onchange=()=>{const v=inp.value.trim();
     S.ov[inp.dataset.kind][inp.dataset.t]=v===''?null:parseFloat(v);save();renderCorr();});
   $('hlOv').onchange=e=>{const v=e.target.value.trim();S.hl_ov=v===''?null:parseFloat(v);save();renderCorr();};
+  document.querySelectorAll('#rhoSrc button').forEach(b=>{b.classList.toggle('on',S.rho_src===b.dataset.v);
+    b.onclick=()=>{S.rho_src=b.dataset.v;save();renderCorr();};});
+  if(S.mkt)el.insertAdjacentHTML('beforeend','<div class="note">Implied ρ backs out the variance formula from the market '+S.mkt.cross
+    +' ATM and the two leg ATMs on screen: with "Implied" selected the generated ATM reproduces the market by construction. '
+    +(S.mkt.source!=='BBG'?'<span class="warn">Cross quotes: '+S.mkt.source+' — '+(S.mkt.note||'')+'</span>':(S.mkt.note||''))+'</div>');
 }
 
 async function loadLeg(which){
@@ -1419,6 +1750,8 @@ async function loadLeg(which){
   try{S.legs[which]=await api('/api/surface?pair='+pair);}catch(e){status('Surface '+pair+': '+e.message,'err');}
   renderLeg(which);save();
 }
+async function loadMkt(){try{S.mkt=await api('/api/cross_market?a='+S.pairA+'&b='+S.pairB);}catch(e){S.mkt=null;status('Cross quotes: '+e.message,'err');}
+  renderCorr();save();}
 async function loadCorr(){S.corr=null;renderCorr();
   try{S.corr=await api('/api/corr?a='+S.pairA+'&b='+S.pairB);}catch(e){status('Correlation: '+e.message,'err');}
   renderCorr();save();}
@@ -1471,6 +1804,17 @@ function renderResults(){
     +'<div><div class="meta"><b style="color:var(--text-primary)">Smile</b> <select id="selTenor">'+R.rows.map(r=>'<option'+(r.tenor===S.selTenor?' selected':'')+'>'+r.tenor+'</option>').join('')+'</select></div><div id="chSmile" class="chart"></div></div>'
     +'<div><div class="meta"><b style="color:var(--text-primary)">Vol-of-vol term structure</b> (SABR ν)</div><div id="chNu" class="chart"></div></div>'
     +'<div><div class="meta"><b style="color:var(--text-primary)">Skew & fly term structure</b> (broker flies)</div><div id="chSkew" class="chart"></div></div></div>';
+  if(S.mkt&&S.mkt.rows&&Object.keys(S.mkt.rows).length){
+    const bk=R.fly_conv==='broker',M=S.mkt.rows;
+    const trip=(m,v,d)=>'<td class="sep">'+f(m,3)+'</td><td>'+f(v,3)+'</td><td class="'+(m==null||v==null?'':(Math.abs(v-m)>0.1?'warn':''))+'">'+(m==null||v==null?'—':sgn(v-m,3))+'</td>';
+    h+='<h2 style="margin-top:14px">Model vs market '+S.mkt.cross+' <span class="badge '+S.mkt.source+'">'+S.mkt.source+'</span></h2>';
+    h+='<div class="scroll"><table><thead><tr><th></th><th class="grp sep" colspan="3">ATM</th><th class="grp sep" colspan="3">25 RR</th><th class="grp sep" colspan="3">10 RR</th><th class="grp sep" colspan="3">25 BF '+(bk?'brk':'smile')+'</th><th class="grp sep" colspan="3">10 BF '+(bk?'brk':'smile')+'</th></tr>'
+      +'<tr><th>Tenor</th>'+'<th class="sep">mkt</th><th>model</th><th>model−mkt</th>'.repeat(5)+'</tr></thead><tbody>';
+    R.rows.forEach(r=>{const m=M[r.tenor]||{};h+='<tr><td class="lab">'+r.tenor+'</td>'+trip(m.atm,r.atm)+trip(m.rr25,r.rr25)+trip(m.rr10,r.rr10)
+      +trip(m.bf25,bk?r.bf25b:r.bf25s)+trip(m.bf10,bk?r.bf10b:r.bf10s)+'</tr>';});
+    h+='</tbody></table></div><div class="note">Model−mkt above zero: the legs + correlation imply more than the cross is quoting (cross cheap vs legs); below zero: cross rich. '
+      +'With ρ source = Implied the ATM column is ~0 by construction; RR / BF differences are the model\'s information. Differences beyond 0.10 vol are highlighted.</div>';
+  }
   h+='<details><summary>Vol-of-vol vs Gaussian copula wings</summary><div class="scroll"><table><thead><tr><th>Tenor</th><th class="grp sep" colspan="4">Vol-of-vol</th><th class="grp sep" colspan="4">Gaussian copula</th><th class="grp sep" colspan="4">(ν·σ)² parts, (vol pts/yr)²</th></tr>'
     +'<tr><th></th><th class="sep">25 RR</th><th>10 RR</th><th>25 BF</th><th>10 BF</th><th class="sep">25 RR</th><th>10 RR</th><th>25 BF</th><th>10 BF</th><th class="sep">'+R.leg_base+'</th><th>'+R.leg_quote+'</th><th>vol-vol</th><th>corr</th></tr></thead><tbody>';
   R.rows.forEach(r=>{const a=r.vov,b=r.cop,p=r.var_parts;h+='<tr><td class="lab">'+r.tenor+'</td><td class="sep">'+sgn(a.rr25,3)+'</td><td>'+sgn(a.rr10,3)+'</td><td>'+f(a.bf25b,3)+'</td><td>'+f(a.bf10b,3)+'</td>'
@@ -1530,20 +1874,129 @@ function exportCsv(){
   a.href=URL.createObjectURL(blob);a.download=R.cross+'_cross_surface_'+new Date().toISOString().slice(0,10)+'.csv';a.click();
 }
 
+
+// ===================== Correlation analytics =====================
+function crossNm(){return crossName(S.pairA,S.pairB)||'cross';}
+function renderAnalytics(){
+  const el=$('cardAn'),A=S.an,c=crossNm();
+  const ccy=c.slice(0,3),q=c.slice(3);
+  let h='<h2>Correlation analytics — '+c+(S.hist?' <span class="badge '+(S.hist.source==='BBG'?'BBG':'PLACEHOLDER')+'">'+S.hist.source+'</span>':'')+'</h2>';
+  h+='<div class="meta">Convention here: ρ = corr('+ccy+' vs USD, '+q+' vs USD), the ρ in σ('+c+')² = σA² + σB² − 2ρ·σA·σB. '
+    +'<b style="color:var(--text-primary)">Long correlation = short '+c+' vol vs long leg vols (vega-neutral); wins if realized ρ ends above implied.</b></div>';
+  h+='<div class="controls" style="margin-bottom:10px"><label class="f">Tenor<select id="anTenor">'+TENORS.map(t=>'<option'+(t===A.tenor?' selected':'')+'>'+t+'</option>').join('')+'</select></label>'
+    +'<label class="f">Lookback<select id="anYears">'+[1,2,3,5].map(y=>'<option value="'+y+'"'+(y==A.years?' selected':'')+'>'+y+'Y</option>').join('')+'</select></label>'
+    +'<label class="f">Cross vega (USD / vol pt)<input id="anVega" class="num wide" value="'+A.vega+'"></label>'
+    +'<button class="act primary" id="btnHist">Load history</button></div>';
+  h+='<div id="anBody">'+(S.hist?'':'<div class="empty">Load history to chart implied vs realized correlation, the premium and a hold-to-expiry backtest.</div>')+'</div>';
+  el.innerHTML=h;
+  $('anTenor').onchange=e=>{A.tenor=e.target.value;save();};
+  $('anYears').onchange=e=>{A.years=+e.target.value;save();};
+  $('anVega').onchange=e=>{A.vega=parseFloat(e.target.value)||0;save();if(S.hist)renderAnBody();};
+  $('btnHist').onclick=loadHist;
+  if(S.hist)renderAnBody();
+}
+async function loadHist(){
+  $('anBody').innerHTML='<div class="empty">Loading '+S.an.tenor+' history…</div>';
+  try{S.hist=await api('/api/corr_history?a='+S.pairA+'&b='+S.pairB+'&tenor='+S.an.tenor+'&years='+S.an.years);renderAnalytics();}
+  catch(e){$('anBody').innerHTML='<div class="empty err">History failed: '+e.message+'</div>';}
+}
+function pctTxt(p){return p==null?'—':Math.round(p)+(Math.round(p)%10===1&&Math.round(p)!==11?'st':Math.round(p)%10===2&&Math.round(p)!==12?'nd':Math.round(p)%10===3&&Math.round(p)!==13?'rd':'th')+' pct';}
+function cls(x){return x==null?'':(x>0?'pos':'negv');}
+function renderAnBody(){
+  const H=S.hist,st=H.stats,el=$('anBody');
+  if(st.error){el.innerHTML='<div class="empty err">'+st.error+'</div>';return;}
+  const n=st.now,p=st.premium||{},bl=st.backtest_long||{},bv=bl.vol||{},c=st.conditional,cx=H.cross;
+  const row=(k,v,cl)=>'<tr><td>'+k+'</td><td class="'+(cl||'')+'">'+v+'</td></tr>';
+  let t='<table class="kv">';
+  t+='<tr class="h"><td colspan="2">Now ('+st.asof+', '+st.tenor+')</td></tr>';
+  t+=row('Implied ρ',f(n.implied,3)+' · '+pctTxt(n.implied_pct)+' of lookback'+(n.implied_z!=null?' · z '+sgn(n.implied_z,2):''));
+  t+=row('Trailing realized ('+st.window+'d)',f(n.trailing,3));
+  t+=row('Implied − trailing',sgn(n.spread,3)+' · '+pctTxt(n.spread_pct));
+  t+=row('Cross vol per 0.01 ρ',f(n.dvol_drho/100,3)+' vol (σA·σB / σX)');
+  t+='<tr class="h"><td colspan="2">Premium: implied − subsequently realized (over the option\'s life)</td></tr>';
+  t+=row('Mean / median',sgn(p.mean,3)+' / '+sgn(p.median,3)+(p.t!=null?' · t '+f(p.t,1)+' (overlapping days, overstated)':''));
+  t+=row('Implied ended above realized',f(p.hit,0)+'% of '+(p.n||0)+' days');
+  t+=row('10th – 90th pct',sgn(p.p10,3)+' to '+sgn(p.p90,3));
+  t+='<tr class="h"><td colspan="2">Backtest: enter every '+st.window+'d, hold to expiry ('+st.backtest_entries+' non-overlapping trades)</td></tr>';
+  t+=row('Long ρ: avg P&L (ρ pts)',sgn(bl.mean,3)+' · hit '+f(bl.hit,0)+'%',cls(bl.mean));
+  t+=row('Long ρ: avg P&L (cross vol pts)',sgn(bv.mean,3)+' · worst '+sgn(bv.min,3)+' · best '+sgn(bv.max,3),cls(bv.mean));
+  t+=row('Short ρ: avg P&L (cross vol pts)',sgn(bv.mean==null?null:-bv.mean,3)+' · hit '+f(bl.hit==null?null:100-bl.hit,0)+'%',cls(bv.mean==null?null:-bv.mean));
+  t+=row('Avg / std (per trade)',bv.std?f(bv.mean/bv.std,2):'—');
+  if(c){t+='<tr class="h"><td colspan="2">Conditional on today\'s spread ('+(n.spread>=0?'implied − trailing ≥ ':'≤ ')+sgn(n.spread,3)+')</td></tr>';
+    t+=row('Days like today',c.n+' (≈'+c.eff_n+' independent)');
+    t+=row('Realized ended below implied (short ρ won)',f(c.short_hit,0)+'%');
+    t+=row('Avg implied − realized on those days',sgn(c.mean_prem,3));}
+  t+='</table>';
+  // evidence, stated as numbers rather than a recommendation
+  const ev=[];
+  if(n.spread<0)ev.push('Implied ρ is <b>'+f(-n.spread,3)+' below</b> trailing realized ('+pctTxt(n.spread_pct)+'): if realized stays where it has been, <b>long correlation</b> (short '+cx+' vol vs legs) earns ≈ '+f(-n.spread*n.dvol_drho,2)+' cross vol pts.');
+  else ev.push('Implied ρ is <b>'+f(n.spread,3)+' above</b> trailing realized ('+pctTxt(n.spread_pct)+'): if realized stays where it has been, <b>short correlation</b> (long '+cx+' vol vs legs) earns ≈ '+f(n.spread*n.dvol_drho,2)+' cross vol pts.');
+  if(p.n)ev.push('Over the lookback, implied ended '+(p.mean<0?'<b>below</b>':'<b>above</b>')+' subsequent realized on average by '+f(Math.abs(p.mean),3)+' ('+f(p.mean<0?100-p.hit:p.hit,0)+'% of days): historically that favoured <b>'+(p.mean<0?'long':'short')+' correlation</b>.');
+  if(bl.n)ev.push('Hold-to-expiry backtest: long ρ hit '+f(bl.hit,0)+'% over '+bl.n+' trades, avg '+sgn(bv.mean,2)+' cross vol pts per trade'+(bl.n<12?' — <span class="warn">small sample</span>':'')+'.');
+  if(c)ev.push('When the spread was at least as '+(n.spread>=0?'positive':'negative')+' as today, realized ended below implied '+f(c.short_hit,0)+'% of the time (n≈'+c.eff_n+' independent) → '+(c.short_hit>=50?'short':'long')+' ρ won '+f(Math.max(c.short_hit,100-c.short_hit),0)+'%'+(c.eff_n<5?' — <span class="warn">only ≈'+c.eff_n+' independent periods; weak evidence</span>':'')+'.');
+  if(n.implied_pct!=null&&(n.implied_pct>85||n.implied_pct<15))ev.push('Implied ρ is at the '+pctTxt(n.implied_pct)+' of its range: correlation mean-reverts (half-life in the inputs card), which leans against the extreme.');
+  // trade construction
+  const V=S.an.vega||0,dA=n.d_sa,dB=n.d_sb,per=V*n.dvol_drho/100;
+  const pa=S.pairA,pb=S.pairB;                // server computes d_sa / d_sb in leg A / leg B order
+  const imp20=H.implied.filter(x=>x!=null),moves=[];for(let i=21;i<imp20.length;i+=21)moves.push(imp20[i]-imp20[i-21]);
+  const sd21=moves.length>2?Math.sqrt(moves.reduce((a,x)=>a+x*x,0)/(moves.length-1)):null;
+  const fmt=x=>(x>=0?'+':'−')+Math.abs(Math.round(x)).toLocaleString();
+  let tc='<table><thead><tr><th>Position (vega-neutral to leg vols)</th><th>'+cx+' vega</th><th>'+pa+' vega</th><th>'+pb+' vega</th><th>P&L per +0.01 ρ</th><th>P&L per 1σ monthly Δimplied ρ'+(sd21?' (±'+f(sd21,3)+')':'')+'</th></tr></thead><tbody>'
+    +'<tr><td class="lab">Long correlation</td><td>'+fmt(-V)+'</td><td>'+fmt(V*dA)+'</td><td>'+fmt(V*dB)+'</td><td>'+fmt(per)+'</td><td>'+(sd21?'±'+Math.round(per*sd21*100).toLocaleString():'—')+'</td></tr>'
+    +'<tr><td class="lab">Short correlation</td><td>'+fmt(V)+'</td><td>'+fmt(-V*dA)+'</td><td>'+fmt(-V*dB)+'</td><td>'+fmt(-per)+'</td><td>'+(sd21?'±'+Math.round(per*sd21*100).toLocaleString():'—')+'</td></tr></tbody></table>'
+    +'<div class="note">Leg vegas = cross vega × ∂σ<sub>X</sub>/∂σ<sub>leg</sub> ('+f(dA,3)+', '+f(dB,3)+' at today\'s '+st.tenor+' ATMs), so a 1-vol move in either leg nets to zero and what is left is ρ. '
+    +'Mark-to-market P&L shown; held delta-hedged to expiry, the same position\'s gamma P&L breaks even when realized ρ = implied ρ.</div>';
+  el.innerHTML='<div class="an-top"><div>'+t+'<ul class="ev">'+ev.map(x=>'<li>'+x+'</li>').join('')+'</ul></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Correlation term structure (today)</b> implied from cross ATMs vs realized</div><div id="chTerm" class="chart" style="height:290px"></div>'
+    +'<div class="meta" style="margin-top:8px"><b style="color:var(--text-primary)">Trade construction</b> — '+st.tenor+'</div>'+tc+'</div></div>'
+    +'<div class="charts" style="margin-top:14px;grid-template-columns:1.4fr 1fr 1fr">'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">'+st.tenor+' implied vs realized ρ</b> ('+H.note+')</div><div id="chHist" class="chart"></div></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Spread</b> implied − realized</div><div id="chSpr" class="chart"></div></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Premium distribution</b> implied − subsequent realized</div><div id="chPrem" class="chart"></div></div></div>'
+    +'<div class="note">'+H.sign_note+'. Trailing realized = the '+st.window+' daily returns before each date; subsequent realized = the '+st.window+' after it (the option\'s life), so it stops '+st.window+' business days before today.</div>';
+  drawAnCharts();
+}
+function drawAnCharts(){
+  if(typeof Plotly==='undefined')return;
+  const H=S.hist,x=H.dates,n=H.stats.now;
+  const L=y=>{const l=baseLayout(y);l.hovermode='x unified';return l;};
+  Plotly.react('chHist',[{x,y:H.implied,mode:'lines',name:'Implied',line:{color:css('--s1'),width:2}},
+    {x,y:H.trailing,mode:'lines',name:'Trailing realized',line:{color:css('--s2'),width:1.5}},
+    {x,y:H.forward,mode:'lines',name:'Subsequent realized',line:{color:css('--s3'),width:1.5}}],L('ρ'),CFG);
+  const s1=H.implied.map((v,i)=>v==null||H.trailing[i]==null?null:v-H.trailing[i]);
+  const s2=H.implied.map((v,i)=>v==null||H.forward[i]==null?null:v-H.forward[i]);
+  const Ls=L('ρ');Ls.yaxis.zeroline=true;Ls.yaxis.zerolinecolor=css('--text-muted');
+  Plotly.react('chSpr',[{x,y:s1,mode:'lines',name:'vs trailing',line:{color:css('--s1'),width:1.5}},
+    {x,y:s2,mode:'lines',name:'vs subsequent (premium)',line:{color:css('--s2'),width:1.5}}],Ls,CFG);
+  const prem=s2.filter(v=>v!=null);
+  const Lp=baseLayout('days');Lp.hovermode='closest';Lp.margin.t=26;Lp.xaxis.title={text:'implied − subsequent realized'};Lp.bargap=0.06;
+  Lp.shapes=[{type:'line',x0:n.spread,x1:n.spread,yref:'paper',y0:0,y1:1,line:{color:css('--ref'),width:1.5,dash:'dash'}},
+             {type:'line',x0:0,x1:0,yref:'paper',y0:0,y1:1,line:{color:css('--text-muted'),width:1}}];
+  Lp.annotations=[{x:n.spread,yref:'paper',y:1,text:'today: implied − trailing',showarrow:false,yanchor:'bottom',xanchor:n.spread<0?'left':'right',font:{size:10,color:css('--text-secondary')}}];
+  Plotly.react('chPrem',[{x:prem,type:'histogram',nbinsx:30,name:'premium',marker:{color:css('--s1')},showlegend:false}],Lp,CFG);
+  // term structure from the snapshot on screen
+  const sAB=S.legs.A&&S.legs.B?orient(S.legs.A.pair)*orient(S.legs.B.pair):1;
+  const ten=TENORS.filter(t=>impliedQ(t)!==null||realized('rho',t)!==null);
+  const Lt=L('ρ');Lt.xaxis.type='category';
+  Plotly.react('chTerm',[{x:ten,y:ten.map(t=>{const v=impliedQ(t);return v==null?null:sAB*v;}),mode:'lines+markers',name:'Implied',line:{color:css('--s1'),width:2},marker:{size:8}},
+    {x:ten,y:ten.map(t=>{const v=realized('rho',t);return v==null?null:sAB*v;}),mode:'lines+markers',name:'Trailing realized',line:{color:css('--s2'),width:2},marker:{size:8}}],Lt,CFG);
+}
+
 async function init(){
   load();
   const st=await api('/api/status').catch(()=>({bbg:false,pairs:['EURUSD','USDCAD'],error:'server unreachable'}));
   $('bbgDot').className='dot '+(st.bbg?'ok':'bad');$('bbgTxt').textContent=st.bbg?'Bloomberg connected':'Bloomberg offline — placeholders';
   if(!st.bbg&&st.error)$('bbgTxt').title=st.error;
   ['pairA','pairB'].forEach(id=>{$(id).innerHTML=st.pairs.map(p=>'<option>'+p+'</option>').join('');$(id).value=S[id];
-    $(id).onchange=async e=>{S[id]=e.target.value;S.ov={rho:{},rs:{},sr:{}};updateCross();save();await Promise.all([loadLeg(id==='pairA'?'A':'B'),loadCorr()]);};});
+    $(id).onchange=async e=>{S[id]=e.target.value;S.ov={rho:{},rs:{},sr:{}};updateCross();save();S.hist=null;S.mkt=null;renderAnalytics();await Promise.all([loadLeg(id==='pairA'?'A':'B'),loadCorr(),loadMkt()]);renderCorr();};});
   $('usdRate').value=S.usd_rate;$('usdRate').onchange=e=>{S.usd_rate=parseFloat(e.target.value)||0;save();};
   segInit();updateCross();
-  $('btnPull').onclick=()=>Promise.all([loadLeg('A'),loadLeg('B')]);
+  $('btnPull').onclick=async()=>{await Promise.all([loadLeg('A'),loadLeg('B'),loadMkt()]);renderCorr();};
   $('btnCorr').onclick=loadCorr;$('btnBuild').onclick=build;
   if(S.legs.A&&S.legs.A.pair===S.pairA)renderLeg('A');else loadLeg('A');
   if(S.legs.B&&S.legs.B.pair===S.pairB)renderLeg('B');else loadLeg('B');
   if(S.corr&&S.corr.vol_vol)renderCorr();else loadCorr();
+  loadMkt();renderAnalytics();
 }
 init();
 </script></body></html>"""
@@ -1746,6 +2199,30 @@ def selftest():
             'USDJPY': (150.00, {'JPY': -140.0}, 2), 'USDMXN': (18.50, {'MXN': 1300.0}, 4),
             'USDCNH': (7.150, {'CNH': -1100.0}, 4)}
     real_ref, real_av = BB.ref, BB.available
+    # LATAM / ILS: NDF outrights via BCN / CHN, deliverable points for MXN / ILS
+    latam = {'USDBRL': (5.40, 'BCN', 5.5212, 'outright', 4), 'USDCLP': (950.0, 'CHN', 951.85, 'outright', 2),
+             'USDMXN': (18.50, 'MXN', 1305.0, 'points', 4), 'USDILS': (3.70, 'ILS', -45.0, 'points', 4)}
+    try:
+        for pair, (spot, pre, val, kind, fs) in latam.items():
+            def ref(tickers, fields, pair=pair, spot=spot, pre=pre, val=val, fs=fs):
+                out = {}
+                for tk in tickers:
+                    name = tk.replace(' Curncy', '')
+                    if name == pair:
+                        out[tk] = {'PX_MID': spot}
+                    elif name.startswith(pair):
+                        out[tk] = {'PX_MID': 1.0}
+                    elif name.startswith(pre):
+                        out[tk] = {'PX_MID': val, 'FWD_SCALE': float(fs)}
+                return out
+            BB.ref = ref
+            L = bbg_surface(pair)
+            F = L['spot'] + L['rows']['3M']['fwd_pts'] / L['fwd_scale']
+            exp = val if kind == 'outright' else spot + val / 10 ** fs
+            check(f'{pair} via {pre} ({kind})', abs(F - exp) < 1e-9 and pre in L['note'],
+                  f"(F {F:.6g}, expected {exp:.6g}; {L['note']})")
+    finally:
+        BB.ref = real_ref
     try:
         for pair, (spot, fwd, fs) in fake.items():
             def ref(tickers, fields, pair=pair, spot=spot, fwd=fwd, fs=fs):
@@ -1772,10 +2249,73 @@ def selftest():
               f"(pts {L['rows']['3M']['fwd_pts']})")
     finally:
         BB.ref, BB.available = real_ref, real_av
+    print('\n11) LATAM / ILS crosses on placeholder legs (all tenors)')
+    for a, b in [('USDBRL', 'USDMXN'), ('USDBRL', 'USDCLP'), ('USDCLP', 'USDMXN'),
+                 ('EURUSD', 'USDBRL'), ('EURUSD', 'USDILS'), ('USDILS', 'USDJPY')]:
+        s = build_surface(placeholder_surface(a), placeholder_surface(b), {t: PLACEHOLDER_RHO.get((a, b)) for t in TENORS},
+                          rho_sig_by_tenor={t: 0.6 for t in TENORS}, sig_rho_by_tenor={t: 0.2 for t in TENORS},
+                          rho_half_life=0.5, today=T0)
+        r = [x for x in s['tenors'] if x['tenor'] == '3M'][0]
+        r2 = s['tenors'][-1] if s['tenors'] else None
+        check(f"{s['cross']}: 10 tenors, no errors", not s['errors'] and len(s['tenors']) == 10,
+              f"(3M ATM {r['res']['atm']*100:.2f} RR25 {r['res']['rr25']*100:+.2f} 25BF {r['res']['bf25b']*100:.3f}; "
+              f"2Y F/S {r2['F']/r2['S']:.3f}; delta {r['dtype']}{' PA' if r['pa'] else ''}) {s['errors']}")
+
     bad = placeholder_surface('USDCAD')
     bad['rows']['3M']['fwd_pts'] = -480000.0
     s = build_surface(placeholder_surface('EURUSD'), bad, {'3M': -0.45}, tenors=['3M'], today=T0)
     check('bad forward fails with a readable message', 'implausible' in s['errors'].get('3M', ''), f"({s['errors'].get('3M', '')[:70]}...)")
+
+    print('\n12) Correlation analytics')
+    sa_, sb_, ry = 7.5, 6.0, 0.45
+    sx_ = variance_formula(sa_, sb_, ry)['atm']
+    check('implied rho inverts the variance formula', abs(implied_rho_y(sa_, sb_, sx_) - ry) < 1e-12,
+          f'(7.5 / 6.0 / {sx_:.4f} -> {implied_rho_y(sa_, sb_, sx_):.6f})')
+    rng3 = np.random.default_rng(5)
+    a3, b3 = rng3.standard_normal(400), rng3.standard_normal(400)
+    rc3 = rolling_corr(a3, b3, 63)
+    worst = max(abs(rc3[i] - np.corrcoef(a3[i - 63:i], b3[i - 63:i])[0, 1]) for i in (63, 150, 399, 400))
+    check('rolling corr = np.corrcoef on every window', worst < 1e-10, f'(max diff {worst:.1e})')
+    # forward window alignment: forward[t] must use the n returns AFTER date t
+    nd3 = 300
+    pxa = 1.08 * np.exp(np.concatenate([[0], np.cumsum(0.005 * a3[:nd3 - 1])]))
+    pxb = 1.37 * np.exp(-np.concatenate([[0], np.cumsum(0.004 * b3[:nd3 - 1])]))
+    h3 = corr_history(list(range(nd3)), pxa, pxb, np.full(nd3, 7.5), np.full(nd3, 6.0), np.full(nd3, 7.19),
+                      'EURUSD', 'USDCAD', '3M')
+    ra3, rb3 = np.diff(np.log(pxa)), -np.diff(np.log(pxb))
+    t3 = 100
+    ok_f = abs(h3['forward'][t3] - np.corrcoef(ra3[t3:t3 + 63], rb3[t3:t3 + 63])[0, 1]) < 1e-10
+    ok_t = abs(h3['trailing'][t3] - np.corrcoef(ra3[t3 - 63:t3], rb3[t3 - 63:t3])[0, 1]) < 1e-10
+    check('trailing uses the 63 returns before t, subsequent the 63 after', ok_f and ok_t
+          and np.all(np.isnan(h3['forward'][-63:])))
+    # known premium: implied = subsequent realized + 0.05 exactly -> mean premium 0.05, long rho never wins
+    fw_known = h3['forward'].copy()
+    h3['implied'] = np.where(np.isfinite(fw_known), fw_known + 0.05, h3['trailing'] + 0.05)
+    h3['vol_x'] = np.full(nd3, 7.19)
+    st3 = corr_trade_stats(h3)
+    check('stats recover a known +0.05 premium; long rho hit 0%',
+          abs(st3['premium']['mean'] - 0.05) < 1e-12 and st3['backtest_long']['hit'] == 0.0
+          and abs(st3['backtest_long']['mean'] + 0.05) < 1e-12,
+          f"(mean prem {st3['premium']['mean']:+.4f}, long hit {st3['backtest_long']['hit']:.0f}%, {st3['backtest_entries']} trades)")
+    tc = trade_construction(100000, sa_, sb_, sx_, ry)
+    pos = lambda A_, B_, r_: tc['cross_vega'] * variance_formula(A_ / 100, B_ / 100, r_)['atm'] * 100 \
+        + tc['leg_a_vega'] * A_ + tc['leg_b_vega'] * B_
+    d_leg = max(abs(pos(sa_ + 0.01, sb_, ry) - pos(sa_, sb_, ry)), abs(pos(sa_, sb_ + 0.01, ry) - pos(sa_, sb_, ry)))
+    d_rho = pos(sa_, sb_, ry + 0.01) - pos(sa_, sb_, ry)
+    check('trade is leg-vol neutral and earns the stated P&L per +0.01 rho',
+          d_leg < 1.0 and abs(d_rho - tc['pnl_per_rho_point']) / tc['pnl_per_rho_point'] < 0.01,
+          f"(leg 1bp vol bump {d_leg:.2f} USD on 100k vega; +0.01 rho {d_rho:,.0f} vs {tc['pnl_per_rho_point']:,.0f})")
+    H = get_corr_history('EURUSD', 'USDCAD', '3M', 3)
+    stH = H['stats']
+    check('synthetic history end to end (premium built in at -0.06)',
+          H['source'] in ('SYNTHETIC', 'BBG') and -0.12 < stH['premium']['mean'] < 0.0 and stH['backtest_long']['hit'] > 50,
+          f"(mean prem {stH['premium']['mean']:+.3f}, long rho hit {stH['backtest_long']['hit']:.0f}% over {stH['backtest_entries']} trades)")
+    json.dumps(H, allow_nan=False)
+    check('history payload is strict JSON (no NaN)', True)
+    M = get_cross_market('EURUSD', 'USDCAD')
+    La, Lb = placeholder_surface('EURUSD'), placeholder_surface('USDCAD')
+    iy = implied_rho_y(La['rows']['3M']['atm'], Lb['rows']['3M']['atm'], M['rows']['3M']['atm'])
+    check('placeholder cross ATM implies rho_Y = placeholder - 0.06', abs(iy - (0.45 - 0.06)) < 0.003, f'({iy:+.4f})')
 
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)
