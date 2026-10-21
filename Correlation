@@ -468,6 +468,8 @@ class CrossPricer:
         w = np.linspace(-zmax, zmax, nw)
         self.w0, self.dw, self.nw = w[0], w[1] - w[0], nw
         self.YA = MA.Q(z1)
+        if not (np.all(np.isfinite(MA.lnY)) and np.all(np.isfinite(MB.lnY)) and math.isfinite(rho)):
+            raise ValueError('non-finite marginal or correlation reached the copula (check leg inputs / rho)')
         YB = MB.Q(rho * z1[:, None] + self.sr * w[None, :])
         f = YB * npdf(w)[None, :]
         g = np.broadcast_to(npdf(w), f.shape)
@@ -791,8 +793,18 @@ def build_surface(legA_in, legB_in, rho_quoted_by_tenor, usd_rate=0.04, fly_conv
                 scale = float(L.get('fwd_scale') or pip_scale_from_spot(S))
                 F = S + float(r.get('fwd_pts') or 0.0) / scale
                 q = {k: float(r[k]) / 100.0 for k in ('atm', 'rr25', 'rr10', 'bf25', 'bf10')}
+                bad = [k for k, v in q.items() if not math.isfinite(v)]
+                if not (math.isfinite(S) and S > 0):
+                    raise ValueError(f"{L['pair']} spot {S} is not a positive number")
+                if not (math.isfinite(F) and F > 0) or abs(F / S - 1) > 0.5:
+                    raise ValueError(f"{L['pair']} {t} forward {F:.6g} vs spot {S:.6g} is implausible "
+                                     f"(fwd pts {r.get('fwd_pts')}, scale {scale:g}) - check fwd points / scale")
+                if bad or q['atm'] <= 0:
+                    raise ValueError(f"{L['pair']} {t} bad quote(s): {bad or 'ATM <= 0'}")
                 legs.append(build_leg(L['pair'].upper(), S, F, T, q, df_usd, fly_conv, dtype=dt))
             rq = float(rho_quoted_by_tenor[t])
+            if not -1 < rq < 1:
+                raise ValueError(f'rho {rq} must be strictly between -1 and 1 (decimal, not %)')
             rs = rho_sig_by_tenor.get(t)
             sr = sig_rho_by_tenor.get(t)
             sr = 0.0 if sr is None else float(sr)
@@ -837,6 +849,9 @@ def realized_corr(px_a, px_b, pair_a, pair_b, windows=None):
             out[t] = {'window': n, 'n': m, 'rho_quoted': None, 'rho_y': None}
             continue
         r = float(np.corrcoef(a[-m:], b[-m:])[0, 1])
+        if not math.isfinite(r):
+            out[t] = {'window': n, 'n': m, 'rho_quoted': None, 'rho_y': None}
+            continue
         out[t] = {'window': n, 'n': m, 'rho_quoted': r, 'rho_y': sA * sB * r}
     return out
 
@@ -849,7 +864,8 @@ def vol_vol_corr(vol_a, vol_b, window):
     m = min(max(window, 63), len(a))
     if m < 20:
         return None, m
-    return float(np.corrcoef(a[-m:], b[-m:])[0, 1]), m
+    r = float(np.corrcoef(a[-m:], b[-m:])[0, 1])
+    return (r if math.isfinite(r) else None), m
 
 
 def corr_vol(px_a, px_b, block=21):
@@ -1037,10 +1053,7 @@ def bbg_surface(pair):
     rows, missing = {}, []
     for t in TENORS:
         r = {k: _px(data.get(tk[(k, t)])) for k in ('atm', 'rr25', 'rr10', 'bf25', 'bf10')}
-        fwd = _px(data.get(tk[('fwd', t)]))
-        if fwd is not None and abs(fwd) > 0.5 * spot:      # outright forward, not points
-            fwd = (fwd - spot) * scale
-        r['fwd_pts'] = fwd
+        r['fwd_pts'] = fwd_to_points(_px(data.get(tk[('fwd', t)])), spot, scale)
         if r['atm'] is None:
             missing.append(t)
             continue
@@ -1052,6 +1065,17 @@ def bbg_surface(pair):
     return {'pair': pair, 'spot': spot, 'fwd_scale': scale, 'rows': rows, 'source': 'BBG',
             'note': ('Missing: ' + ', '.join(missing)) if missing else '',
             'asof': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+
+def fwd_to_points(v, spot, scale):
+    """Bloomberg fwd tickers usually return points (EUR3M = 54.8 -> 0.00548), but some (NDF
+    tickers) return the outright forward. Decide in PRICE units: points/scale is a small
+    fraction of spot; an outright is about spot itself."""
+    if v is None:
+        return None
+    if abs(v / scale) > 0.3 * spot:          # looks like an outright (e.g. KWN3M 1395 vs spot 1400)
+        return (v - spot) * scale
+    return v
 
 
 def get_surface(pair):
@@ -1075,7 +1099,7 @@ def get_corr(a, b):
             ta, tb = f'{a} Curncy', f'{b} Curncy'
             vtk = {(p, t): f'{p}V{t} Curncy' for p in (a, b) for t in TENORS}
             h = BB.hist([ta, tb] + list(vtk.values()), 'PX_LAST', start, end)
-            dates = sorted(set(h.get(ta, {})) & set(h.get(tb, {})))
+            dates = sorted(d for d in set(h.get(ta, {})) & set(h.get(tb, {})) if h[ta][d] > 0 and h[tb][d] > 0)
             if len(dates) < 30:
                 raise RuntimeError(f'only {len(dates)} common spot dates')
             pa_ = [h[ta][d] for d in dates]
@@ -1716,6 +1740,42 @@ def selftest():
     check('no errors, no calendar flags', not s['errors'] and not s['calendar_flags'], str(s['errors']))
     check('3M matches prototype', abs(r3['res']['bf25b'] * 100 - 0.130) < 0.004 and abs(r3['vov']['nu_x'] - 0.971) < 0.01)
     check(f'speed ({el:.1f}s for 10 tenors)', el < 20)
+
+    print('\n10) Bloomberg surface parsing (fake terminal) — fwd points vs outright forwards')
+    fake = {'EURUSD': (1.0850, {'EUR': 54.83}, 4), 'USDCAD': (1.3700, {'CAD': -48.26}, 4),
+            'USDJPY': (150.00, {'JPY': -140.0}, 2), 'USDMXN': (18.50, {'MXN': 1300.0}, 4),
+            'USDCNH': (7.150, {'CNH': -1100.0}, 4)}
+    real_ref, real_av = BB.ref, BB.available
+    try:
+        for pair, (spot, fwd, fs) in fake.items():
+            def ref(tickers, fields, pair=pair, spot=spot, fwd=fwd, fs=fs):
+                out = {}
+                for tk in tickers:
+                    name = tk.replace(' Curncy', '')
+                    if name == pair:
+                        out[tk] = {'PX_MID': spot}
+                    elif name.startswith(pair):
+                        out[tk] = {'PX_MID': 1.0}
+                    else:
+                        out[tk] = {'PX_MID': list(fwd.values())[0], 'FWD_SCALE': float(fs)}
+                return out
+            BB.ref = ref
+            L = bbg_surface(pair)
+            F = L['spot'] + L['rows']['3M']['fwd_pts'] / L['fwd_scale']
+            exp = spot + list(fwd.values())[0] / 10 ** fs
+            check(f'{pair} pts kept as points', abs(F - exp) < 1e-12, f'(F {F:.6g}, expected {exp:.6g})')
+        BB.ref = lambda tickers, fields: {tk: ({'PX_MID': 1400.0} if tk.replace(' Curncy', '') == 'USDKRW' else
+                                               {'PX_MID': 1.0} if tk.startswith('USDKRW') else
+                                               {'PX_MID': 1395.5, 'FWD_SCALE': 0.0}) for tk in tickers}
+        L = bbg_surface('USDKRW')
+        check('outright NDF forward detected (KWN 1395.5 vs spot 1400)', abs(L['rows']['3M']['fwd_pts'] + 4.5) < 1e-9,
+              f"(pts {L['rows']['3M']['fwd_pts']})")
+    finally:
+        BB.ref, BB.available = real_ref, real_av
+    bad = placeholder_surface('USDCAD')
+    bad['rows']['3M']['fwd_pts'] = -480000.0
+    s = build_surface(placeholder_surface('EURUSD'), bad, {'3M': -0.45}, tenors=['3M'], today=T0)
+    check('bad forward fails with a readable message', 'implausible' in s['errors'].get('3M', ''), f"({s['errors'].get('3M', '')[:70]}...)")
 
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)
