@@ -853,6 +853,22 @@ def build_surface(legA_in, legB_in, rho_quoted_by_tenor, usd_rate=0.04, fly_conv
 # ======================================================================
 # Realized estimators (spot correlation, vol-vol correlation, vol of correlation)
 # ======================================================================
+# Realized correlation convention. Zero-mean (sum ab / sqrt(sum a^2 sum b^2)) is the one consistent
+# with implied rho from ATM vols and with the P&L of the vega-neutral trade, both of which run on
+# squared returns. Pearson (demeaned) differs by sd ~0.04 on 21-day windows.
+REALIZED_ZERO_MEAN = True
+
+
+def corr_est(a, b, zero_mean=None):
+    """Realized correlation of two aligned return arrays (zero-mean by default)."""
+    zero_mean = REALIZED_ZERO_MEAN if zero_mean is None else zero_mean
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if not zero_mean:
+        a, b = a - a.mean(), b - b.mean()
+    den = math.sqrt(float(np.sum(a * a)) * float(np.sum(b * b)))
+    return float(np.sum(a * b)) / den if den > 0 else float('nan')
+
+
 def realized_corr(px_a, px_b, pair_a, pair_b, windows=None):
     """px_a, px_b: aligned daily closes. Per-tenor rho as quoted and rho_Y."""
     windows = windows or CORR_WINDOW_BDAYS
@@ -865,7 +881,7 @@ def realized_corr(px_a, px_b, pair_a, pair_b, windows=None):
         if m < 10:
             out[t] = {'window': n, 'n': m, 'rho_quoted': None, 'rho_y': None}
             continue
-        r = float(np.corrcoef(a[-m:], b[-m:])[0, 1])
+        r = corr_est(a[-m:], b[-m:])
         if not math.isfinite(r):
             out[t] = {'window': n, 'n': m, 'rho_quoted': None, 'rho_y': None}
             continue
@@ -896,7 +912,7 @@ def corr_vol(px_a, px_b, block=21):
     if nb < 8:
         return {'value': None, 'n_blocks': nb}
     a, b = a[-nb * block:], b[-nb * block:]
-    rhos = np.array([np.corrcoef(a[i * block:(i + 1) * block], b[i * block:(i + 1) * block])[0, 1]
+    rhos = np.array([corr_est(a[i * block:(i + 1) * block], b[i * block:(i + 1) * block])
                      for i in range(nb)])
     raw = float(np.var(np.diff(rhos), ddof=1))
     noise = float(np.mean((1 - rhos ** 2) ** 2)) / (block - 3)    # Fisher-z: var ~ 1/(n-3)
@@ -932,14 +948,19 @@ def implied_rho_y(sa, sb, sx):
     return (sa * sa + sb * sb - sx * sx) / (2 * sa * sb)
 
 
-def rolling_corr(a, b, n):
-    """Correlation of a[i-n:i], b[i-n:i] for every i (NaN until n points). O(len) via cumsums."""
+def rolling_corr(a, b, n, zero_mean=None):
+    """Correlation of a[i-n:i], b[i-n:i] for every i (NaN until n points). O(len) via cumsums.
+    Zero-mean by default (see REALIZED_ZERO_MEAN)."""
+    zero_mean = REALIZED_ZERO_MEAN if zero_mean is None else zero_mean
     a, b = np.asarray(a, float), np.asarray(b, float)
     c = lambda x: np.concatenate([[0.0], np.cumsum(x)])
     sa, sb, saa, sbb, sab = c(a), c(b), c(a * a), c(b * b), c(a * b)
     out = np.full(len(a) + 1, np.nan)
     i = np.arange(n, len(a) + 1)
-    ma, mb = (sa[i] - sa[i - n]) / n, (sb[i] - sb[i - n]) / n
+    if zero_mean:
+        ma = mb = 0.0
+    else:
+        ma, mb = (sa[i] - sa[i - n]) / n, (sb[i] - sb[i - n]) / n
     va = (saa[i] - saa[i - n]) / n - ma * ma
     vb = (sbb[i] - sbb[i - n]) / n - mb * mb
     cv = (sab[i] - sab[i - n]) / n - ma * mb
@@ -949,22 +970,25 @@ def rolling_corr(a, b, n):
 
 
 def corr_history(dates, spot_a, spot_b, vol_a, vol_b, vol_x, pair_a, pair_b, tenor):
-    """Daily series (aligned dates) -> implied rho_Y, trailing realized, subsequent realized.
-    trailing[t] = realized over the N returns ending at t (what you knew)
-    forward[t]  = realized over the N returns after t (what the option actually lived through)."""
-    n = TENOR_BDAYS[tenor]
+    """Daily series on the SPOT dates -> implied rho_Y, trailing realized, subsequent realized.
+    Vols may contain NaN (days the vol tickers didn't print): implied is NaN there, realized is not
+    affected — returns are always consecutive spot closes.
+    trailing[t] = realized over the returns ending at t, same window as the inputs card (min 21)
+    forward[t]  = realized over the option's life after t (tenor in business days, min 5)."""
     sA, sB = leg_info(pair_a)[1], leg_info(pair_b)[1]
     ra = sA * np.diff(np.log(np.asarray(spot_a, float)))     # returns of Y_A (USD value of ccy A)
     rb = sB * np.diff(np.log(np.asarray(spot_b, float)))
     va, vb, vx = (np.asarray(v, float) for v in (vol_a, vol_b, vol_x))
-    implied = implied_rho_y(va, vb, vx)
-    m = max(n, 5)
-    rc = rolling_corr(ra, rb, m)                             # length len(dates)
-    trailing = rc.copy()
+    with np.errstate(invalid='ignore'):
+        implied = implied_rho_y(va, vb, vx)
+    m = max(TENOR_BDAYS[tenor], 5)
+    mt = CORR_WINDOW_BDAYS[tenor]
+    trailing = rolling_corr(ra, rb, mt)                       # length len(dates)
+    rc = rolling_corr(ra, rb, m)
     forward = np.full(len(dates), np.nan)
     forward[:len(dates) - m] = rc[m:]                         # realized over (t, t+m]
     return {'dates': list(dates), 'implied': implied, 'trailing': trailing, 'forward': forward,
-            'vol_a': va, 'vol_b': vb, 'vol_x': vx, 'n': m, 'tenor': tenor}
+            'vol_a': va, 'vol_b': vb, 'vol_x': vx, 'n': m, 'n_trail': mt, 'tenor': tenor}
 
 
 def _pct(x, arr):
@@ -1088,6 +1112,141 @@ def synthetic_history(pair_a, pair_b, tenor, years=3, seed=None):
     return dates, spot_a, spot_b, va, vb, vx
 
 
+# ======================================================================
+# 21-day correlation monitor: rolling implied vs realized, MAs, daily moves, noise, diagnostics
+# ======================================================================
+def sma(x, k):
+    """Simple moving average; NaN if any value in the window is NaN."""
+    x = np.asarray(x, float)
+    out = np.full(len(x), np.nan)
+    if k <= 1:
+        return x.copy()
+    for i in range(k - 1, len(x)):
+        w = x[i - k + 1:i + 1]
+        if np.all(np.isfinite(w)):
+            out[i] = float(np.mean(w))
+    return out
+
+
+def noise_split(x):
+    """Split daily changes of a level series into noise and genuine movement.
+    Model x_t = true_t + e_t, e iid (bid/offer bounce, stale marks). Then the lag-1 autocovariance
+    of daily changes is -var(e), so  noise sd = sqrt(-cov1),  true daily move sd = sqrt(var(dx) - 2 var(e)).
+    Variance ratio VR(5) = var(5-day change) / (5 var(1-day change)): 1 = random walk, < 1 = noise / mean
+    reversion dominating day-to-day moves, > 1 = trending."""
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if len(x) < 30:
+        return None
+    d = np.diff(x)
+    v1 = float(np.var(d, ddof=1))
+    dm = d - d.mean()
+    cov1 = float(np.mean(dm[1:] * dm[:-1]))
+    noise_var = max(-cov1, 0.0)
+    true_var = max(v1 - 2 * noise_var, 0.0)
+    d5 = x[5:] - x[:-5]
+    vr = float(np.var(d5, ddof=1) / (5 * v1)) if v1 > 0 else None
+    return {'daily_sd': math.sqrt(v1), 'noise_sd': math.sqrt(noise_var), 'true_daily_sd': math.sqrt(true_var),
+            'ac1': cov1 / v1 if v1 > 0 else None, 'vr5': vr, 'n': int(len(d))}
+
+
+def corr_monitor(dates, spot_a, spot_b, implied, pair_a, pair_b, window=21, ma=5, days=21, cross_spot=None):
+    """dates/spots: consecutive spot closes for the two legs (as quoted). implied: implied rho_Y on the
+    same dates (NaN allowed). cross_spot: market close of the cross in base/quote orientation (optional).
+    Realized is zero-mean over `window` returns; returns are of 'USD value of each ccy' (sign-adjusted)."""
+    sA, sB = leg_info(pair_a)[1], leg_info(pair_b)[1]
+    pa_, pb_ = np.asarray(spot_a, float), np.asarray(spot_b, float)
+    qa, qb = np.diff(np.log(pa_)), np.diff(np.log(pb_))        # returns as quoted
+    ra, rb = sA * qa, sB * qb                                   # ccy vs USD
+    N = len(dates)
+    imp = np.asarray(implied, float)
+    real = rolling_corr(ra, rb, window)                          # zero-mean, index = date
+    real_p = rolling_corr(ra, rb, window, zero_mean=False)       # Pearson, for comparison
+    # exact decomposition of the day-over-day change in realized: rho = C / D,
+    #   C = sum ab, D = sqrt(sum a^2 sum b^2) over the window ending at date i
+    c_ = lambda x: np.concatenate([[0.0], np.cumsum(x)])
+    sab, saa, sbb = c_(ra * rb), c_(ra * ra), c_(rb * rb)
+    C = np.full(N, np.nan)
+    D = np.full(N, np.nan)
+    i = np.arange(window, N)
+    C[i] = sab[i] - sab[i - window]
+    D[i] = np.sqrt((saa[i] - saa[i - window]) * (sbb[i] - sbb[i - window]))
+    d_comove = np.full(N, np.nan)          # (C_t - C_{t-1}) / D_{t-1}: the day that entered vs the day that left
+    d_vols = np.full(N, np.nan)            # C_t (1/D_t - 1/D_{t-1}): renormalisation as window vols change
+    j = np.arange(window + 1, N)
+    d_comove[j] = (C[j] - C[j - 1]) / D[j - 1]
+    d_vols[j] = C[j] * (1 / D[j] - 1 / D[j - 1])
+    ma_imp, ma_real = sma(imp, ma), sma(real, ma)
+
+    # daily table: last `days` dates. Co-move score of each day's returns, normalised by TODAY's window
+    # RMS vols, so the mean of the last `window` scores equals today's realized exactly.
+    last = N - 1
+    rms_a = math.sqrt(float(np.mean(ra[-window:] ** 2)))
+    rms_b = math.sqrt(float(np.mean(rb[-window:] ** 2)))
+    rows = []
+    for k in range(max(1, N - days), N):
+        rr = k - 1                                               # return ending at date k
+        rows.append({'date': str(dates[k]), 'ret_a_bp': float(qa[rr] * 1e4), 'ret_b_bp': float(qb[rr] * 1e4),
+                     'score': float(ra[rr] * rb[rr] / (rms_a * rms_b)) if rms_a > 0 and rms_b > 0 else None,
+                     'realized': real[k], 'd_realized': real[k] - real[k - 1] if k >= 1 else None,
+                     'd_comove': d_comove[k], 'd_vols': d_vols[k],
+                     'implied': imp[k], 'd_implied': imp[k] - imp[k - 1] if k >= 1 else None,
+                     'ma_implied': ma_imp[k], 'ma_realized': ma_real[k], 'spread': imp[k] - real[k]})
+
+    # diagnostics on the realized calculation
+    # Lead-lag: with simultaneous closes, corr(A_t, B_t+1) and corr(B_t, A_t+1) are ~0 (sd 1/sqrt(n)).
+    # A 3-sigma band per lag keeps false alarms ~0.5% for the pair of tests. If one close lags, part of
+    # the co-movement shows up at lag 1; adding the lag-1 terms back gives the synchronous-equivalent rho.
+    nret = len(ra)
+    band = 3 / math.sqrt(nret) if nret else None
+    lag_ab = corr_est(ra[:-1], rb[1:]) if nret > 3 else None          # A today vs B tomorrow
+    lag_ba = corr_est(ra[1:], rb[:-1]) if nret > 3 else None          # B today vs A tomorrow
+    corr_full = corr_est(ra, rb) if nret > 3 else None
+    lag_adj = None
+    if nret > 3:
+        # synchronous-equivalent rho: a lagged close spreads one day's move over two returns, which
+        # moves co-variance to lag 1 AND shrinks that leg's measured variance. Add both back:
+        #   rho = [c0 + c_ab(1) + c_ba(1)] / sqrt([v_a + 2 g_a(1)] [v_b + 2 g_b(1)])   (zero-mean sums)
+        c0 = float(np.dot(ra, rb))
+        c1 = float(np.dot(ra[:-1], rb[1:]) + np.dot(ra[1:], rb[:-1]))
+        va_ = float(np.dot(ra, ra)) + 2 * float(np.dot(ra[:-1], ra[1:]))
+        vb_ = float(np.dot(rb, rb)) + 2 * float(np.dot(rb[:-1], rb[1:]))
+        if va_ > 0 and vb_ > 0:
+            lag_adj = (c0 + c1) / math.sqrt(va_ * vb_)
+    diag = {
+        'zero_mean_today': real[last], 'pearson_today': real_p[last],
+        'lag_ab': lag_ab, 'lag_ba': lag_ba, 'lag_band': band, 'n_returns': nret,
+        'corr_full': corr_full,
+        'corr_lag_adjusted': lag_adj,
+        'stale_a': int(np.sum(qa == 0)), 'stale_b': int(np.sum(qb == 0)),
+        'realized_vol_a': math.sqrt(252 * float(np.mean(ra[-window:] ** 2))) * 100,
+        'realized_vol_b': math.sqrt(252 * float(np.mean(rb[-window:] ** 2))) * 100,
+    }
+    va_, vb_ = diag['realized_vol_a'], diag['realized_vol_b']
+    diag['cross_vol_from_legs'] = math.sqrt(max(va_ ** 2 + vb_ ** 2 - 2 * real[last] * va_ * vb_, 0.0))
+    if cross_spot is not None:
+        xs = np.asarray(cross_spot, float)
+        ya = pa_ if sA > 0 else 1 / pa_
+        yb = pb_ if sB > 0 else 1 / pb_
+        synth = ya / yb                                          # cross implied by the two leg closes
+        ok = np.isfinite(xs) & (xs > 0)
+        if ok.sum() > window + 2:
+            rel = np.abs(xs[ok] / synth[ok] - 1) * 1e4
+            diag['cross_close_vs_legs_bp'] = {'median': float(np.median(rel)), 'p95': float(np.percentile(rel, 95)),
+                                              'max': float(np.max(rel)), 'n': int(ok.sum())}
+            okr = ok[1:] & ok[:-1]
+            rx = np.diff(np.log(np.where(ok, xs, np.nan)))
+            sel = np.where(okr)[0][-window:]
+            if len(sel) >= window // 2:
+                diag['cross_vol_direct'] = math.sqrt(252 * float(np.mean(rx[sel] ** 2))) * 100
+                diag['cross_vol_window_n'] = int(len(sel))
+    return {'dates': [str(d) for d in dates], 'implied': imp, 'realized': real, 'realized_pearson': real_p,
+            'ma_implied': ma_imp, 'ma_realized': ma_real, 'rows': rows, 'diag': diag,
+            'noise_implied': noise_split(imp), 'noise_realized_dd': noise_split(real),
+            'sampling_sd': (1 - real[last] ** 2) / math.sqrt(window) if math.isfinite(real[last]) else None,
+            'window': window, 'ma': ma}
+
+
 # ######################################################################
 #                       DATA: BLOOMBERG + PLACEHOLDERS
 # ######################################################################
@@ -1170,6 +1329,10 @@ class BBG:
                 req.getElement('securities').appendValue(t)
             req.getElement('fields').appendValue(field)
             req.set('periodicitySelection', 'DAILY')
+            # don't inherit terminal defaults: weekend/holiday fills would put zero returns in the
+            # window and make a "21-row" window ~15 business days
+            req.set('nonTradingDayFillOption', 'ACTIVE_DAYS_ONLY')
+            req.set('nonTradingDayFillMethod', 'NIL_VALUE')
             req.set('startDate', start.strftime('%Y%m%d'))
             req.set('endDate', end.strftime('%Y%m%d'))
             self.session.sendRequest(req)
@@ -1406,13 +1569,14 @@ def get_corr_history(a, b, tenor, years):
             hx = next((h[f'{x}V{tenor} Curncy'] for x in xn if h.get(f'{x}V{tenor} Curncy')), {})
             if not hx:
                 raise RuntimeError(f'no history for {base + quote}V{tenor} (either orientation)')
-            sets = [set(k for k, v in h[tks[k2]].items() if v and v > 0) for k2 in tks] + [set(k for k, v in hx.items() if v and v > 0)]
-            dates = sorted(set.intersection(*sets))
+            dates = sorted(d for d in set(h[tks['sa']]) & set(h[tks['sb']]) if h[tks['sa']][d] > 0 and h[tks['sb']][d] > 0)
             if len(dates) < TENOR_BDAYS[tenor] + 40:
-                raise RuntimeError(f'only {len(dates)} aligned dates')
+                raise RuntimeError(f'only {len(dates)} common spot dates')
+            g = lambda src_, d: src_[d] if src_.get(d) and src_[d] > 0 else float('nan')
             series = (dates, [h[tks['sa']][d] for d in dates], [h[tks['sb']][d] for d in dates],
-                      [h[tks['va']][d] for d in dates], [h[tks['vb']][d] for d in dates], [hx[d] for d in dates])
-            src, note = 'BBG', f'BDH {dates[0]} -> {dates[-1]}, {len(dates)} aligned days'
+                      [g(h[tks['va']], d) for d in dates], [g(h[tks['vb']], d) for d in dates], [g(hx, d) for d in dates])
+            gaps = sum(1 for d in dates if not (hx.get(d) and h[tks['va']].get(d) and h[tks['vb']].get(d)))
+            src, note = 'BBG', f'BDH {dates[0]} -> {dates[-1]}, {len(dates)} spot days' + (f', implied missing on {gaps}' if gaps else '')
         except Exception as e:
             log(f'BBG corr history failed: {e}')
             note = f'Bloomberg history unavailable ({e}); showing SYNTHETIC data.'
@@ -1426,10 +1590,79 @@ def get_corr_history(a, b, tenor, years):
         hist[k] = hist[k][cut:]
     hist['dates'] = hist['dates'][cut:]
     stats = corr_trade_stats(hist)
-    return {'cross': base + quote, 'tenor': tenor, 'source': src, 'note': note, 'window': hist['n'],
+    return {'cross': base + quote, 'tenor': tenor, 'source': src, 'note': note, 'window': hist['n'], 'window_trail': hist['n_trail'],
             'sign_note': f'rho_Y = corr({base} vs USD, {quote} vs USD); long correlation = short {base + quote} vol vs legs',
             'dates': [str(d) for d in hist['dates']], 'implied': _clean(hist['implied']),
             'trailing': _clean(hist['trailing']), 'forward': _clean(hist['forward']), 'stats': stats}
+
+
+def get_corr_monitor(a, b, tenor='1M', window=21, ma=5, years=1.0, days=21):
+    a, b = a.upper(), b.upper()
+    base, quote = cross_ccys(a, b)
+    src, note = 'SYNTHETIC', 'SYNTHETIC history (no Bloomberg) — illustrates the tool, not the market.'
+    pulled = None
+    if BB.available():
+        try:
+            end = date.today()
+            start = end - timedelta(days=int(365 * max(years, 3.0)) + 120)    # diagnostics use >= 3y
+            xn = [base + quote, quote + base]
+            tks = [f'{a} Curncy', f'{b} Curncy', f'{a}V{tenor} Curncy', f'{b}V{tenor} Curncy'] \
+                + [f'{x} Curncy' for x in xn] + [f'{x}V{tenor} Curncy' for x in xn]
+            h = BB.hist(tks, 'PX_LAST', start, end)
+            sa_, sb_ = h.get(f'{a} Curncy', {}), h.get(f'{b} Curncy', {})
+            dates = sorted(d for d in set(sa_) & set(sb_) if sa_[d] > 0 and sb_[d] > 0)
+            if len(dates) < window + 30:
+                raise RuntimeError(f'only {len(dates)} common spot dates')
+            vx_d, vx_nm = next(((h[f'{x}V{tenor} Curncy'], x) for x in xn if h.get(f'{x}V{tenor} Curncy')), ({}, None))
+            xs_d, xs_inv = {}, False
+            if h.get(f'{xn[0]} Curncy'):
+                xs_d = h[f'{xn[0]} Curncy']
+            elif h.get(f'{xn[1]} Curncy'):
+                xs_d, xs_inv = h[f'{xn[1]} Curncy'], True
+            g = lambda d_, k: d_[k] if d_.get(k) and d_[k] > 0 else float('nan')
+            va = np.array([g(h.get(f'{a}V{tenor} Curncy', {}), d) for d in dates])
+            vb = np.array([g(h.get(f'{b}V{tenor} Curncy', {}), d) for d in dates])
+            vx = np.array([g(vx_d, d) for d in dates])
+            xs = np.array([g(xs_d, d) for d in dates])
+            if xs_inv:
+                xs = 1 / xs
+            pulled = (dates, [sa_[d] for d in dates], [sb_[d] for d in dates], va, vb, vx, xs)
+            miss = int(np.sum(~np.isfinite(vx)))
+            src, note = 'BBG', (f'BDH {dates[0]} -> {dates[-1]}, {len(dates)} spot days'
+                                + (f'; implied missing on {miss}' if miss else '')
+                                + ('' if vx_nm else f'; no {base + quote}V{tenor} history (implied unavailable)'))
+        except Exception as e:
+            log(f'BBG corr monitor failed: {e}')
+            note = f'Bloomberg history unavailable ({e}); showing SYNTHETIC data.'
+    if pulled is None:
+        dates, pa_, pb_, va, vb, vx = synthetic_history(a, b, tenor, max(years, 3.0) + 0.5)
+        sA, sB = leg_info(a)[1], leg_info(b)[1]
+        ya = np.asarray(pa_) if sA > 0 else 1 / np.asarray(pa_)
+        yb = np.asarray(pb_) if sB > 0 else 1 / np.asarray(pb_)
+        if leg_info(a)[0] != base:
+            ya, yb = yb, ya
+        pulled = (dates, pa_, pb_, np.asarray(va), np.asarray(vb), np.asarray(vx), ya / yb)
+    dates, pa_, pb_, va, vb, vx, xs = pulled
+    with np.errstate(invalid='ignore'):
+        imp = implied_rho_y(np.asarray(va, float), np.asarray(vb, float), np.asarray(vx, float))
+    # monitor works in (base leg, quote leg) order so the cross check is in base/quote units
+    if leg_info(a)[0] != base:
+        a2, b2, p1, p2 = b, a, pb_, pa_
+    else:
+        a2, b2, p1, p2 = a, b, pa_, pb_
+    M = corr_monitor(dates, p1, p2, imp, a2, b2, window=window, ma=ma, days=days, cross_spot=xs)
+    cut = max(0, len(M['dates']) - int(252 * years))
+    ser = {k: _clean(M[k][cut:]) for k in ('implied', 'realized', 'realized_pearson', 'ma_implied', 'ma_realized')}
+    clean_row = lambda r: {k: (round(v, 6) if isinstance(v, float) and math.isfinite(v) else
+                               (None if isinstance(v, float) else v)) for k, v in r.items()}
+    out = {'cross': base + quote, 'leg_base': a2, 'leg_quote': b2, 'tenor': tenor, 'source': src, 'note': note,
+           'window': window, 'ma': ma, 'dates': M['dates'][cut:], **ser,
+           'rows': [clean_row(r) for r in M['rows']],
+           'diag': {k: (v if not isinstance(v, float) or math.isfinite(v) else None) for k, v in M['diag'].items()},
+           'noise_implied': M['noise_implied'], 'noise_realized_dd': M['noise_realized_dd'],
+           'sampling_sd': M['sampling_sd'],
+           'sign_note': f'rho = corr({base} vs USD, {quote} vs USD), zero-mean over {window} daily returns'}
+    return out
 
 
 # ######################################################################
@@ -1523,6 +1756,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, get_corr(q['a'], q['b']))
             elif u.path == '/api/cross_market':
                 self._send(200, get_cross_market(q['a'], q['b']))
+            elif u.path == '/api/corr_monitor':
+                self._send(200, get_corr_monitor(q['a'], q['b'], q.get('tenor', '1M'), int(q.get('window', 21)),
+                                                 int(q.get('ma', 5)), float(q.get('years', 1))))
             elif u.path == '/api/corr_history':
                 self._send(200, get_corr_history(q['a'], q['b'], q.get('tenor', '3M'), float(q.get('years', 3))))
             else:
@@ -1650,16 +1886,17 @@ details summary{cursor:pointer;color:var(--text-secondary);margin-top:8px}
 <section class="grid2"><div class="card" id="cardA"></div><div class="card" id="cardB"></div></section>
 <section class="card" id="cardC"></section>
 <section class="card" id="results"><h2>Cross surface</h2><div class="empty">Generate to build the cross surface.</div></section>
+<section class="card" id="cardMon"></section>
 <section class="card" id="cardAn"></section>
 </main>
 <script>
 const TENORS=['1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y'];
 const FIELDS=[['fwd_pts','Fwd pts'],['atm','ATM'],['rr25','25 RR'],['rr10','10 RR'],['bf25','25 BF'],['bf10','10 BF']];
-const LS='crossvol_state_v3';
+const LS='crossvol_state_v4';
 let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
-       legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null};
+       legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
 const $=id=>document.getElementById(id);
-function save(){try{localStorage.setItem(LS,JSON.stringify({...S,result:null,hist:null}));}catch(e){}}
+function save(){try{localStorage.setItem(LS,JSON.stringify({...S,result:null,hist:null,monData:null}));}catch(e){}}
 function load(){try{const r=localStorage.getItem(LS);if(r)Object.assign(S,JSON.parse(r));}catch(e){}}
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 function status(msg,cls){const el=$('status');el.className='status '+(cls||'');el.textContent=msg||'';}
@@ -1910,7 +2147,7 @@ function renderAnBody(){
   let t='<table class="kv">';
   t+='<tr class="h"><td colspan="2">Now ('+st.asof+', '+st.tenor+')</td></tr>';
   t+=row('Implied ρ',f(n.implied,3)+' · '+pctTxt(n.implied_pct)+' of lookback'+(n.implied_z!=null?' · z '+sgn(n.implied_z,2):''));
-  t+=row('Trailing realized ('+st.window+'d)',f(n.trailing,3));
+  t+=row('Trailing realized ('+(H.window_trail||st.window)+'d, zero-mean)',f(n.trailing,3));
   t+=row('Implied − trailing',sgn(n.spread,3)+' · '+pctTxt(n.spread_pct));
   t+=row('Cross vol per 0.01 ρ',f(n.dvol_drho/100,3)+' vol (σA·σB / σX)');
   t+='<tr class="h"><td colspan="2">Premium: implied − subsequently realized (over the option\'s life)</td></tr>';
@@ -1953,7 +2190,7 @@ function renderAnBody(){
     +'<div><div class="meta"><b style="color:var(--text-primary)">'+st.tenor+' implied vs realized ρ</b> ('+H.note+')</div><div id="chHist" class="chart"></div></div>'
     +'<div><div class="meta"><b style="color:var(--text-primary)">Spread</b> implied − realized</div><div id="chSpr" class="chart"></div></div>'
     +'<div><div class="meta"><b style="color:var(--text-primary)">Premium distribution</b> implied − subsequent realized</div><div id="chPrem" class="chart"></div></div></div>'
-    +'<div class="note">'+H.sign_note+'. Trailing realized = the '+st.window+' daily returns before each date; subsequent realized = the '+st.window+' after it (the option\'s life), so it stops '+st.window+' business days before today.</div>';
+    +'<div class="note">'+H.sign_note+'. Trailing realized = the '+(H.window_trail||st.window)+' daily returns before each date; subsequent realized = the '+st.window+' after it (the option\'s life), so it stops '+st.window+' business days before today. Realized ρ is zero-mean (consistent with implied ρ and with the trade\'s P&L).</div>';
   drawAnCharts();
 }
 function drawAnCharts(){
@@ -1982,13 +2219,117 @@ function drawAnCharts(){
     {x:ten,y:ten.map(t=>{const v=realized('rho',t);return v==null?null:sAB*v;}),mode:'lines+markers',name:'Trailing realized',line:{color:css('--s2'),width:2},marker:{size:8}}],Lt,CFG);
 }
 
+
+// ===================== 21-day correlation monitor =====================
+function renderMonitor(){
+  const el=$('cardMon'),C=S.mon,c=crossNm();
+  let h='<h2>Correlation monitor — '+c+(S.monData?' <span class="badge '+(S.monData.source==='BBG'?'BBG':'PLACEHOLDER')+'">'+S.monData.source+'</span>':'')+'</h2>';
+  h+='<div class="meta">Rolling implied ρ (from the '+C.tenor+' ATMs) vs rolling realized ρ over the last '+C.window+' daily returns, with '+C.ma+'-day moving averages and the day-over-day moves. '
+    +'ρ = corr(ccy vs USD) as in the analytics card; realized is zero-mean.</div>';
+  h+='<div class="controls" style="margin-bottom:10px">'
+    +'<label class="f">Implied tenor<select id="monTenor">'+TENORS.map(t=>'<option'+(t===C.tenor?' selected':'')+'>'+t+'</option>').join('')+'</select></label>'
+    +'<label class="f">Realized window (days)<input id="monWin" class="num" value="'+C.window+'"></label>'
+    +'<label class="f">MA (days)<input id="monMa" class="num" value="'+C.ma+'"></label>'
+    +'<label class="f">Lookback<select id="monYears">'+[[0.5,'6M'],[1,'1Y'],[2,'2Y'],[3,'3Y']].map(([v,l])=>'<option value="'+v+'"'+(v==C.years?' selected':'')+'>'+l+'</option>').join('')+'</select></label>'
+    +'<button class="act primary" id="btnMon">Load monitor</button></div>';
+  h+='<div id="monBody">'+(S.monData?'':'<div class="empty">Load to see rolling implied vs realized, the moving averages and the last '+C.window+' days\' moves.</div>')+'</div>';
+  el.innerHTML=h;
+  $('monTenor').onchange=e=>{C.tenor=e.target.value;save();};
+  $('monWin').onchange=e=>{C.window=Math.max(5,parseInt(e.target.value)||21);save();};
+  $('monMa').onchange=e=>{C.ma=Math.max(1,parseInt(e.target.value)||5);save();};
+  $('monYears').onchange=e=>{C.years=+e.target.value;save();};
+  $('btnMon').onclick=loadMon;
+  if(S.monData)renderMonBody();
+}
+async function loadMon(){
+  const C=S.mon;$('monBody').innerHTML='<div class="empty">Loading…</div>';
+  try{S.monData=await api('/api/corr_monitor?a='+S.pairA+'&b='+S.pairB+'&tenor='+C.tenor+'&window='+C.window+'&ma='+C.ma+'&years='+C.years);renderMonitor();}
+  catch(e){$('monBody').innerHTML='<div class="empty err">Monitor failed: '+e.message+'</div>';}
+}
+function renderMonBody(){
+  const D=S.monData,el=$('monBody'),rows=D.rows,last=rows[rows.length-1]||{},d=D.diag,ni=D.noise_implied||{},nr=D.noise_realized_dd||{};
+  const lagBad=d.lag_band!=null&&(Math.abs(d.lag_ab)>d.lag_band||Math.abs(d.lag_ba)>d.lag_band);
+  const row=(k,v,cl)=>'<tr><td>'+k+'</td><td class="'+(cl||'')+'">'+v+'</td></tr>';
+  const W=D.window;
+  let t='<table class="kv">';
+  t+='<tr class="h"><td colspan="2">Today ('+(last.date||'—')+')</td></tr>';
+  t+=row('Implied ρ ('+D.tenor+')',f(last.implied,3)+' · d/d '+sgn(last.d_implied,3)+' · '+D.ma+'d MA '+f(last.ma_implied,3));
+  t+=row('Realized ρ ('+W+'d)',f(last.realized,3)+' · d/d '+sgn(last.d_realized,3)+' · '+D.ma+'d MA '+f(last.ma_realized,3));
+  t+=row('Implied − realized',sgn(last.spread,3));
+  t+='<tr class="h"><td colspan="2">Noise vs movement (over the lookback)</td></tr>';
+  t+=row('Implied: daily change sd',f(ni.daily_sd,4)+' · mark noise ±'+f(ni.noise_sd,4)+' · genuine daily move '+f(ni.true_daily_sd,4));
+  t+=row('Implied: lag-1 autocorr of changes / VR(5)',sgn(ni.ac1,2)+' / '+f(ni.vr5,2)+(ni.vr5!=null?(ni.vr5<0.8?' <span class="warn">noisy: daily moves partly reverse</span>':ni.vr5>1.2?' trending':' ≈ random walk'):''));
+  t+=row('Realized: daily change sd',f(nr.daily_sd,4)+' (one day in, one day out of the window)');
+  t+=row('Realized: sampling error of the '+W+'d level',D.sampling_sd!=null?'± '+f(D.sampling_sd,3)+' (1−ρ²)/√'+W:'—');
+  t+='</table>';
+  // realized-calculation checks
+  const cc=d.cross_close_vs_legs_bp;
+  let k='<table class="kv"><tr class="h"><td colspan="2">Realized-calculation checks</td></tr>';
+  k+=row('Zero-mean vs Pearson today',f(d.zero_mean_today,3)+' vs '+f(d.pearson_today,3)+' (diff '+sgn(d.zero_mean_today-d.pearson_today,3)+')');
+  k+=row('Lag-1: '+D.leg_base+' today vs '+D.leg_quote+' next day',sgn(d.lag_ab,3)+' (noise band ±'+f(d.lag_band,3)+', '+d.n_returns+' days)',Math.abs(d.lag_ab)>d.lag_band?'warn':'');
+  k+=row('Lag-1: '+D.leg_quote+' today vs '+D.leg_base+' next day',sgn(d.lag_ba,3),Math.abs(d.lag_ba)>d.lag_band?'warn':'');
+  k+=row('Full-sample realized ('+d.n_returns+' days)',f(d.corr_full,3)+(lagBad?' · lead-lag adjusted '+f(d.corr_lag_adjusted,3):' · no lead-lag adjustment needed'));
+  k+=row('Unchanged closes (stale)',D.leg_base+' '+d.stale_a+' · '+D.leg_quote+' '+d.stale_b+' of '+d.n_returns+' days',(d.stale_a+d.stale_b)>3?'warn':'');
+  if(cc)k+=row(D.cross+' close vs legs\' product','median '+f(cc.median,1)+'bp · 95% '+f(cc.p95,1)+'bp · max '+f(cc.max,1)+'bp',cc.median>5?'warn':'');
+  k+=row('Realized '+D.cross+' vol: from legs + ρ / direct',f(d.cross_vol_from_legs,2)+' / '+(d.cross_vol_direct!=null?f(d.cross_vol_direct,2):'— (no cross close history)'),
+         d.cross_vol_direct!=null&&Math.abs(d.cross_vol_direct-d.cross_vol_from_legs)>0.25?'warn':'');
+  k+='</table>';
+  const notes=[];
+  if(lagBad)notes.push('Lag-1 correlation outside the noise band: the two closes are probably not simultaneous, which pulls realized ρ toward zero (here '+f(d.corr_full,3)+' measured vs '+f(d.corr_lag_adjusted,3)+' lead-lag adjusted). Check the pricing source / close time of both legs.');
+  if(cc&&cc.median>5)notes.push('The cross close differs from the legs\' product by a median '+f(cc.median,1)+'bp: the cross and legs close at different times or sources.');
+  if(d.cross_vol_direct!=null&&Math.abs(d.cross_vol_direct-d.cross_vol_from_legs)>0.25)notes.push('Realized cross vol measured directly differs from legs+ρ by '+f(Math.abs(d.cross_vol_direct-d.cross_vol_from_legs),2)+' vol: the identity is exact for simultaneous closes, so this points to timing.');
+  if(!notes.length)notes.push('Checks pass: closes look simultaneous and the realized identity holds'+(d.cross_vol_direct!=null?' ('+f(d.cross_vol_from_legs,2)+' vs '+f(d.cross_vol_direct,2)+')':'')+'.');
+  // table
+  const fx=(x,dp)=>x==null?'—':Number(x).toFixed(dp);
+  let tb='<div class="scroll"><table><thead><tr><th>Date</th><th class="sep">'+D.leg_base+' bp</th><th>'+D.leg_quote+' bp</th><th>Co-move</th>'
+    +'<th class="sep">Realized</th><th>Δ d/d</th><th>from in/out day</th><th>from vols</th><th class="sep">Implied</th><th>Δ d/d</th>'
+    +'<th class="sep">MA impl</th><th>MA real</th><th class="sep">Impl − real</th></tr></thead><tbody>';
+  rows.slice().reverse().forEach(r=>{tb+='<tr><td class="lab">'+r.date+'</td><td class="sep">'+fx(r.ret_a_bp,1)+'</td><td>'+fx(r.ret_b_bp,1)+'</td>'
+    +'<td class="'+(r.score==null?'':(r.score>=0?'pos':'negv'))+'">'+sgn(r.score,2)+'</td>'
+    +'<td class="sep hl">'+fx(r.realized,3)+'</td><td>'+sgn(r.d_realized,3)+'</td><td>'+sgn(r.d_comove,3)+'</td><td>'+sgn(r.d_vols,3)+'</td>'
+    +'<td class="sep hl">'+fx(r.implied,3)+'</td><td>'+sgn(r.d_implied,3)+'</td>'
+    +'<td class="sep">'+fx(r.ma_implied,3)+'</td><td>'+fx(r.ma_realized,3)+'</td><td class="sep">'+sgn(r.spread,3)+'</td></tr>';});
+  tb+='</tbody></table></div><div class="note">Leg returns are as quoted. Co-move = the day\'s (ccy vs USD) return product ÷ today\'s '+W+'-day RMS vols; the mean of the last '+W+' co-moves is today\'s realized ρ exactly. '
+    +'Realized Δ d/d splits exactly into "from in/out day" (the day that entered vs the day that dropped out) + "from vols" (renormalisation as the window\'s vols change). '
+    +'Noise split: daily change variance = 2 × mark-noise² + genuine-move², with mark noise estimated from how much daily changes reverse the next day.</div>';
+  el.innerHTML='<div class="an-top"><div>'+t+'</div><div>'+k+'<ul class="ev">'+notes.map(x=>'<li>'+x+'</li>').join('')+'</ul></div></div>'
+    +'<div class="charts" style="margin-top:14px;grid-template-columns:1.5fr 1fr 1fr">'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Rolling implied vs '+W+'d realized</b> (dashed = '+D.ma+'d MA) · '+D.note+'</div><div id="chMonLvl" class="chart"></div></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Day-over-day moves</b> last '+rows.length+' days (dotted = ±1 sd of daily Δ implied)</div><div id="chMonDD" class="chart"></div></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Daily co-move</b> last '+W+' days (dashed = mean = realized)</div><div id="chMonSc" class="chart"></div></div></div>'
+    +'<div style="margin-top:12px">'+tb+'</div>';
+  drawMon();
+}
+function drawMon(){
+  if(typeof Plotly==='undefined')return;
+  const D=S.monData,x=D.dates,rows=D.rows,W=D.window;
+  const L1=baseLayout('ρ');
+  Plotly.react('chMonLvl',[{x,y:D.implied,mode:'lines',name:'Implied '+D.tenor,line:{color:css('--s1'),width:2}},
+    {x,y:D.realized,mode:'lines',name:'Realized '+W+'d',line:{color:css('--s2'),width:2}},
+    {x,y:D.ma_implied,mode:'lines',name:D.ma+'d MA implied',line:{color:css('--s1'),width:1.5,dash:'dash'}},
+    {x,y:D.ma_realized,mode:'lines',name:D.ma+'d MA realized',line:{color:css('--s2'),width:1.5,dash:'dash'}}],L1,CFG);
+  const dx=rows.map(r=>r.date.slice(5));
+  const L2=baseLayout('Δρ');L2.barmode='group';L2.bargap=0.25;L2.xaxis.type='category';L2.xaxis.tickangle=-45;L2.margin.b=60;
+  const sd=(D.noise_implied||{}).daily_sd;
+  if(sd)L2.shapes=[sd,-sd].map(v=>({type:'line',xref:'paper',x0:0,x1:1,y0:v,y1:v,line:{color:css('--ref'),width:1,dash:'dot'}}));
+  L2.yaxis.zerolinecolor=css('--text-muted');
+  Plotly.react('chMonDD',[{x:dx,y:rows.map(r=>r.d_implied),type:'bar',name:'Δ implied',marker:{color:css('--s1')}},
+    {x:dx,y:rows.map(r=>r.d_realized),type:'bar',name:'Δ realized',marker:{color:css('--s2')}}],L2,CFG);
+  const sr=rows.slice(-W),last=rows[rows.length-1]||{};
+  const L3=baseLayout('co-move');L3.xaxis.type='category';L3.xaxis.tickangle=-45;L3.margin.b=60;L3.showlegend=false;L3.hovermode='closest';
+  L3.yaxis.zerolinecolor=css('--text-muted');
+  if(last.realized!=null)L3.shapes=[{type:'line',xref:'paper',x0:0,x1:1,y0:last.realized,y1:last.realized,line:{color:css('--ref'),width:1.5,dash:'dash'}}];
+  Plotly.react('chMonSc',[{x:sr.map(r=>r.date.slice(5)),y:sr.map(r=>r.score),type:'bar',name:'co-move',marker:{color:css('--s3')},
+    hovertemplate:'%{x}<br>co-move %{y:.2f}<extra></extra>'}],L3,CFG);
+}
+
 async function init(){
   load();
   const st=await api('/api/status').catch(()=>({bbg:false,pairs:['EURUSD','USDCAD'],error:'server unreachable'}));
   $('bbgDot').className='dot '+(st.bbg?'ok':'bad');$('bbgTxt').textContent=st.bbg?'Bloomberg connected':'Bloomberg offline — placeholders';
   if(!st.bbg&&st.error)$('bbgTxt').title=st.error;
   ['pairA','pairB'].forEach(id=>{$(id).innerHTML=st.pairs.map(p=>'<option>'+p+'</option>').join('');$(id).value=S[id];
-    $(id).onchange=async e=>{S[id]=e.target.value;S.ov={rho:{},rs:{},sr:{}};updateCross();save();S.hist=null;S.mkt=null;renderAnalytics();await Promise.all([loadLeg(id==='pairA'?'A':'B'),loadCorr(),loadMkt()]);renderCorr();};});
+    $(id).onchange=async e=>{S[id]=e.target.value;S.ov={rho:{},rs:{},sr:{}};updateCross();save();S.hist=null;S.mkt=null;S.monData=null;renderAnalytics();renderMonitor();await Promise.all([loadLeg(id==='pairA'?'A':'B'),loadCorr(),loadMkt()]);renderCorr();};});
   $('usdRate').value=S.usd_rate;$('usdRate').onchange=e=>{S.usd_rate=parseFloat(e.target.value)||0;save();};
   segInit();updateCross();
   $('btnPull').onclick=async()=>{await Promise.all([loadLeg('A'),loadLeg('B'),loadMkt()]);renderCorr();};
@@ -1996,7 +2337,7 @@ async function init(){
   if(S.legs.A&&S.legs.A.pair===S.pairA)renderLeg('A');else loadLeg('A');
   if(S.legs.B&&S.legs.B.pair===S.pairB)renderLeg('B');else loadLeg('B');
   if(S.corr&&S.corr.vol_vol)renderCorr();else loadCorr();
-  loadMkt();renderAnalytics();
+  loadMkt();renderMonitor();renderAnalytics();
 }
 init();
 </script></body></html>"""
@@ -2017,6 +2358,10 @@ def selftest():
 
     def rows_flat(atm, pts=0.0, tenors=TENORS):
         return {t: {'fwd_pts': pts, 'atm': atm, 'rr25': 0.0, 'rr10': 0.0, 'bf25': 0.0, 'bf10': 0.0} for t in tenors}
+
+    def zm_ref(x, y):            # zero-mean realized correlation, written out independently
+        x, y = np.asarray(x, float), np.asarray(y, float)
+        return float(np.dot(x, y) / math.sqrt(np.dot(x, x) * np.dot(y, y)))
 
     print('\n1) Lognormal limit: flat smiles -> flat cross, ATM = variance formula (both wing models)')
     A = {'pair': 'EURUSD', 'spot': 1.08, 'fwd_scale': 10000, 'rows': rows_flat(7.5, 20)}
@@ -2132,9 +2477,9 @@ def selftest():
     eur = 1.08 * np.exp(np.concatenate([[0], np.cumsum(0.0047 * z1)]))
     usdcad = 1.37 * np.exp(-np.concatenate([[0], np.cumsum(0.0038 * (0.45 * z1 + math.sqrt(1 - 0.45 ** 2) * z2))]))
     rc = realized_corr(eur, usdcad, 'EURUSD', 'USDCAD')
-    zz = z1[-504:]
-    exact = np.corrcoef(zz, 0.45 * zz + math.sqrt(1 - 0.45 ** 2) * z2[-504:])[0, 1]   # sample corr of the shocks
-    check('spot rho = exact sample corr, quoted sign flipped for USDCAD',
+    ra8, rb8 = np.diff(np.log(eur))[-504:], -np.diff(np.log(usdcad))[-504:]
+    exact = zm_ref(ra8, rb8)                   # zero-mean sample corr of the (ccy vs USD) returns
+    check('spot rho = zero-mean sample corr, quoted sign flipped for USDCAD',
           abs(rc['2Y']['rho_y'] - exact) < 1e-10 and abs(rc['2Y']['rho_quoted'] + exact) < 1e-10,
           f"(rho_Y {rc['2Y']['rho_y']:+.4f} vs shocks {exact:+.4f}; quoted {rc['2Y']['rho_quoted']:+.4f})")
     cv_const = corr_vol(eur, usdcad)
@@ -2274,8 +2619,11 @@ def selftest():
     rng3 = np.random.default_rng(5)
     a3, b3 = rng3.standard_normal(400), rng3.standard_normal(400)
     rc3 = rolling_corr(a3, b3, 63)
-    worst = max(abs(rc3[i] - np.corrcoef(a3[i - 63:i], b3[i - 63:i])[0, 1]) for i in (63, 150, 399, 400))
-    check('rolling corr = np.corrcoef on every window', worst < 1e-10, f'(max diff {worst:.1e})')
+    worst = max(abs(rc3[i] - zm_ref(a3[i - 63:i], b3[i - 63:i])) for i in (63, 150, 399, 400))
+    rp3 = rolling_corr(a3, b3, 63, zero_mean=False)
+    worst_p = max(abs(rp3[i] - np.corrcoef(a3[i - 63:i], b3[i - 63:i])[0, 1]) for i in (63, 150, 399, 400))
+    check('rolling corr: zero-mean = written-out formula, Pearson = np.corrcoef', worst < 1e-10 and worst_p < 1e-10,
+          f'(max diff {worst:.1e} / {worst_p:.1e})')
     # forward window alignment: forward[t] must use the n returns AFTER date t
     nd3 = 300
     pxa = 1.08 * np.exp(np.concatenate([[0], np.cumsum(0.005 * a3[:nd3 - 1])]))
@@ -2284,8 +2632,8 @@ def selftest():
                       'EURUSD', 'USDCAD', '3M')
     ra3, rb3 = np.diff(np.log(pxa)), -np.diff(np.log(pxb))
     t3 = 100
-    ok_f = abs(h3['forward'][t3] - np.corrcoef(ra3[t3:t3 + 63], rb3[t3:t3 + 63])[0, 1]) < 1e-10
-    ok_t = abs(h3['trailing'][t3] - np.corrcoef(ra3[t3 - 63:t3], rb3[t3 - 63:t3])[0, 1]) < 1e-10
+    ok_f = abs(h3['forward'][t3] - zm_ref(ra3[t3:t3 + 63], rb3[t3:t3 + 63])) < 1e-10
+    ok_t = abs(h3['trailing'][t3] - zm_ref(ra3[t3 - 63:t3], rb3[t3 - 63:t3])) < 1e-10
     check('trailing uses the 63 returns before t, subsequent the 63 after', ok_f and ok_t
           and np.all(np.isnan(h3['forward'][-63:])))
     # known premium: implied = subsequent realized + 0.05 exactly -> mean premium 0.05, long rho never wins
@@ -2316,6 +2664,79 @@ def selftest():
     La, Lb = placeholder_surface('EURUSD'), placeholder_surface('USDCAD')
     iy = implied_rho_y(La['rows']['3M']['atm'], Lb['rows']['3M']['atm'], M['rows']['3M']['atm'])
     check('placeholder cross ATM implies rho_Y = placeholder - 0.06', abs(iy - (0.45 - 0.06)) < 0.003, f'({iy:+.4f})')
+
+    print('\n13) Realized-correlation fixes and the 21-day monitor')
+    rng4 = np.random.default_rng(21)
+    n4 = 800
+    e1, e2 = rng4.standard_normal(n4), rng4.standard_normal(n4)
+    ya4 = 1.08 * np.exp(np.concatenate([[0], np.cumsum(0.0045 * e1[1:])]))              # USD per EUR
+    yb4 = (1 / 1.37) * np.exp(np.concatenate([[0], np.cumsum(0.0035 * (0.45 * e1[1:] + math.sqrt(1 - 0.45 ** 2) * e2[1:]))]))
+    eurusd4, usdcad4 = ya4, 1 / yb4
+    cross4 = ya4 / yb4                                                                   # EURCAD, perfectly synchronous
+    imp4 = np.full(n4, 0.40)
+    M = corr_monitor(list(range(n4)), eurusd4, usdcad4, imp4, 'EURUSD', 'USDCAD', window=21, ma=5, days=21, cross_spot=cross4)
+    ra4, rb4 = np.diff(np.log(ya4)), np.diff(np.log(yb4))
+    check('monitor realized = zero-mean formula on the last 21 returns', abs(M['realized'][-1] - zm_ref(ra4[-21:], rb4[-21:])) < 1e-12,
+          f"({M['realized'][-1]:.6f})")
+    sc = [r['score'] for r in M['rows']][-21:]
+    check('mean of the last 21 daily co-moves = realized exactly', abs(np.mean(sc) - M['realized'][-1]) < 1e-12,
+          f"({np.mean(sc):.6f} vs {M['realized'][-1]:.6f})")
+    dec = max(abs(r['d_comove'] + r['d_vols'] - r['d_realized']) for r in M['rows'][1:])
+    check('d/d realized = from in/out day + from vols, exactly, every row', dec < 1e-12, f'(max residual {dec:.1e})')
+    dg = M['diag']
+    check('realized identity: cross vol direct = from legs + rho (synchronous closes)',
+          abs(dg['cross_vol_direct'] - dg['cross_vol_from_legs']) < 1e-9 and dg['cross_close_vs_legs_bp']['max'] < 1e-6,
+          f"({dg['cross_vol_direct']:.6f} vs {dg['cross_vol_from_legs']:.6f}; close diff {dg['cross_close_vs_legs_bp']['max']:.1e}bp)")
+    check('lag-1 correlations inside the noise band when closes are synchronous',
+          abs(dg['lag_ab']) < dg['lag_band'] and abs(dg['lag_ba']) < dg['lag_band'],
+          f"({dg['lag_ab']:+.3f}, {dg['lag_ba']:+.3f} vs ±{dg['lag_band']:.3f})")
+    # asynchronous: USDCAD close records 30% of its move a day late
+    rb_async = rb4.copy()
+    rb_async[1:] = 0.7 * rb4[1:] + 0.3 * rb4[:-1]
+    yb_async = yb4[0] * np.exp(np.concatenate([[0], np.cumsum(rb_async)]))
+    Ma = corr_monitor(list(range(n4)), eurusd4, 1 / yb_async, imp4, 'EURUSD', 'USDCAD', window=21, cross_spot=cross4)
+    da = Ma['diag']
+    check('asynchronous closes are flagged (lag-1 outside band, cross close vs legs diverges)',
+          max(abs(da['lag_ab']), abs(da['lag_ba'])) > da['lag_band'] and da['cross_close_vs_legs_bp']['median'] > 5,
+          f"(lag A->B {da['lag_ab']:+.3f}, B->A {da['lag_ba']:+.3f} vs ±{da['lag_band']:.3f}; close diff median {da['cross_close_vs_legs_bp']['median']:.1f}bp)")
+    true_sync = zm_ref(ra4, rb4)
+    check('lead-lag adjustment recovers the synchronous rho',
+          abs(da['corr_lag_adjusted'] - true_sync) < abs(da['corr_full'] - true_sync) and abs(da['corr_lag_adjusted'] - true_sync) < 0.03,
+          f"(async measured {da['corr_full']:.3f}, adjusted {da['corr_lag_adjusted']:.3f}, synchronous {true_sync:.3f})")
+    # false-alarm rate of the lag test on synchronous data
+    fa = 0
+    for sd_ in range(200):
+        rr_ = np.random.default_rng(1000 + sd_)
+        g1_, g2_ = rr_.standard_normal(780), rr_.standard_normal(780)
+        x_, y_ = 0.0045 * g1_, 0.0035 * (0.45 * g1_ + math.sqrt(1 - 0.45 ** 2) * g2_)
+        bnd = 3 / math.sqrt(len(x_))
+        fa += max(abs(corr_est(x_[:-1], y_[1:])), abs(corr_est(x_[1:], y_[:-1]))) > bnd
+    check('lag test false-alarm rate on synchronous data < 2%', fa / 200 < 0.02, f'({fa}/200 = {fa / 2:.1f}%)')
+    # MA
+    ma_ok = abs(M['ma_realized'][-1] - np.mean(M['realized'][-5:])) < 1e-12 and np.isnan(sma([1.0, np.nan, 2, 3], 2)[1])
+    check('5-day MA = mean of the last 5 values; NaN-safe', ma_ok)
+    # noise split: implied = random walk + iid noise
+    rw = 0.40 + np.cumsum(0.006 * rng4.standard_normal(3000))
+    ns = noise_split(rw + 0.010 * rng4.standard_normal(3000))
+    n0 = noise_split(rw)
+    check('noise split recovers mark noise (true 0.010) and genuine daily move (true 0.006)',
+          abs(ns['noise_sd'] - 0.010) < 0.002 and abs(ns['true_daily_sd'] - 0.006) < 0.0015 and ns['vr5'] < 0.8
+          and n0['noise_sd'] < 0.0015 and 0.85 < n0['vr5'] < 1.15,
+          f"(noise {ns['noise_sd']:.4f}, move {ns['true_daily_sd']:.4f}, VR5 {ns['vr5']:.2f}; pure RW noise {n0['noise_sd']:.4f}, VR5 {n0['vr5']:.2f})")
+    # realized must not depend on gaps in the implied series
+    vx_gap = np.full(n4, 7.2)
+    vx_gap[::7] = np.nan
+    h_full = corr_history(list(range(n4)), eurusd4, usdcad4, np.full(n4, 7.5), np.full(n4, 6.0), np.full(n4, 7.2), 'EURUSD', 'USDCAD', '1M')
+    h_gap = corr_history(list(range(n4)), eurusd4, usdcad4, np.full(n4, 7.5), np.full(n4, 6.0), vx_gap, 'EURUSD', 'USDCAD', '1M')
+    same = np.allclose(h_full['trailing'], h_gap['trailing'], equal_nan=True) and np.allclose(h_full['forward'], h_gap['forward'], equal_nan=True)
+    check('realized unaffected by missing implied days (spot-only alignment)', same and np.isnan(h_gap['implied'][0]))
+    check('trailing window matches the inputs card (1W uses 21d, not 5d)',
+          corr_history(list(range(n4)), eurusd4, usdcad4, np.full(n4, 7.5), np.full(n4, 6.0), np.full(n4, 7.2), 'EURUSD', 'USDCAD', '1W')['n_trail'] == 21)
+    MM = get_corr_monitor('EURUSD', 'USDCAD', '1M', 21, 5, 1.0)
+    json.dumps(MM, allow_nan=False)
+    check('monitor endpoint: strict JSON, 21 table rows, ~1Y of dates',
+          len(MM['rows']) == 21 and 240 <= len(MM['dates']) <= 253 and MM['diag']['cross_vol_direct'] is not None,
+          f"({MM['source']}, {len(MM['dates'])} dates, realized today {MM['realized'][-1]:+.3f}, implied {MM['implied'][-1]:+.3f})")
 
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)
