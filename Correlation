@@ -42,16 +42,20 @@ import calendar
 import getpass
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
 import secrets
+import socket
+import ssl
+import subprocess
 import threading
 import time
 import traceback
 import webbrowser
 import zlib
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -116,6 +120,12 @@ PLACEHOLDER_RHO = {  # correlation of the legs AS QUOTED
 # To change it: python cross_vol.py --hash-password   and paste the printed dict over this one.
 CAD_TAB_PASSWORD = {'algo': 'pbkdf2_sha256', 'iter': 390000, 'salt': 'c5316446c9262040882bc36a9e333cdc',
                     'hash': '2e3df2b58a531722eac479118fd960a2a331bf049386361b707440deb6a026be'}
+# Password colleagues use to open the app when it is served on the network (--lan). Hash only, as above.
+# To change it: python cross_vol.py --hash-password app
+APP_PASSWORD = {'algo': 'pbkdf2_sha256', 'iter': 390000, 'salt': 'cd3df36e526d493a41dc86c0ec1d7bad',
+                'hash': 'bd72a131214c404c0c143107d4eb80148aaa84a13ca524ef2e6c890baf5825d0'}
+APP_SESSION_HOURS = 12
+VIEWERS_CAN_PULL = False      # --viewers-can-pull: let network viewers trigger Bloomberg pulls (off: they see your last pull)
 
 PLACEHOLDER_VOL_VOL_CORR = 0.60
 PLACEHOLDER_CORR_VOL = 0.20
@@ -2019,9 +2029,6 @@ def get_corr_monitor(a, b, tenor='1M', window=21, ma=5, years=1.0, days=21):
 CAD_CROSSES = [('EURUSD', 'USDCAD'), ('GBPUSD', 'USDCAD'), ('USDCAD', 'USDJPY'), ('AUDUSD', 'USDCAD'),
                ('NZDUSD', 'USDCAD'), ('USDCAD', 'USDMXN'), ('USDCAD', 'USDCHF')]
 CAD_SESSION_HOURS = 8
-_SESSIONS = {}                     # token -> expiry (epoch seconds)
-_AUTH_FAILS = {'n': 0, 'until': 0.0}
-_AUTH_LOCK = threading.Lock()
 
 
 def hash_password(pw, iterations=390000):
@@ -2030,52 +2037,75 @@ def hash_password(pw, iterations=390000):
             'hash': hashlib.pbkdf2_hmac('sha256', pw.encode(), bytes.fromhex(salt), iterations).hex()}
 
 
-def check_password(pw):
-    h = CAD_TAB_PASSWORD
+def check_password(pw, entry=None):
+    h = entry or CAD_TAB_PASSWORD
     dk = hashlib.pbkdf2_hmac('sha256', str(pw).encode(), bytes.fromhex(h['salt']), int(h['iter'])).hex()
     return hmac.compare_digest(dk, h['hash'])
 
 
-def auth_login(pw):
-    """Returns (status, token_or_message). 5 wrong attempts -> 60s lockout."""
-    with _AUTH_LOCK:
-        now = time.time()
-        if now < _AUTH_FAILS['until']:
-            return 429, f'Too many attempts — try again in {int(_AUTH_FAILS["until"] - now) + 1}s'
-    ok = check_password(pw)                                   # slow on purpose (PBKDF2); outside the lock
-    with _AUTH_LOCK:
-        if not ok:
-            _AUTH_FAILS['n'] += 1
-            if _AUTH_FAILS['n'] >= 5:
-                _AUTH_FAILS.update(n=0, until=time.time() + 60)
-                return 429, 'Too many attempts — locked for 60s'
-            return 401, 'Wrong password'
-        _AUTH_FAILS['n'] = 0
-        tok = secrets.token_urlsafe(32)
-        _SESSIONS[tok] = time.time() + CAD_SESSION_HOURS * 3600
-        for k in [k for k, v in _SESSIONS.items() if v < time.time()]:
-            _SESSIONS.pop(k, None)
-        return 200, tok
+class PasswordGate:
+    """Server-side password check -> random session token in an HttpOnly cookie.
+    5 wrong tries from one IP address lock that address out for 60s (other addresses unaffected)."""
+
+    def __init__(self, cookie, hours, entry):
+        self.cookie, self.hours, self.entry = cookie, hours, entry
+        self.sessions, self.fails, self.lock = {}, {}, threading.Lock()
+
+    def login(self, pw, ip='?'):
+        with self.lock:
+            f = self.fails.setdefault(ip, {'n': 0, 'until': 0.0})
+            now = time.time()
+            if now < f['until']:
+                return 429, f'Too many attempts — try again in {int(f["until"] - now) + 1}s'
+        ok = check_password(pw, self.entry())                 # slow on purpose (PBKDF2); outside the lock
+        with self.lock:
+            f = self.fails.setdefault(ip, {'n': 0, 'until': 0.0})
+            if not ok:
+                f['n'] += 1
+                if f['n'] >= 5:
+                    f.update(n=0, until=time.time() + 60)
+                    return 429, 'Too many attempts — locked for 60s'
+                return 401, 'Wrong password'
+            f['n'] = 0
+            tok = secrets.token_urlsafe(32)
+            self.sessions[tok] = time.time() + self.hours * 3600
+            for k in [k for k, v in self.sessions.items() if v < time.time()]:
+                self.sessions.pop(k, None)
+            return 200, tok
+
+    def check(self, cookie_header):
+        tok = None
+        for part in (cookie_header or '').split(';'):
+            k, _, v = part.strip().partition('=')
+            if k == self.cookie:
+                tok = v
+        with self.lock:
+            exp = self.sessions.get(tok) if tok else None
+            if exp and exp > time.time():
+                return tok
+            if tok:
+                self.sessions.pop(tok, None)
+        return None
+
+    def logout(self, tok):
+        with self.lock:
+            self.sessions.pop(tok, None)
+
+
+CAD_GATE = PasswordGate('cv_cad', CAD_SESSION_HOURS, lambda: CAD_TAB_PASSWORD)
+APP_GATE = PasswordGate('cv_app', APP_SESSION_HOURS, lambda: APP_PASSWORD)
+
+
+def auth_login(pw, ip='?'):
+    return CAD_GATE.login(pw, ip)
 
 
 def auth_ok(cookie_header):
-    tok = None
-    for part in (cookie_header or '').split(';'):
-        k, _, v = part.strip().partition('=')
-        if k == 'cv_cad':
-            tok = v
-    with _AUTH_LOCK:
-        exp = _SESSIONS.get(tok) if tok else None
-        if exp and exp > time.time():
-            return tok
-        if tok:
-            _SESSIONS.pop(tok, None)
-    return None
+    return CAD_GATE.check(cookie_header)
 
 
 def auth_logout(tok):
-    with _AUTH_LOCK:
-        _SESSIONS.pop(tok, None)
+    CAD_GATE.logout(tok)
 
 
 def _cad_build_worker(args):
@@ -2330,53 +2360,293 @@ def run_build_band(body):
 # ######################################################################
 #                                 HTTP
 # ######################################################################
+# ######################################################################
+#              NETWORK MODE (--lan): roles, data gate, TLS
+# ----------------------------------------------------------------------
+# host   = requests from this machine (loopback): full control, no login.
+# viewer = anyone else, after the app password: sees the Bloomberg data the host last loaded
+#          (served from cache, never pulled on the host's session unless --viewers-can-pull),
+#          builds / marks their own scenarios (pure computation), CAD tab behind its own password.
+# ######################################################################
+SERVER = {'lan': False, 'tls': False, 'allowed_hosts': {'localhost', '127.0.0.1', '::1'}}
+BUILD_SLOTS = threading.BoundedSemaphore(3)          # concurrent surface builds across all users
+_DATA_CACHE = {}
+_DATA_LOCK = threading.Lock()
+
+
+def is_loopback(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+        return a.is_loopback or (a.version == 6 and a.ipv4_mapped is not None and a.ipv4_mapped.is_loopback)
+    except ValueError:
+        return False
+
+
+def viewer_may_pull():
+    """Viewers may run the data functions themselves only when that can't touch Bloomberg."""
+    return VIEWERS_CAN_PULL or not BB.available()
+
+
+def serve_data(role, name, fn, *args):
+    """Host (or a viewer when allowed): run fn and remember the result. Viewer otherwise: the host's
+    last result for exactly these arguments, or 409 if the host hasn't loaded it."""
+    key = (name,) + tuple(args)
+    if role == 'host' or viewer_may_pull():
+        out = fn(*args)
+        with _DATA_LOCK:
+            _DATA_CACHE[key] = (datetime.now().strftime('%H:%M:%S'), out)
+        return 200, out
+    with _DATA_LOCK:
+        hit = _DATA_CACHE.get(key)
+    if hit is None:
+        what = ' '.join(str(a) for a in args)
+        return 409, {'error': f'View-only: the host hasn\'t loaded {name.replace("_", " ")} for {what} yet '
+                              f'(viewers can\'t trigger Bloomberg pulls). Ask them to load it, then retry.'}
+    out = dict(hit[1]) if isinstance(hit[1], dict) else hit[1]
+    if isinstance(out, dict):
+        out['cached_at'] = hit[0]
+    return 200, out
+
+
+def host_of(header):
+    """Hostname part of a Host header: 'Box:8090' -> 'box', '[::1]:8090' -> '::1'."""
+    h = (header or '').strip().lower()
+    if h.startswith('['):
+        return h[1:h.find(']')] if ']' in h else h
+    return h.rsplit(':', 1)[0] if h.count(':') == 1 else h
+
+
+def local_addresses():
+    """Names and IPs this machine answers to (for the Host check and the printed URLs)."""
+    names = {'localhost', '127.0.0.1', '::1'}
+    hn = socket.gethostname()
+    names |= {hn.lower(), socket.getfqdn().lower()}
+    try:
+        names |= set(socket.gethostbyname_ex(hn)[2])
+    except OSError:
+        pass
+    try:                                             # primary LAN address (no packet is sent)
+        s_ = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s_.connect(('10.255.255.255', 1))
+        names.add(s_.getsockname()[0])
+        s_.close()
+    except OSError:
+        pass
+    return {n for n in names if n}
+
+
+def _is_ip(x):
+    try:
+        ipaddress.ip_address(x)
+        return True
+    except ValueError:
+        return False
+
+
+def make_self_signed(cert_path, key_path, names, days=825):
+    """Self-signed certificate covering every name/IP in `names`. Uses the `cryptography` package,
+    else the openssl command line."""
+    dns = sorted(n for n in names if not _is_ip(n))
+    ips = sorted(n for n in names if _is_ip(n))
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+        key = ec.generate_private_key(ec.SECP256R1())
+        subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, (dns or ['crossvol'])[0][:64]),
+                          x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'Cross Vol Builder (self-signed)')])
+        now = datetime.now(timezone.utc)
+        san = [x509.DNSName(d) for d in dns] + [x509.IPAddress(ipaddress.ip_address(i)) for i in ips]
+        cert = (x509.CertificateBuilder().subject_name(subj).issuer_name(subj).public_key(key.public_key())
+                .serial_number(x509.random_serial_number()).not_valid_before(now - timedelta(minutes=5))
+                .not_valid_after(now + timedelta(days=days))
+                .add_extension(x509.SubjectAlternativeName(san), critical=False)
+                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                .sign(key, hashes.SHA256()))
+        with open(key_path, 'wb') as fh:
+            fh.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+        with open(cert_path, 'wb') as fh:
+            fh.write(cert.public_bytes(serialization.Encoding.PEM))
+    except ImportError:
+        san = ','.join([f'DNS:{d}' for d in dns] + [f'IP:{i}' for i in ips])
+        try:
+            subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+                            '-keyout', key_path, '-out', cert_path, '-days', str(days), '-subj', f'/CN={(dns or ["crossvol"])[0][:64]}',
+                            '-addext', f'subjectAltName={san}'], check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError) as e:
+            raise SystemExit('Could not create a TLS certificate: install it with  pip install cryptography  '
+                             f'or pass --cert / --key (your firm\'s certificate is better anyway). ({e})')
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
+
+
+def cert_names(cert_path):
+    """Names in a PEM certificate's SAN (best effort; empty set if unreadable)."""
+    try:
+        from cryptography import x509
+        c = x509.load_pem_x509_certificate(open(cert_path, 'rb').read())
+        san = c.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        return {str(v).lower() for v in san.get_values_for_type(x509.DNSName)} | {str(v) for v in san.get_values_for_type(x509.IPAddress)}
+    except Exception:
+        return set()
+
+
+def cert_fingerprint(cert_path):
+    der = ssl.PEM_cert_to_DER_cert(open(cert_path).read())
+    d = hashlib.sha256(der).hexdigest().upper()
+    return ':'.join(d[i:i + 2] for i in range(0, len(d), 2))
+
+
+def tls_context(cert, key, names):
+    """Your --cert/--key, else a self-signed pair in ./crossvol_tls (regenerated if this machine's
+    names changed)."""
+    if not (cert and key):
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'crossvol_tls')
+        os.makedirs(d, exist_ok=True)
+        cert, key = os.path.join(d, 'cert.pem'), os.path.join(d, 'key.pem')
+        if not (os.path.exists(cert) and os.path.exists(key)) or not (names <= cert_names(cert)):
+            log('creating a self-signed TLS certificate in ' + d)
+            make_self_signed(cert, key, names)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cert, key)
+    return ctx, cert
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        import sys as _sys
+        e = _sys.exc_info()[1]
+        if isinstance(e, (ssl.SSLError, ConnectionError, TimeoutError, socket.timeout)):
+            return                                   # plain-HTTP probe on the HTTPS port, dropped client, idle timeout
+        log(f'request from {client_address[0]} failed: {type(e).__name__}: {e}')
+
+
+LOGIN_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cross Vol Builder</title><style>
+:root{--bg:#f6f5f2;--card:#fff;--text:#1b1b19;--muted:#6b6a64;--border:#dcdbd5;--accent:#2a78d6;--bad:#c23a3a}
+@media (prefers-color-scheme:dark){:root{--bg:#131312;--card:#1d1d1b;--text:#ecebe6;--muted:#9a9890;--border:#33332f;--accent:#3987e5;--bad:#e05555}}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;display:grid;place-items:center;min-height:100vh}
+form{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:22px;width:min(360px,calc(100vw - 32px));box-sizing:border-box}
+h1{font-size:17px;margin:0 0 4px}p{color:var(--muted);font-size:12px;margin:0 0 14px}
+input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font:inherit}
+button{margin-top:10px;width:100%;padding:9px;border:0;border-radius:6px;background:var(--accent);color:#fff;font:600 14px system-ui,sans-serif;cursor:pointer}
+#msg{min-height:18px;margin-top:8px;font-size:12px;color:var(--bad)}</style></head><body>
+<form id="f"><h1>Cross Vol Builder</h1><p>Shared from a colleague's machine. Sign in with the password they gave you.</p>
+<input id="pw" type="password" autocomplete="current-password" placeholder="Password" autofocus><button>Sign in</button><div id="msg"></div></form>
+<script>
+document.getElementById('f').onsubmit=async e=>{e.preventDefault();const m=document.getElementById('msg'),pw=document.getElementById('pw');m.textContent='';
+  try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw.value})});
+    pw.value='';if(r.ok){location.reload();return;}const j=await r.json().catch(()=>({}));m.textContent=j.error||'Sign-in failed';}
+  catch(err){m.textContent='Server unreachable';}};
+</script></body></html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
+    timeout = 60                                    # idle connections can't hold a thread forever
+    server_version = 'CrossVol'
+    sys_version = ''
+
     def log_message(self, *a):
         pass
+
+    # ---- who is asking ----
+    def _ip(self):
+        return self.client_address[0]
+
+    def _role(self):
+        """'host' for requests from this machine, 'viewer' for a logged-in network user, else None."""
+        if is_loopback(self._ip()):
+            return 'host'
+        return 'viewer' if APP_GATE.check(self.headers.get('Cookie')) else None
+
+    def _host_ok(self):
+        """Reject requests addressed to a name this server doesn't own (blocks DNS-rebinding pages
+        from driving the tool through a colleague's or your own browser)."""
+        return host_of(self.headers.get('Host')) in SERVER['allowed_hosts']
+
+    def _cookie(self, name, val, max_age):
+        return (f'{name}={val}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}'
+                + ('; Secure' if SERVER['tls'] else ''))
 
     def _send(self, code, payload, ctype='application/json', headers=None):
         data = payload if isinstance(payload, bytes) else json.dumps(payload, default=_jsonable).encode()
         self.send_response(code)
         self.send_header('Content-Type', ctype)
         self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        if SERVER['tls']:
+            self.send_header('Strict-Transport-Security', 'max-age=86400')
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
+    def _data(self, name, fn, *args):
+        code, out = serve_data(self._role(), name, fn, *args)
+        self._send(code, out)
+
+    def _build(self, fn, body):
+        if not BUILD_SLOTS.acquire(timeout=90):
+            self._send(503, {'error': 'server busy building other surfaces — try again in a moment'})
+            return
+        try:
+            return fn(body)
+        finally:
+            BUILD_SLOTS.release()
+
     def do_GET(self):
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         try:
+            if not self._host_ok():
+                self._send(403, {'error': 'host not allowed (start with --allow-host NAME to add one)'})
+                return
+            role = self._role()
+            if role is None:                         # network user without a session: login page only
+                if u.path in ('/', '/index.html', '/login'):
+                    self._send(200, LOGIN_HTML.encode(), 'text/html; charset=utf-8')
+                else:
+                    self._send(401, {'error': 'login required'})
+                return
             if u.path in ('/', '/index.html'):
                 self._send(200, HTML.encode(), 'text/html; charset=utf-8')
             elif u.path == '/api/status':
-                self._send(200, {'bbg': BB.available(), 'error': BB.last_error, 'pairs': LEG_PAIRS,
-                                 'tenors': TENORS, 'windows': CORR_WINDOW_BDAYS})
+                self._send(200, {'bbg': BB.available(), 'error': BB.last_error if role == 'host' else '', 'pairs': LEG_PAIRS,
+                                 'tenors': TENORS, 'windows': CORR_WINDOW_BDAYS, 'role': role, 'lan': SERVER['lan'],
+                                 'tls': SERVER['tls'], 'viewers_pull': viewer_may_pull()})
             elif u.path == '/api/surface':
-                self._send(200, get_surface(q['pair']))
+                self._data('surface', get_surface, q['pair'].upper())
             elif u.path == '/api/corr':
-                self._send(200, get_corr(q['a'], q['b']))
+                self._data('corr', get_corr, q['a'].upper(), q['b'].upper())
             elif u.path == '/api/cross_market':
-                self._send(200, get_cross_market(q['a'], q['b']))
+                self._data('cross_market', get_cross_market, q['a'].upper(), q['b'].upper())
+            elif u.path == '/api/corr_ci':
+                self._data('corr_ci', get_corr_ci, q['a'].upper(), q['b'].upper(), float(q.get('years', CI_HISTORY_YEARS)))
+            elif u.path == '/api/corr_monitor':
+                self._data('corr_monitor', get_corr_monitor, q['a'].upper(), q['b'].upper(), q.get('tenor', '1M'),
+                           int(q.get('window', 21)), int(q.get('ma', 5)), float(q.get('years', 1)))
+            elif u.path == '/api/corr_history':
+                self._data('corr_history', get_corr_history, q['a'].upper(), q['b'].upper(), q.get('tenor', '3M'), float(q.get('years', 3)))
             elif u.path == '/api/cad/status':
-                tok = auth_ok(self.headers.get('Cookie'))
-                self._send(200, {'authed': bool(tok), **(CAD_BOARD.status() if tok else {})})
+                tok = CAD_GATE.check(self.headers.get('Cookie'))
+                self._send(200, {'authed': bool(tok), 'view_only': not (role == 'host' or viewer_may_pull()),
+                                 **(CAD_BOARD.status() if tok else {})})
             elif u.path == '/api/cad/snapshot':
-                if not auth_ok(self.headers.get('Cookie')):
+                if not CAD_GATE.check(self.headers.get('Cookie')):
                     self._send(401, {'error': 'locked'})
                 else:
                     with CAD_BOARD.lock:
                         snap = CAD_BOARD.snapshot
                     self._send(200, {'snapshot': snap, **CAD_BOARD.status()})
-            elif u.path == '/api/corr_monitor':
-                self._send(200, get_corr_monitor(q['a'], q['b'], q.get('tenor', '1M'), int(q.get('window', 21)),
-                                                 int(q.get('ma', 5)), float(q.get('years', 1))))
-            elif u.path == '/api/corr_ci':
-                self._send(200, get_corr_ci(q['a'], q['b'], float(q.get('years', CI_HISTORY_YEARS))))
-            elif u.path == '/api/corr_history':
-                self._send(200, get_corr_history(q['a'], q['b'], q.get('tenor', '3M'), float(q.get('years', 3))))
             else:
                 self._send(404, {'error': 'not found'})
         except Exception as e:
@@ -2385,35 +2655,66 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if not self._host_ok():
+                self._send(403, {'error': 'host not allowed'})
+                return
             n = int(self.headers.get('Content-Length', 0))
+            if n > 8_000_000:
+                self._send(413, {'error': 'request too large'})
+                return
             body = json.loads(self.rfile.read(n) or b'{}')
             path = urlparse(self.path).path
-            if path == '/api/auth':
-                code, val = auth_login(body.get('password', ''))
+            if path == '/api/login':
+                code, val = APP_GATE.login(body.get('password', ''), self._ip())
                 if code == 200:
-                    self._send(200, {'ok': True}, headers={'Set-Cookie': f'cv_cad={val}; HttpOnly; SameSite=Strict; Path=/; Max-Age={CAD_SESSION_HOURS * 3600}'})
+                    log(f'viewer signed in from {self._ip()}')
+                    self._send(200, {'ok': True}, headers={'Set-Cookie': self._cookie('cv_app', val, APP_SESSION_HOURS * 3600)})
+                else:
+                    self._send(code, {'error': val})
+                return
+            role = self._role()
+            if role is None:
+                self._send(401, {'error': 'login required'})
+                return
+            if path == '/api/app_logout':
+                tok = APP_GATE.check(self.headers.get('Cookie'))
+                if tok:
+                    APP_GATE.logout(tok)
+                self._send(200, {'ok': True}, headers={'Set-Cookie': self._cookie('cv_app', '', 0)})
+                return
+            if path == '/api/auth':
+                code, val = CAD_GATE.login(body.get('password', ''), self._ip())
+                if code == 200:
+                    self._send(200, {'ok': True}, headers={'Set-Cookie': self._cookie('cv_cad', val, CAD_SESSION_HOURS * 3600)})
                 else:
                     self._send(code, {'error': val})
                 return
             if path == '/api/logout':
-                tok = auth_ok(self.headers.get('Cookie'))
+                tok = CAD_GATE.check(self.headers.get('Cookie'))
                 if tok:
-                    auth_logout(tok)
-                self._send(200, {'ok': True}, headers={'Set-Cookie': 'cv_cad=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'})
+                    CAD_GATE.logout(tok)
+                self._send(200, {'ok': True}, headers={'Set-Cookie': self._cookie('cv_cad', '', 0)})
                 return
             if path == '/api/cad/refresh':
-                if not auth_ok(self.headers.get('Cookie')):
+                if not CAD_GATE.check(self.headers.get('Cookie')):
                     self._send(401, {'error': 'locked'})
+                    return
+                if role != 'host' and not viewer_may_pull():    # viewers see the host's latest board
+                    self._send(200, {'started': False, 'view_only': True, **CAD_BOARD.status()})
                     return
                 started = CAD_BOARD.start(body.get('rho_src', 'implied'))
                 self._send(200, {'started': started, **CAD_BOARD.status()})
                 return
             if path == '/api/build_band':
-                self._send(200, run_build_band(body))
+                res = self._build(run_build_band, body)
+                if res is not None:
+                    self._send(200, res)
                 return
             if path == '/api/build':
-                res = run_build(body)
-                log(f"built {res['cross']} {len(res['rows'])} tenors in {res['secs']}s"
+                res = self._build(run_build, body)
+                if res is None:
+                    return
+                log(f"built {res['cross']} {len(res['rows'])} tenors in {res['secs']}s" + ('' if role == 'host' else f' for {self._ip()}')
                     + (f" errors={res['errors']}" if res['errors'] else ''))
                 self._send(200, res)
             else:
@@ -2537,7 +2838,7 @@ table.grid input.num.gsel{background:rgba(57,135,229,.20);border-color:var(--acc
 table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
 </style></head><body>
 <header><h1>Cross Vol Builder</h1><span class="pill"><span id="bbgDot" class="dot"></span><span id="bbgTxt">checking Bloomberg…</span></span>
-<span class="pill" id="asof" style="background:none"></span><span style="flex:1"></span><span class="pill">ATM: variance formula · RR: copula · wings: vol-of-vol</span>
+<span class="pill" id="asof" style="background:none"></span><span class="pill" id="roleTag" style="display:none"></span><button class="act" id="btnSignOut" style="display:none;padding:3px 9px;font-size:11px">Sign out</button><span style="flex:1"></span><span class="pill">ATM: variance formula · RR: copula · wings: vol-of-vol</span>
 <button class="act" id="btnExport">Export…</button></header>
 <div id="expPanel" style="display:none"></div><div id="expMenu" style="display:none"></div>
 <nav id="tabs"><button data-tab="main" class="on">Cross builder</button><button data-tab="cad">CAD crosses 🔒</button></nav>
@@ -2576,7 +2877,7 @@ const LS='crossvol_state_v9';
 let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
        legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
 const $=id=>document.getElementById(id);
-function save(){try{localStorage.setItem(LS,JSON.stringify({...S,result:null,hist:null,monData:null,ciData:null,band:null,bandBusy:false,lastBody:null,_ciP:null,_bandP:null}));}catch(e){}}
+function save(){try{localStorage.setItem(LS,JSON.stringify({...S,role:undefined,loadErr:undefined,result:null,hist:null,monData:null,ciData:null,band:null,bandBusy:false,lastBody:null,_ciP:null,_bandP:null}));}catch(e){}}
 function load(){try{const r=localStorage.getItem(LS);if(r)Object.assign(S,JSON.parse(r));}catch(e){}}
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 function status(msg,cls){const el=$('status');el.className='status '+(cls||'');el.textContent=msg||'';}
@@ -2585,7 +2886,9 @@ function sgn(x,d=2){return (x===null||x===undefined||!isFinite(x))?'—':(x>=0?'
 function legCcy(p){return p.slice(3)==='USD'?p.slice(0,3):p.slice(3);}
 const RANK=['EUR','GBP','AUD','NZD','USD','CAD','CHF','NOK','SEK','DKK','PLN','CZK','HUF','ILS','TRY','ZAR','MXN','BRL','CLP','COP','CNH','CNY','HKD','SGD','TWD','KRW','INR','IDR','PHP','THB','JPY'];
 function crossName(a,b){const ca=legCcy(a),cb=legCcy(b);if(ca===cb)return null;return RANK.indexOf(ca)<RANK.indexOf(cb)?ca+cb:cb+ca;}
-async function api(path,opt){const r=await fetch(path,opt);const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);return j;}
+async function api(path,opt){const r=await fetch(path,opt);const j=await r.json();
+  if(r.status===401&&j.error==='login required'){location.reload();throw new Error('signed out');}   // network session expired -> sign-in page
+  if(!r.ok)throw new Error(j.error||r.statusText);return j;}
 
 function segInit(){document.querySelectorAll('.seg').forEach(seg=>{const k=seg.dataset.k;
   seg.querySelectorAll('button').forEach(b=>{b.classList.toggle('on',S[k]===b.dataset.v);
@@ -2747,7 +3050,7 @@ function gridTSV(which){const L=S.legs[which];const out=[['Tenor'].concat(FIELDS
   TENORS.forEach(t=>{const r=L.rows[t]||{};out.push([t].concat(GRID_KEYS.map(k=>r[k]==null?'':r[k])).join('\t'));});return out.join('\n');}
 function renderLeg(which){
   const L=S.legs[which],el=$('card'+which),pair=which==='A'?S.pairA:S.pairB;
-  if(!L){el.innerHTML='<h2>'+pair+'</h2><div class="empty">loading…</div>';return;}
+  if(!L){const er=(S.loadErr||{})[which];el.innerHTML='<h2>'+pair+'</h2><div class="empty'+(er?' warn':'')+'">'+(er||'loading…')+'</div>';return;}
   if(!L._orig)L._orig=JSON.parse(JSON.stringify(L.rows));
   let h='<h2>Leg '+which+' — '+L.pair+' <span class="badge '+L.source+'">'+L.source+'</span><span style="flex:1"></span>'
     +'<button class="act" style="padding:3px 9px;font-size:11px" id="gCopy'+which+'">Copy table</button>'
@@ -2791,7 +3094,7 @@ function renderCorr(){
   let h='<h2>Correlation inputs — '+S.pairA+' vs '+S.pairB+(C?' <span class="badge '+C.source+'">'+C.source+'</span>':'')
     +'<span style="flex:1"></span><span style="font-weight:400;color:var(--text-secondary);font-size:11px">ρ used for the build</span>'
     +'<div class="seg" id="rhoSrc"><button data-v="implied">Implied (mkt cross ATM)</button><button data-v="realized">Realized</button></div></h2>';
-  if(!C){el.innerHTML=h+'<div class="empty">loading…</div>';return;}
+  if(!C){const er=(S.loadErr||{}).corr;el.innerHTML=h+'<div class="empty'+(er?' warn':'')+'">'+(er||'loading…')+'</div>';return;}
   if(C.from)h+='<div class="meta">BDH daily closes '+C.from+' → '+C.to+' ('+C.n_obs+' obs)'
     +(C.corr_vol&&C.corr_vol.n_blocks?' · vol of ρ from '+C.corr_vol.n_blocks+' blocks of '+C.corr_vol.block+'d (noise-corrected; raw '+f(C.corr_vol.raw,3)+')':'')+'</div>';
   h+='<div class="scroll"><table><thead><tr><th></th><th class="grp sep" colspan="5">Spot correlation ρ (legs as quoted)</th><th class="grp sep" colspan="3">Vol-vol correlation ρσ</th><th class="grp sep" colspan="3">Vol of correlation σρ (instantaneous, abs / yr)</th></tr>'
@@ -2826,13 +3129,15 @@ function renderCorr(){
 
 async function loadLeg(which){
   const pair=which==='A'?S.pairA:S.pairB;S.legs[which]=null;renderLeg(which);
-  try{S.legs[which]=await api('/api/surface?pair='+pair);S.asof=new Date();updateAsof();}catch(e){status('Surface '+pair+': '+e.message,'err');}
+  S.loadErr=S.loadErr||{};delete S.loadErr[which];
+  try{S.legs[which]=await api('/api/surface?pair='+pair);S.asof=new Date();updateAsof();}catch(e){S.loadErr[which]=e.message;status('Surface '+pair+': '+e.message,'err');}
   renderLeg(which);save();
 }
 async function loadMkt(){try{S.mkt=await api('/api/cross_market?a='+S.pairA+'&b='+S.pairB);}catch(e){S.mkt=null;status('Cross quotes: '+e.message,'err');}
   renderCorr();save();}
 async function loadCorr(){S.corr=null;renderCorr();
-  try{S.corr=await api('/api/corr?a='+S.pairA+'&b='+S.pairB);}catch(e){status('Correlation: '+e.message,'err');}
+  S.loadErr=S.loadErr||{};delete S.loadErr.corr;
+  try{S.corr=await api('/api/corr?a='+S.pairA+'&b='+S.pairB);}catch(e){S.loadErr.corr=e.message;status('Correlation: '+e.message,'err');}
   renderCorr();save();}
 function updateCross(){const c=crossName(S.pairA,S.pairB);$('crossName').textContent=c||'same ccy';$('btnBuild').disabled=!c;}
 
@@ -3843,7 +4148,9 @@ async function cadLoadSnap(){
   catch(e){if(/locked/.test(e.message)){cadClear();renderCadLock('Session expired — unlock again.');}else status('CAD board: '+e.message,'err');}
 }
 async function cadRefresh(){
-  try{const r=await api('/api/cad/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rho_src:CAD.rho_src})});CAD.st=r;renderCadStatus();cadPoll();}
+  try{const r=await api('/api/cad/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rho_src:CAD.rho_src})});
+    if(r.view_only){await cadLoadSnap();return;}   // network viewer: show the host's latest board
+    CAD.st=r;renderCadStatus();cadPoll();}
   catch(e){if(/locked/.test(e.message)){cadClear();renderCadLock('Session expired — unlock again.');}else status('CAD refresh: '+e.message,'err');}
 }
 function cadPoll(){if(CAD.poll)return;CAD.poll=setInterval(async()=>{
@@ -3932,8 +4239,14 @@ function cadWire(){
 async function init(){
   load();
   const st=await api('/api/status').catch(()=>({bbg:false,pairs:['EURUSD','USDCAD'],error:'server unreachable'}));
-  $('bbgDot').className='dot '+(st.bbg?'ok':'bad');$('bbgTxt').textContent=st.bbg?'Bloomberg connected':'Bloomberg offline — placeholders';
+  $('bbgDot').className='dot '+(st.bbg?'ok':'bad');$('bbgTxt').textContent=(st.role==='viewer'?'Host\'s ':'')+(st.bbg?'Bloomberg connected':'Bloomberg offline — placeholders');
   if(!st.bbg&&st.error)$('bbgTxt').title=st.error;
+  S.role=st.role||'host';
+  if(st.role==='viewer'){const t=$('roleTag');t.style.display='';
+    t.textContent=st.viewers_pull?'Shared session · signed in':'Shared session · view-only data';
+    t.title=st.viewers_pull?'You are on a colleague\'s server.':'You are on a colleague\'s server. Bloomberg data is what they last loaded; you can mark legs and build your own scenarios, but you can\'t trigger Bloomberg pulls.';
+    const so=$('btnSignOut');so.style.display='';so.onclick=async()=>{try{await fetch('/api/app_logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}location.reload();};}
+  else if(st.lan){const t=$('roleTag');t.style.display='';t.textContent='Sharing on the network (host)';t.title='Colleagues sign in with the network password and see the data you load.';}
   ['pairA','pairB'].forEach(id=>{$(id).innerHTML=st.pairs.map(p=>'<option>'+p+'</option>').join('');$(id).value=S[id];
     $(id).onchange=async e=>{S[id]=e.target.value;S.ov={rho:{},rs:{},sr:{}};updateCross();save();S.hist=null;S.mkt=null;S.monData=null;renderAnalytics();renderMonitor();await Promise.all([loadLeg(id==='pairA'?'A':'B'),loadCorr(),loadMkt()]);renderCorr();};});
   $('usdRate').value=S.usd_rate;$('usdRate').onchange=e=>{S.usd_rate=parseFloat(e.target.value)||0;save();};
@@ -4506,10 +4819,10 @@ def selftest():
     try:
         CAD_TAB_PASSWORD = hash_password('test-only-pw', iterations=2000)
         ok1 = check_password('test-only-pw') and not check_password('test-only-pW') and not check_password('')
-        _AUTH_FAILS.update(n=0, until=0.0)
+        CAD_GATE.fails.clear()
         codes = [auth_login('nope')[0] for _ in range(5)]
         locked = auth_login('test-only-pw')[0]
-        _AUTH_FAILS.update(n=0, until=0.0)
+        CAD_GATE.fails.clear()
         code, tok = auth_login('test-only-pw')
         ok_cookie = auth_ok(f'foo=1; cv_cad={tok}') == tok and auth_ok('cv_cad=forged') is None
         auth_logout(tok)
@@ -4520,7 +4833,7 @@ def selftest():
               and real['iter'] >= 300000, f"(iter {real['iter']})")
     finally:
         CAD_TAB_PASSWORD = real
-        _AUTH_FAILS.update(n=0, until=0.0)
+        CAD_GATE.fails.clear()
 
     print('\n17) Confidence band (correlation forecast error model, known-truth simulation, band builds)')
     V0, k0 = 0.03, math.log(2) / 126
@@ -4573,6 +4886,49 @@ def selftest():
     check('band builds (parallel): ATM of each rebuilt surface = analytic band edge',
           max(abs(g - w_) for g, w_ in zip(got, want)) < 1e-3, f"({', '.join(f'{g:.4f}' for g in got)} in {B['secs']}s)")
 
+    print('\n18) Network mode: sign-in gate, view-only data, host check, TLS certificate')
+    check('network password stored as a salted PBKDF2 hash (no plaintext)', set(APP_PASSWORD) == {'algo', 'iter', 'salt', 'hash'}
+          and len(APP_PASSWORD['hash']) == 64 and APP_PASSWORD['iter'] >= 300000 and APP_PASSWORD['salt'] != CAD_TAB_PASSWORD['salt'])
+    g = PasswordGate('cv_t', 1, lambda: hash_password('pw-x', iterations=2000))
+    ent = hash_password('pw-x', iterations=2000)
+    g.entry = lambda: ent
+    a_codes = [g.login('bad', '10.0.0.1')[0] for _ in range(5)]
+    check('lockout is per address: one guesser can\'t lock everyone else out',
+          a_codes == [401, 401, 401, 401, 429] and g.login('pw-x', '10.0.0.1')[0] == 429 and g.login('pw-x', '10.0.0.2')[0] == 200)
+    calls = []
+    fn = lambda *a: calls.append(a) or {'v': len(calls)}
+    real_av, real_vp = BB.available, VIEWERS_CAN_PULL
+    try:
+        BB.available = lambda: True                                    # pretend Bloomberg is up
+        _DATA_CACHE.clear()
+        c1, o1 = serve_data('viewer', 'surface', fn, 'EURUSD')
+        c2, o2 = serve_data('host', 'surface', fn, 'EURUSD')
+        c3, o3 = serve_data('viewer', 'surface', fn, 'EURUSD')
+        c4, _ = serve_data('viewer', 'surface', fn, 'USDJPY')
+        check('Bloomberg up: viewers never pull; they get the host\'s last result for the same arguments',
+              (c1, c2, c3, c4) == (409, 200, 200, 409) and len(calls) == 1 and o3['v'] == 1 and 'cached_at' in o3 and 'cached_at' not in o2,
+              f'(codes {c1},{c2},{c3},{c4}; pulls {len(calls)})')
+        globals()['VIEWERS_CAN_PULL'] = True
+        c5, _ = serve_data('viewer', 'surface', fn, 'USDJPY')
+        check('--viewers-can-pull lets viewers pull', c5 == 200 and len(calls) == 2)
+    finally:
+        BB.available = real_av
+        globals()['VIEWERS_CAN_PULL'] = real_vp
+        _DATA_CACHE.clear()
+    check('loopback detection (host role)', all(is_loopback(x) for x in ('127.0.0.1', '::1', '::ffff:127.0.0.1'))
+          and not any(is_loopback(x) for x in ('10.1.2.3', '192.168.0.9', 'fe80::1', 'junk')))
+    check('Host header parsing', [host_of(x) for x in ('Box:8090', '[::1]:8090', '10.0.0.5', 'EVIL.com:8090', None)]
+          == ['box', '::1', '10.0.0.5', 'evil.com', ''])
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        nm = {'localhost', 'traderbox', 'traderbox.corp.example', '10.20.30.40', '127.0.0.1'}
+        cp_, kp_ = os.path.join(td, 'c.pem'), os.path.join(td, 'k.pem')
+        make_self_signed(cp_, kp_, nm)
+        ctx_ = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx_.load_cert_chain(cp_, kp_)
+        fp = cert_fingerprint(cp_)
+        check('self-signed certificate covers every name/IP and loads into TLS', nm <= cert_names(cp_) and len(fp) == 95, f'(SHA-256 {fp[:23]}…)')
+
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)
 
@@ -4581,23 +4937,59 @@ def selftest():
 #                                 MAIN
 # ######################################################################
 def main():
+    global VIEWERS_CAN_PULL
     ap = argparse.ArgumentParser(description='Cross Vol Builder')
     ap.add_argument('--port', type=int, default=8090)
     ap.add_argument('--no-browser', action='store_true')
     ap.add_argument('--selftest', action='store_true', help='run the numerical checks and exit')
-    ap.add_argument('--hash-password', action='store_true', help='print a CAD_TAB_PASSWORD entry for a new password')
+    ap.add_argument('--hash-password', nargs='?', const='cad', choices=['cad', 'app'],
+                    help='print a new password entry: cad (CAD tab, default) or app (network sign-in)')
+    ap.add_argument('--lan', action='store_true', help='serve on the network (HTTPS, sign-in for everyone but this machine)')
+    ap.add_argument('--host', help='bind address (default 127.0.0.1; --lan = 0.0.0.0)')
+    ap.add_argument('--cert', help='TLS certificate (PEM), e.g. one issued by your firm; default: self-signed')
+    ap.add_argument('--key', help='TLS private key (PEM) for --cert')
+    ap.add_argument('--allow-host', action='append', default=[], help='extra hostname/IP colleagues use to reach you (repeatable)')
+    ap.add_argument('--viewers-can-pull', action='store_true', help='let signed-in viewers trigger Bloomberg pulls on your session')
+    ap.add_argument('--insecure-http', action='store_true', help='allow --lan without HTTPS (passwords would cross the network in clear)')
     args = ap.parse_args()
     if args.hash_password:
-        pw = getpass.getpass('New CAD-tab password: ')
+        label = 'CAD-tab' if args.hash_password == 'cad' else 'network sign-in'
+        pw = getpass.getpass(f'New {label} password: ')
         if pw != getpass.getpass('Repeat: '):
             raise SystemExit('Passwords differ')
-        print('CAD_TAB_PASSWORD = ' + repr(hash_password(pw)))
+        print(('CAD_TAB_PASSWORD' if args.hash_password == 'cad' else 'APP_PASSWORD') + ' = ' + repr(hash_password(pw)))
         return
     if args.selftest:
         raise SystemExit(0 if selftest() else 1)
-    srv = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
-    url = f'http://localhost:{args.port}'
+    bind = args.host or ('0.0.0.0' if args.lan else '127.0.0.1')
+    SERVER['lan'] = not is_loopback(bind)
+    VIEWERS_CAN_PULL = bool(args.viewers_can_pull)
+    names = local_addresses() | {h.lower() for h in args.allow_host} if SERVER['lan'] else {'localhost', '127.0.0.1', '::1'}
+    SERVER['allowed_hosts'] = names
+    use_tls = bool(args.cert or SERVER['lan']) and not args.insecure_http
+    if SERVER['lan'] and not use_tls:
+        log('WARNING: --insecure-http: sign-in passwords and data cross the network unencrypted')
+    srv = Server((bind, args.port), Handler)
+    scheme = 'http'
+    if use_tls:
+        ctx, cert = tls_context(args.cert, args.key, names)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)   # handshake in the worker thread
+        SERVER['tls'], scheme = True, 'https'
+    url = f'{scheme}://localhost:{args.port}'
     log(f'Cross Vol Builder on {url}  (Bloomberg: {"available" if BB.available() else "offline — " + BB.last_error})')
+    if SERVER['lan']:
+        share = sorted(n for n in names if n not in ('localhost', '127.0.0.1', '::1') and ':' not in n)
+        log('Shared on the network. Colleagues open (any of):')
+        for n in share:
+            log(f'    {scheme}://{n}:{args.port}')
+        log('  They sign in with the network password; you (this machine) have full control at ' + url)
+        log('  Viewers ' + ('CAN trigger Bloomberg pulls on your session (--viewers-can-pull)' if VIEWERS_CAN_PULL
+                             else 'cannot trigger Bloomberg pulls: they see the data you last loaded'
+                             + ('' if BB.available() else ' (Bloomberg offline now, so everyone sees placeholders)')))
+        if use_tls and not args.cert:
+            log('  Self-signed certificate: browsers will warn once. Tell colleagues to check this fingerprint')
+            log('  (browser padlock -> certificate details) before clicking through:')
+            log('    SHA-256 ' + cert_fingerprint(cert))
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
