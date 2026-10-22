@@ -1249,6 +1249,8 @@ def spot_history(a, b, years):
                 raise RuntimeError(f'only {len(dates)} common spot dates')
             return (dates, [h[ta][d] for d in dates], [h[tb][d] for d in dates], 'BBG',
                     f'BDH {dates[0]} -> {dates[-1]}, {len(dates)} spot days')
+        except NotInStore:
+            raise
         except Exception as e:
             log(f'BBG spot history {a}/{b} failed: {e}')
             note = f'Bloomberg history unavailable ({e}); SYNTHETIC data.'
@@ -1656,7 +1658,7 @@ class BBG:
                 return msgs
         raise TimeoutError('Bloomberg request timed out')
 
-    def ref(self, tickers, fields):
+    def _ref_live(self, tickers, fields):
         with self.lock:
             if not self._ensure():
                 raise RuntimeError(self.last_error)
@@ -1678,7 +1680,7 @@ class BBG:
                     out[tk] = {f: fd.getElementAsFloat(f) for f in fields if fd.hasElement(f)}
             return out
 
-    def hist(self, tickers, field, start, end):
+    def _hist_live(self, tickers, field, start, end):
         with self.lock:
             if not self._ensure():
                 raise RuntimeError(self.last_error)
@@ -1709,6 +1711,170 @@ class BBG:
             return out
 
 
+    # ---- every Bloomberg call goes through these two: live pull -> shared store, or served from the store ----
+    def ref(self, tickers, fields):
+        m = data_mode()
+        if m != 'live':
+            try:
+                return STORE.get_ref(tickers, fields)
+            except NotInStore as e:
+                if m == 'store':
+                    STORE.want(e)
+                    raise
+        out = self._ref_live(tickers, fields)
+        STORE.put_ref(tickers, fields, out)
+        return out
+
+    def hist(self, tickers, field, start, end):
+        m = data_mode()
+        if m != 'live':
+            try:
+                return STORE.get_hist(tickers, field, start, end)
+            except NotInStore as e:
+                if m == 'store':
+                    STORE.want(e)
+                    raise
+        out = self._hist_live(tickers, field, start, end)
+        STORE.put_hist(tickers, field, start, end, out)
+        return out
+
+
+# ######################################################################
+#                SHARED MARKET DATA STORE + HOURLY REFRESH
+# ----------------------------------------------------------------------
+# Every Bloomberg result (your clicks, the scheduled refresh) is kept per ticker. Requests run in a
+# data mode:  live          pull from Bloomberg (you, on this machine)
+#             store         served from the store only — never touches Bloomberg (network viewers)
+#             prefer_store  store if it has it, else live (your page's automatic reloads)
+# A viewer asking for something the store doesn't have gets a clear message, and it is queued:
+# the next refresh pulls the whole bundle for that pair (legs, cross quotes, histories).
+# The refresh re-pulls everything the site has used (incrementally for histories) and rebuilds the
+# CAD board; open pages see the new version and reload their sections.
+# ######################################################################
+class NotInStore(Exception):
+    def __init__(self, refs=(), hists=()):
+        self.refs, self.hists = list(refs), list(hists)        # [(ticker, fields)], [(ticker, field, start)]
+        super().__init__(self.short())
+
+    def short(self):
+        tk = [r[0] for r in self.refs] + [h[0] for h in self.hists]
+        return ', '.join(tk[:4]) + (f' +{len(tk) - 4} more' if len(tk) > 4 else '')
+
+
+_MODE = threading.local()
+
+
+def data_mode():
+    return getattr(_MODE, 'mode', 'live')
+
+
+class data_mode_ctx:
+    def __init__(self, mode):
+        self.mode = mode
+
+    def __enter__(self):
+        self.prev = data_mode()
+        _MODE.mode = self.mode
+
+    def __exit__(self, *a):
+        _MODE.mode = self.prev
+
+
+class MarketStore:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.ref = {}            # ticker -> {'asked': set(fields), 'vals': {field: value}}
+        self.hist = {}           # (ticker, field) -> {'s': {date: value}, 'start': date, 'end': date}
+        self.wanted_ref, self.wanted_hist, self.wanted_combos = {}, {}, set()
+        self.wanted_cad = False
+        self.version, self.updated, self.last_put = 0, None, 0.0
+
+    def _bump(self):
+        self.version += 1
+        self.updated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.last_put = time.time()
+
+    def put_ref(self, tickers, fields, out):
+        with self.lock:
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            for tk in tickers:                                   # remember "asked, nothing there" too
+                e = self.ref.setdefault(tk, {'asked': set(), 'vals': {}})
+                e['asked'] |= set(fields)
+                e['ts'] = ts
+                for f in fields:
+                    if f in (out.get(tk) or {}):
+                        e['vals'][f] = out[tk][f]
+                    else:
+                        e['vals'].pop(f, None)
+                w = self.wanted_ref.get(tk)
+                if w is not None and w <= e['asked']:
+                    self.wanted_ref.pop(tk, None)
+            self._bump()
+
+    def get_ref(self, tickers, fields):
+        with self.lock:
+            miss = [(tk, sorted(fields)) for tk in tickers if tk not in self.ref or not set(fields) <= self.ref[tk]['asked']]
+            if miss:
+                raise NotInStore(refs=miss)
+            return {tk: {f: self.ref[tk]['vals'][f] for f in fields if f in self.ref[tk]['vals']} for tk in tickers}
+
+    def ref_asof(self, tickers):
+        """When the stored quotes for these tickers were pulled (oldest of them)."""
+        with self.lock:
+            ts = [self.ref[t]['ts'] for t in tickers if t in self.ref and self.ref[t].get('ts')]
+            return min(ts) if ts else None
+
+    def put_hist(self, tickers, field, start, end, out):
+        with self.lock:
+            for tk in tickers:
+                e = self.hist.setdefault((tk, field), {'s': {}, 'start': start, 'end': end})
+                e['s'].update(out.get(tk) or {})
+                e['start'], e['end'] = min(e['start'], start), max(e['end'], end)
+                w = self.wanted_hist.get((tk, field))
+                if w is not None and e['start'] <= w:
+                    self.wanted_hist.pop((tk, field), None)
+            self._bump()
+
+    def get_hist(self, tickers, field, start, end):
+        """Served up to the last refresh: a request that runs to today gets data as of the last pull."""
+        with self.lock:
+            miss = [(tk, field, start) for tk in tickers if (tk, field) not in self.hist or self.hist[(tk, field)]['start'] > start]
+            if miss:
+                raise NotInStore(hists=miss)
+            return {tk: {d: v for d, v in self.hist[(tk, field)]['s'].items() if start <= d <= end} for tk in tickers}
+
+    def want(self, e):
+        with self.lock:
+            for tk, fields in e.refs:
+                self.wanted_ref[tk] = self.wanted_ref.get(tk, set()) | set(fields)
+            for tk, f, st in e.hists:
+                cur = self.wanted_hist.get((tk, f))
+                self.wanted_hist[(tk, f)] = st if cur is None else min(cur, st)
+
+    def want_combo(self, a, b=None):
+        with self.lock:
+            self.wanted_combos.add((a, b))
+
+    def snapshot_keys(self):
+        with self.lock:
+            refs = {tk: set(e['asked']) for tk, e in self.ref.items()}
+            for tk, f in self.wanted_ref.items():
+                refs[tk] = refs.get(tk, set()) | f
+            hists = {k: (e['start'], e['end']) for k, e in self.hist.items()}
+            for k, st in self.wanted_hist.items():
+                hists[k] = (min(st, hists[k][0]), None) if k in hists else (st, None)
+            combos, cad = set(self.wanted_combos), self.wanted_cad
+            return refs, hists, combos, cad
+
+    def stats(self):
+        with self.lock:
+            return {'version': self.version, 'updated': self.updated,
+                    'quiet_secs': round(time.time() - self.last_put, 1) if self.last_put else None,
+                    'n_tickers': len(self.ref), 'n_series': len(self.hist),
+                    'n_wanted': len(self.wanted_ref) + len(self.wanted_hist) + len(self.wanted_combos) + int(self.wanted_cad)}
+
+
+STORE = MarketStore()
 BB = BBG()
 
 
@@ -1789,7 +1955,8 @@ def bbg_surface(pair):
         notes.append('Missing: ' + ', '.join(missing))
     return {'pair': pair, 'spot': spot, 'fwd_scale': scale, 'rows': rows, 'source': 'BBG',
             'note': ' · '.join(notes),
-            'asof': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            'asof': (STORE.ref_asof(sorted(set(tk.values()))) if data_mode() != 'live' else None)
+            or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 
 def fwd_to_points(v, spot, scale, kind='auto'):
@@ -1815,6 +1982,8 @@ def get_surface(pair):
     if BB.available():
         try:
             return bbg_surface(pair)
+        except NotInStore:
+            raise
         except Exception as e:
             log(f'BBG surface {pair} failed: {e}')
             BB.last_error = f'BBG pull failed: {e}'
@@ -1846,6 +2015,8 @@ def get_corr(a, b):
             return {'source': 'BBG', 'from': dates[0].isoformat(), 'to': dates[-1].isoformat(),
                     'n_obs': len(dates), 'by_tenor': realized_corr(pa_, pb_, a, b),
                     'vol_vol': vv, 'corr_vol': corr_vol(pa_, pb_)}
+        except NotInStore:
+            raise
         except Exception as e:
             log(f'BBG corr {a}/{b} failed: {e}')
             BB.last_error = f'BDH failed: {e}'
@@ -1896,6 +2067,8 @@ def get_cross_market(a, b):
                             'note': '' if sgn > 0 else f'quoted as {nm} on Bloomberg; RR sign flipped'}
             return {'cross': base + quote, 'source': 'BBG', 'rows': {},
                     'note': f'no Bloomberg vol tickers found for {base + quote} or {quote + base}'}
+        except NotInStore:
+            raise
         except Exception as e:
             log(f'BBG cross {base + quote} failed: {e}')
             BB.last_error = f'cross pull failed: {e}'
@@ -1935,6 +2108,8 @@ def get_corr_history(a, b, tenor, years):
                       [g(h[tks['va']], d) for d in dates], [g(h[tks['vb']], d) for d in dates], [g(hx, d) for d in dates])
             gaps = sum(1 for d in dates if not (hx.get(d) and h[tks['va']].get(d) and h[tks['vb']].get(d)))
             src, note = 'BBG', f'BDH {dates[0]} -> {dates[-1]}, {len(dates)} spot days' + (f', implied missing on {gaps}' if gaps else '')
+        except NotInStore:
+            raise
         except Exception as e:
             log(f'BBG corr history failed: {e}')
             note = f'Bloomberg history unavailable ({e}); showing SYNTHETIC data.'
@@ -1989,6 +2164,8 @@ def get_corr_monitor(a, b, tenor='1M', window=21, ma=5, years=1.0, days=21):
             src, note = 'BBG', (f'BDH {dates[0]} -> {dates[-1]}, {len(dates)} spot days'
                                 + (f'; implied missing on {miss}' if miss else '')
                                 + ('' if vx_nm else f'; no {base + quote}V{tenor} history (implied unavailable)'))
+        except NotInStore:
+            raise
         except Exception as e:
             log(f'BBG corr monitor failed: {e}')
             note = f'Bloomberg history unavailable ({e}); showing SYNTHETIC data.'
@@ -2120,7 +2297,8 @@ def _cad_build_worker(args):
 class CadBoard:
     def __init__(self):
         self.lock = threading.Lock()
-        self.snapshot = None
+        self.snapshot = None           # latest board (any rho source)
+        self.snaps = {}                # rho source -> board
         self.building = False
         self.progress = {'done': 0, 'total': len(CAD_CROSSES), 'stage': ''}
         self.error = ''
@@ -2130,16 +2308,42 @@ class CadBoard:
     def status(self):
         with self.lock:
             return {'building': self.building, 'progress': dict(self.progress), 'error': self.error,
-                    'asof': self.snapshot['asof'] if self.snapshot else None}
+                    'asof': self.snapshot['asof'] if self.snapshot else None,
+                    'asof_by_src': {k: v['asof'] for k, v in self.snaps.items()}}
 
-    def start(self, rho_src='implied'):
-        with self.lock:
-            if self.building:
+    def start(self, rho_src='implied', mode='live', wait=False):
+        """Build the board for one or more rho sources in `mode` (live / store). wait=True blocks
+        (used by the shared refresh, which first waits for any build in progress)."""
+        srcs = [rho_src] if isinstance(rho_src, str) else list(rho_src)
+        t_end = time.time() + 300
+        while True:
+            with self.lock:
+                if not self.building:
+                    self.building, self.error = True, ''
+                    self.progress = {'done': 0, 'total': len(CAD_CROSSES) * len(srcs), 'stage': 'pulling market data'}
+                    break
+            if not wait or time.time() > t_end:
                 return False
-            self.building, self.error = True, ''
-            self.progress = {'done': 0, 'total': len(CAD_CROSSES), 'stage': 'pulling market data'}
-        threading.Thread(target=self._run, args=(rho_src,), daemon=True).start()
+            time.sleep(0.5)
+
+        def go():
+            try:
+                for src in srcs:
+                    with data_mode_ctx(mode):
+                        self._run(src)
+            finally:
+                with self.lock:
+                    self.building = False
+                    self.progress['stage'] = 'done'
+        if wait:
+            go()
+        else:
+            threading.Thread(target=go, daemon=True).start()
         return True
+
+    def built_sources(self):
+        with self.lock:
+            return set(self.snaps)
 
     def _corr(self, a, b):
         key = (a, b, date.today())
@@ -2205,17 +2409,20 @@ class CadBoard:
             crosses = [self._summarise(p, s, rho_src) for p, s in zip(prep, built)]
             snap = {'asof': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'secs': round(time.time() - t0, 1),
                     'rho_src': rho_src, 'crosses': crosses, 'tenors': TENORS,
-                    'sources': sorted({legs[p]['source'] for p in legs})}
+                    'sources': sorted({legs[p]['source'] for p in legs}), 'data_version': STORE.version}
             with self.lock:
                 self.snapshot = snap
+                self.snaps[rho_src] = snap
+        except NotInStore as e:
+            with STORE.lock:
+                STORE.wanted_cad = True
+            with self.lock:
+                self.error = (f'The CAD board\'s data isn\'t in the shared data yet. Queued for the next refresh '
+                              f'({REFRESH["next"] or "when the host refreshes"}).')
         except Exception as e:
             log(traceback.format_exc())
             with self.lock:
                 self.error = f'{type(e).__name__}: {e}'
-        finally:
-            with self.lock:
-                self.building = False
-                self.progress['stage'] = 'done'
 
     @staticmethod
     def _summarise(p, s, rho_src):
@@ -2260,6 +2467,118 @@ class CadBoard:
 
 
 CAD_BOARD = CadBoard()
+
+
+# ---------- shared refresh (hourly by default) ----------
+REFRESH = {'mins': 60, 'window': (6 * 60, 20 * 60), 'weekdays_only': True, 'next': None, 'next_dt': None,
+           'running': False, 'last': None, 'last_secs': None, 'last_error': '', 'last_counts': '',
+           'lock': threading.Lock()}
+
+
+def next_refresh_after(now, mins, window=None, weekdays_only=False):
+    """Next slot on a `mins` grid from midnight (60 -> on the hour) inside the window (minutes from
+    midnight, inclusive) and, if asked, on a weekday."""
+    if not mins or mins <= 0:
+        return None
+    t = now.replace(second=0, microsecond=0)
+    cand = t.replace(hour=0, minute=0) + timedelta(minutes=((t.hour * 60 + t.minute) // mins + 1) * mins)
+    for _ in range(8 * 24 * 60 // mins + 2):
+        mm = cand.hour * 60 + cand.minute
+        if (window is None or window[0] <= mm <= window[1]) and (not weekdays_only or cand.weekday() < 5):
+            return cand
+        cand += timedelta(minutes=mins)
+    return None
+
+
+def _fmt_next(dt):
+    if dt is None:
+        return None
+    return dt.strftime('%H:%M') if dt.date() == date.today() else dt.strftime('%a %H:%M')
+
+
+def prefetch_combo(a, b):
+    """Everything the main tab needs for a pair of legs, pulled live into the store."""
+    for fn, args in ((get_surface, (a,)), (get_surface, (b,)), (get_cross_market, (a, b)), (get_corr, (a, b)),
+                     (get_corr_ci, (a, b)), (get_corr_monitor, (a, b)), (get_corr_history, (a, b, '3M', 3))):
+        try:
+            fn(*args)
+        except Exception as e:
+            log(f'prefetch {fn.__name__}{args} failed: {e}')
+
+
+def refresh_shared(reason='scheduled'):
+    """Re-pull everything the site has used (+ anything queued), rebuild the CAD board(s)."""
+    with REFRESH['lock']:
+        if REFRESH['running']:
+            return False
+        REFRESH['running'] = True
+    t0, err, counts = time.time(), '', ''
+    try:
+        if not BB.available():
+            raise RuntimeError('Bloomberg offline (' + (BB.last_error or 'no session') + ')')
+        refs, hists, combos, cad = STORE.snapshot_keys()
+        today = date.today()
+        with data_mode_ctx('live'):
+            groups = {}
+            for tk, fs in refs.items():
+                groups.setdefault(frozenset(fs), []).append(tk)
+            for fs, tks in groups.items():
+                for i in range(0, len(tks), 400):
+                    BB.ref(tks[i:i + 400], sorted(fs))
+            hg = {}
+            for (tk, f), (st, en) in hists.items():
+                s0 = st if en is None else max(st, en - timedelta(days=10))        # top up the last 10 days
+                hg.setdefault((f, s0), []).append(tk)
+            for (f, s0), tks in hg.items():
+                for i in range(0, len(tks), 50):
+                    BB.hist(tks[i:i + 50], f, s0, today)
+            for a, b in sorted(combos, key=str):
+                if b is None:
+                    try:
+                        get_surface(a)
+                    except Exception as e:
+                        log(f'prefetch {a} failed: {e}')
+                else:
+                    prefetch_combo(a, b)
+        with STORE.lock:
+            STORE.wanted_combos -= combos
+        _CI_CACHE.clear()
+        CAD_BOARD._corr_cache.clear()
+        srcs = CAD_BOARD.built_sources() | ({'implied'} if cad else set())
+        if srcs:
+            CAD_BOARD.start(sorted(srcs), mode='live', wait=True)
+            with STORE.lock:
+                STORE.wanted_cad = False
+        counts = (f'{len(refs)} quote tickers, {len(hists)} histories' + (f', {len(combos)} new pair bundles' if combos else '')
+                  + (f', CAD board ({"/".join(sorted(srcs))})' if srcs else ''))
+        log(f'shared refresh ({reason}): {counts} in {time.time() - t0:.1f}s')
+    except Exception as e:
+        err = f'{type(e).__name__}: {e}'
+        log(f'shared refresh ({reason}) failed: {err}')
+    finally:
+        with REFRESH['lock']:
+            REFRESH.update(running=False, last=datetime.now().strftime('%H:%M:%S'), last_secs=round(time.time() - t0, 1),
+                           last_error=err, last_counts=counts)
+    return True
+
+
+def refresh_info():
+    out = {k: REFRESH[k] for k in ('mins', 'next', 'running', 'last', 'last_secs', 'last_error', 'last_counts')}
+    w = REFRESH['window']
+    out['window'] = None if w is None else '%02d:%02d-%02d:%02d' % (w[0] // 60, w[0] % 60, w[1] // 60, w[1] % 60)
+    out['weekdays_only'] = REFRESH['weekdays_only']
+    return out
+
+
+def refresh_scheduler():
+    while True:
+        nxt = next_refresh_after(datetime.now(), REFRESH['mins'], REFRESH['window'], REFRESH['weekdays_only'])
+        REFRESH['next_dt'], REFRESH['next'] = nxt, _fmt_next(nxt)
+        if nxt is None:
+            return
+        while datetime.now() < nxt:
+            time.sleep(min(20.0, max(0.5, (nxt - datetime.now()).total_seconds())))
+        refresh_shared('scheduled')
 
 
 # ######################################################################
@@ -2370,8 +2689,6 @@ def run_build_band(body):
 # ######################################################################
 SERVER = {'lan': False, 'tls': False, 'allowed_hosts': {'localhost', '127.0.0.1', '::1'}}
 BUILD_SLOTS = threading.BoundedSemaphore(3)          # concurrent surface builds across all users
-_DATA_CACHE = {}
-_DATA_LOCK = threading.Lock()
 
 
 def is_loopback(ip):
@@ -2383,29 +2700,26 @@ def is_loopback(ip):
 
 
 def viewer_may_pull():
-    """Viewers may run the data functions themselves only when that can't touch Bloomberg."""
+    """Viewers may run live data functions only when that can't touch Bloomberg (or you allowed it)."""
     return VIEWERS_CAN_PULL or not BB.available()
 
 
-def serve_data(role, name, fn, *args):
-    """Host (or a viewer when allowed): run fn and remember the result. Viewer otherwise: the host's
-    last result for exactly these arguments, or 409 if the host hasn't loaded it."""
-    key = (name,) + tuple(args)
-    if role == 'host' or viewer_may_pull():
-        out = fn(*args)
-        with _DATA_LOCK:
-            _DATA_CACHE[key] = (datetime.now().strftime('%H:%M:%S'), out)
-        return 200, out
-    with _DATA_LOCK:
-        hit = _DATA_CACHE.get(key)
-    if hit is None:
-        what = ' '.join(str(a) for a in args)
-        return 409, {'error': f'View-only: the host hasn\'t loaded {name.replace("_", " ")} for {what} yet '
-                              f'(viewers can\'t trigger Bloomberg pulls). Ask them to load it, then retry.'}
-    out = dict(hit[1]) if isinstance(hit[1], dict) else hit[1]
-    if isinstance(out, dict):
-        out['cached_at'] = hit[0]
-    return 200, out
+def serve_data(role, name, fn, *args, prefer_store=False):
+    """Run a data function in the caller's data mode. Viewers: shared store only (no Bloomberg).
+    You: live, or store-first for your page's automatic reloads."""
+    if role == 'host':
+        mode = 'prefer_store' if prefer_store else 'live'
+    else:
+        mode = 'live' if viewer_may_pull() else 'store'
+    try:
+        with data_mode_ctx(mode):
+            return 200, fn(*args)
+    except NotInStore as e:
+        STORE.want_combo(args[0], None if name == 'surface' else args[1])
+        what = args[0] if name == 'surface' else f'{args[0]}/{args[1]} {name.replace("_", " ")}' + (f' {args[2]}' if len(args) > 2 and isinstance(args[2], str) else '')
+        return 409, {'queued': True, 'error': f'{what} isn\'t in the shared data yet. Queued: it will be pulled at the next refresh '
+                                              f'({REFRESH["next"] or "when the host refreshes"}), or the host can press Refresh now. '
+                                              f'[{e.short()}]'}
 
 
 def host_of(header):
@@ -2547,6 +2861,9 @@ document.getElementById('f').onsubmit=async e=>{e.preventDefault();const m=docum
 </script></body></html>"""
 
 
+_CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ssl.SSLError, socket.timeout)
+
+
 class Handler(BaseHTTPRequestHandler):
     timeout = 60                                    # idle connections can't hold a thread forever
     server_version = 'CrossVol'
@@ -2591,8 +2908,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _data(self, name, fn, *args):
-        code, out = serve_data(self._role(), name, fn, *args)
-        self._send(code, out)
+        role, pref = self._role(), self.headers.get('X-CV-Source') == 'store'
+        code, out = serve_data(role, name, fn, *args, prefer_store=pref)
+        self._send(code, out, headers={'X-Data-Version': str(STORE.version)} if (role == 'host' and not pref) else None)
 
     def _build(self, fn, body):
         if not BUILD_SLOTS.acquire(timeout=90):
@@ -2622,7 +2940,8 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == '/api/status':
                 self._send(200, {'bbg': BB.available(), 'error': BB.last_error if role == 'host' else '', 'pairs': LEG_PAIRS,
                                  'tenors': TENORS, 'windows': CORR_WINDOW_BDAYS, 'role': role, 'lan': SERVER['lan'],
-                                 'tls': SERVER['tls'], 'viewers_pull': viewer_may_pull()})
+                                 'tls': SERVER['tls'], 'viewers_pull': viewer_may_pull(),
+                                 'shared': {**STORE.stats(), 'refresh': refresh_info()}})
             elif u.path == '/api/surface':
                 self._data('surface', get_surface, q['pair'].upper())
             elif u.path == '/api/corr':
@@ -2645,13 +2964,19 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(401, {'error': 'locked'})
                 else:
                     with CAD_BOARD.lock:
-                        snap = CAD_BOARD.snapshot
+                        src = q.get('rho_src')
+                        snap = CAD_BOARD.snaps.get(src) if src else CAD_BOARD.snapshot
                     self._send(200, {'snapshot': snap, **CAD_BOARD.status()})
             else:
                 self._send(404, {'error': 'not found'})
+        except _CLIENT_GONE:
+            return                                   # the browser went away mid-response (closed tab, reload)
         except Exception as e:
             log(traceback.format_exc())
-            self._send(500, {'error': f'{type(e).__name__}: {e}'})
+            try:
+                self._send(500, {'error': f'{type(e).__name__}: {e}'})
+            except _CLIENT_GONE:
+                pass
 
     def do_POST(self):
         try:
@@ -2699,11 +3024,23 @@ class Handler(BaseHTTPRequestHandler):
                 if not CAD_GATE.check(self.headers.get('Cookie')):
                     self._send(401, {'error': 'locked'})
                     return
-                if role != 'host' and not viewer_may_pull():    # viewers see the host's latest board
-                    self._send(200, {'started': False, 'view_only': True, **CAD_BOARD.status()})
-                    return
-                started = CAD_BOARD.start(body.get('rho_src', 'implied'))
+                src = body.get('rho_src', 'implied') if body.get('rho_src') in ('implied', 'realized') else 'implied'
+                mode = 'live' if (role == 'host' or viewer_may_pull()) else 'store'
+                if mode == 'store':                          # viewers rebuild from the shared data, never Bloomberg
+                    with CAD_BOARD.lock:
+                        snap = CAD_BOARD.snaps.get(src)
+                    if snap and snap.get('data_version') == STORE.version:
+                        self._send(200, {'started': False, 'current': True, **CAD_BOARD.status()})
+                        return
+                started = CAD_BOARD.start(src, mode=mode)
                 self._send(200, {'started': started, **CAD_BOARD.status()})
+                return
+            if path == '/api/refresh_shared':
+                if role != 'host':
+                    self._send(403, {'error': 'only the host can refresh the shared data'})
+                    return
+                threading.Thread(target=refresh_shared, args=('manual',), daemon=True).start()
+                self._send(200, {'started': True})
                 return
             if path == '/api/build_band':
                 res = self._build(run_build_band, body)
@@ -2719,9 +3056,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, res)
             else:
                 self._send(404, {'error': 'not found'})
+        except _CLIENT_GONE:
+            return                                   # the browser went away mid-response (closed tab, reload)
         except Exception as e:
             log(traceback.format_exc())
-            self._send(500, {'error': f'{type(e).__name__}: {e}'})
+            try:
+                self._send(500, {'error': f'{type(e).__name__}: {e}'})
+            except _CLIENT_GONE:
+                pass
 
 
 def _jsonable(o):
@@ -2752,9 +3094,10 @@ HTML = r"""<!doctype html>
  --input:#ffffff;--accent:#2a78d6}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text-primary);font:13px/1.4 -apple-system,"Segoe UI",Roboto,Arial,sans-serif}
-header{display:flex;align-items:center;gap:14px;padding:12px 18px;border-bottom:1px solid var(--border);background:var(--surface-1)}
-header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
-.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;background:var(--surface-2);color:var(--text-secondary);font-size:12px}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:12px 18px;border-bottom:1px solid var(--border);background:var(--surface-1)}
+header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px;white-space:nowrap}
+header .act{white-space:nowrap}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;white-space:nowrap;background:var(--surface-2);color:var(--text-secondary);font-size:12px}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--text-muted)}
 .dot.ok{background:var(--good)}.dot.bad{background:var(--warning)}
 main{padding:14px 18px;display:flex;flex-direction:column;gap:14px;max-width:1750px;margin:0 auto}
@@ -2838,7 +3181,8 @@ table.grid input.num.gsel{background:rgba(57,135,229,.20);border-color:var(--acc
 table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
 </style></head><body>
 <header><h1>Cross Vol Builder</h1><span class="pill"><span id="bbgDot" class="dot"></span><span id="bbgTxt">checking Bloomberg…</span></span>
-<span class="pill" id="asof" style="background:none"></span><span class="pill" id="roleTag" style="display:none"></span><button class="act" id="btnSignOut" style="display:none;padding:3px 9px;font-size:11px">Sign out</button><span style="flex:1"></span><span class="pill">ATM: variance formula · RR: copula · wings: vol-of-vol</span>
+<span class="pill" id="asof" style="background:none"></span><span class="pill" id="roleTag" style="display:none"></span><button class="act" id="btnSignOut" style="display:none;padding:3px 9px;font-size:11px">Sign out</button>
+<span class="pill" id="sharedTag" style="display:none"></span><button class="act" id="btnShared" style="display:none;padding:3px 9px;font-size:11px" title="Pull everything the site uses from Bloomberg now (instead of waiting for the hourly refresh)">Refresh now</button><span style="flex:1"></span><span class="pill">ATM: variance formula · RR: copula · wings: vol-of-vol</span>
 <button class="act" id="btnExport">Export…</button></header>
 <div id="expPanel" style="display:none"></div><div id="expMenu" style="display:none"></div>
 <nav id="tabs"><button data-tab="main" class="on">Cross builder</button><button data-tab="cad">CAD crosses 🔒</button></nav>
@@ -2886,7 +3230,9 @@ function sgn(x,d=2){return (x===null||x===undefined||!isFinite(x))?'—':(x>=0?'
 function legCcy(p){return p.slice(3)==='USD'?p.slice(0,3):p.slice(3);}
 const RANK=['EUR','GBP','AUD','NZD','USD','CAD','CHF','NOK','SEK','DKK','PLN','CZK','HUF','ILS','TRY','ZAR','MXN','BRL','CLP','COP','CNH','CNY','HKD','SGD','TWD','KRW','INR','IDR','PHP','THB','JPY'];
 function crossName(a,b){const ca=legCcy(a),cb=legCcy(b);if(ca===cb)return null;return RANK.indexOf(ca)<RANK.indexOf(cb)?ca+cb:cb+ca;}
-async function api(path,opt){const r=await fetch(path,opt);const j=await r.json();
+let API_STORE=false;                       // set during automatic reloads: your page reads the shared store, no new pulls
+async function api(path,opt){opt=opt||{};if(API_STORE)opt={...opt,headers:{...(opt.headers||{}),'X-CV-Source':'store'}};
+  const r=await fetch(path,opt);const dv=r.headers.get('X-Data-Version');if(dv!=null)S.dataVer=+dv;const j=await r.json();
   if(r.status===401&&j.error==='login required'){location.reload();throw new Error('signed out');}   // network session expired -> sign-in page
   if(!r.ok)throw new Error(j.error||r.statusText);return j;}
 
@@ -4014,6 +4360,46 @@ function smileBandTraces(t,K){const B=bandFresh();if(!B)return [];const cs=['lo'
   return [{x:K,y:up,mode:'lines',line:{width:0},showlegend:false,hoverinfo:'skip'},
     {x:K,y:dn,mode:'lines',line:{width:0},fill:'tonexty',fillcolor:'rgba(57,135,229,0.16)',name:CI_LAB[ciCfg().level]+' ρ band',hoverinfo:'skip'}];}
 
+// ===================== Shared data: refresh indicator + automatic reload of every open page =====================
+const SHARED_POLL_MS=60000;
+function renderShared(sh){const t=$('sharedTag'),b=$('btnShared');if(!t||!sh)return;const r=sh.refresh||{};
+  if(!S.bbgUp){t.style.display='none';b.style.display='none';return;}       // Bloomberg offline: nothing to share
+  t.style.display='';
+  t.textContent=(r.running?'Refreshing shared data…':(sh.updated?'Shared data '+sh.updated.slice(11,16):'Shared data: none yet'))+(r.mins?' · next '+(r.next||'—'):' · auto-refresh off');
+  t.title=(r.last?'Last refresh '+r.last+' ('+r.last_secs+'s): '+(r.last_error||r.last_counts):'No scheduled refresh yet')
+    +(sh.n_wanted?' · '+sh.n_wanted+' item(s) queued for the next refresh':'')+(r.mins?' · every '+r.mins+' min'+(r.window?' '+r.window:'')+(r.weekdays_only?' weekdays':''):'');
+  if(S.role==='host'){b.style.display='';b.disabled=!!r.running;b.textContent=r.running?'Refreshing…':'Refresh now';}}
+let _autoBusy=false;
+async function pollShared(){let st;try{st=await api('/api/status');}catch(e){return;}
+  S.bbgUp=!!st.bbg;const sh=st.shared;renderShared(sh);if(!sh)return;
+  if(S.dataVer==null){S.dataVer=sh.version;return;}
+  if(sh.version!==S.dataVer&&sh.quiet_secs!=null&&sh.quiet_secs>=15&&!(sh.refresh&&sh.refresh.running))await autoRefresh(sh);}
+async function autoRefresh(sh){
+  if(_autoBusy||_loadingAll)return;
+  const ae=document.activeElement;if(ae&&ae.tagName==='INPUT'&&ae.closest('#tabMain')){setTimeout(()=>autoRefresh(sh),20000);return;}   // not while someone is typing
+  _autoBusy=true;API_STORE=true;const target=sh.version;
+  const n=(S.legs.A?legEdits(S.legs.A).length:0)+(S.legs.B?legEdits(S.legs.B).length:0);
+  try{
+    if(S.legs.A&&S.legs.B)await refreshMarket({choice:'keep'});
+    else await Promise.all([S.legs.A?null:loadLeg('A'),S.legs.B?null:loadLeg('B'),loadMkt()]);   // a pair that wasn't in the shared data before
+    if(S.corr||(S.loadErr||{}).corr)await loadCorr();
+    if(S.result){S.ciData=null;await build();if(S._ciP)await S._ciP;}
+    renderTri();
+    if(S.monData)await loadMon();
+    if(S.hist)await loadHist();
+    if(S.tab==='cad'){if(CAD.snap)await cadLoadSnap();else await cadEnter();}
+    S.dataVer=target;
+    status('Auto-refreshed with the shared data from '+(sh.updated||'').slice(11,16)+(n?' · kept your '+n+' edit'+(n>1?'s':''):''));
+  }catch(e){status('Auto-refresh: '+e.message,'err');}
+  finally{API_STORE=false;_autoBusy=false;}}
+async function refreshSharedNow(){
+  try{await api('/api/refresh_shared',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){status('Refresh: '+e.message,'err');return;}
+  status('Refreshing the shared Bloomberg data…');
+  const t=setInterval(async()=>{let st;try{st=await api('/api/status');}catch(e){return;}renderShared(st.shared);
+    if(!st.shared.refresh.running){clearInterval(t);const r=st.shared.refresh;
+      status(r.last_error?'Shared refresh failed: '+r.last_error:'Shared data refreshed ('+r.last_counts+', '+r.last_secs+'s)',r.last_error?'err':'');
+      setTimeout(pollShared,16000);}},2000);}
+
 // ===================== Vol / correlation ladders (mirrors ladder_book_setup / ladder_node) — card currently not on the page =====================
 function ncdfJ(x){                       // double-precision normal CDF: series for |x|<5, continued fraction beyond
   if(x<-5||x>5){const t=Math.abs(x);let f=0;for(let k=60;k>=1;k--)f=k/(t+f);const tail=npdfJ(t)/(t+f);return x>0?1-tail:tail;}
@@ -4144,12 +4530,12 @@ function renderCadLock(msg){
 }
 async function cadLock(){try{await api('/api/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}cadClear();renderCadLock('Locked.');}
 async function cadLoadSnap(){
-  try{const r=await api('/api/cad/snapshot');CAD.snap=r.snapshot;CAD.st=r;renderCad();}
+  try{const r=await api('/api/cad/snapshot?rho_src='+CAD.rho_src);CAD.snap=r.snapshot;CAD.st=r;if(CAD.snap)renderCad();else renderCadStatus();}
   catch(e){if(/locked/.test(e.message)){cadClear();renderCadLock('Session expired — unlock again.');}else status('CAD board: '+e.message,'err');}
 }
 async function cadRefresh(){
   try{const r=await api('/api/cad/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rho_src:CAD.rho_src})});
-    if(r.view_only){await cadLoadSnap();return;}   // network viewer: show the host's latest board
+    if(!r.started&&r.current){await cadLoadSnap();return;}   // viewer: board already built from the latest shared data
     CAD.st=r;renderCadStatus();cadPoll();}
   catch(e){if(/locked/.test(e.message)){cadClear();renderCadLock('Session expired — unlock again.');}else status('CAD refresh: '+e.message,'err');}
 }
@@ -4241,10 +4627,12 @@ async function init(){
   const st=await api('/api/status').catch(()=>({bbg:false,pairs:['EURUSD','USDCAD'],error:'server unreachable'}));
   $('bbgDot').className='dot '+(st.bbg?'ok':'bad');$('bbgTxt').textContent=(st.role==='viewer'?'Host\'s ':'')+(st.bbg?'Bloomberg connected':'Bloomberg offline — placeholders');
   if(!st.bbg&&st.error)$('bbgTxt').title=st.error;
-  S.role=st.role||'host';
+  S.role=st.role||'host';S.bbgUp=!!st.bbg;
   if(st.role==='viewer'){const t=$('roleTag');t.style.display='';
-    t.textContent=st.viewers_pull?'Shared session · signed in':'Shared session · view-only data';
-    t.title=st.viewers_pull?'You are on a colleague\'s server.':'You are on a colleague\'s server. Bloomberg data is what they last loaded; you can mark legs and build your own scenarios, but you can\'t trigger Bloomberg pulls.';
+    t.textContent=st.viewers_pull?'Shared session · signed in':'Shared session · Bloomberg via host';
+    t.title=st.viewers_pull?'You are on a colleague\'s server.':'You are on a colleague\'s server. Everything works except Bloomberg pulls: data comes from the shared store (the host\'s pulls + the scheduled refresh). Pages update themselves when new data lands.';
+    if(!st.viewers_pull&&st.bbg){$('btnPull').textContent='Reload shared data';$('btnPull').title='Reload legs and cross quotes from the shared data (no Bloomberg pull)';
+      $('btnCorr').textContent='Reload realized';$('btnCorr').title='Reload realized correlation from the shared data';}
     const so=$('btnSignOut');so.style.display='';so.onclick=async()=>{try{await fetch('/api/app_logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}location.reload();};}
   else if(st.lan){const t=$('roleTag');t.style.display='';t.textContent='Sharing on the network (host)';t.title='Colleagues sign in with the network password and see the data you load.';}
   ['pairA','pairB'].forEach(id=>{$(id).innerHTML=st.pairs.map(p=>'<option>'+p+'</option>').join('');$(id).value=S[id];
@@ -4260,6 +4648,9 @@ async function init(){
   if(S.legs.B&&S.legs.B.pair===S.pairB)renderLeg('B');else loadLeg('B');
   if(S.corr&&S.corr.vol_vol)renderCorr();else loadCorr();
   loadMkt();renderMonitor();renderAnalytics();renderTri();renderCI();
+  $('btnShared').onclick=refreshSharedNow;
+  renderShared(st.shared);if(st.shared)S.dataVer=st.shared.version;
+  setInterval(pollShared,SHARED_POLL_MS);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pollShared();});
 }
 init();
 </script></body></html>"""
@@ -4886,7 +5277,7 @@ def selftest():
     check('band builds (parallel): ATM of each rebuilt surface = analytic band edge',
           max(abs(g - w_) for g, w_ in zip(got, want)) < 1e-3, f"({', '.join(f'{g:.4f}' for g in got)} in {B['secs']}s)")
 
-    print('\n18) Network mode: sign-in gate, view-only data, host check, TLS certificate')
+    print('\n18) Network mode: sign-in gate, shared data store + hourly refresh, host check, TLS certificate')
     check('network password stored as a salted PBKDF2 hash (no plaintext)', set(APP_PASSWORD) == {'algo', 'iter', 'salt', 'hash'}
           and len(APP_PASSWORD['hash']) == 64 and APP_PASSWORD['iter'] >= 300000 and APP_PASSWORD['salt'] != CAD_TAB_PASSWORD['salt'])
     g = PasswordGate('cv_t', 1, lambda: hash_password('pw-x', iterations=2000))
@@ -4896,25 +5287,73 @@ def selftest():
     check('lockout is per address: one guesser can\'t lock everyone else out',
           a_codes == [401, 401, 401, 401, 429] and g.login('pw-x', '10.0.0.1')[0] == 429 and g.login('pw-x', '10.0.0.2')[0] == 200)
     calls = []
-    fn = lambda *a: calls.append(a) or {'v': len(calls)}
-    real_av, real_vp = BB.available, VIEWERS_CAN_PULL
+    real = (BB.available, BBG._ref_live, BBG._hist_live, VIEWERS_CAN_PULL)
     try:
-        BB.available = lambda: True                                    # pretend Bloomberg is up
-        _DATA_CACHE.clear()
-        c1, o1 = serve_data('viewer', 'surface', fn, 'EURUSD')
-        c2, o2 = serve_data('host', 'surface', fn, 'EURUSD')
-        c3, o3 = serve_data('viewer', 'surface', fn, 'EURUSD')
-        c4, _ = serve_data('viewer', 'surface', fn, 'USDJPY')
-        check('Bloomberg up: viewers never pull; they get the host\'s last result for the same arguments',
-              (c1, c2, c3, c4) == (409, 200, 200, 409) and len(calls) == 1 and o3['v'] == 1 and 'cached_at' in o3 and 'cached_at' not in o2,
-              f'(codes {c1},{c2},{c3},{c4}; pulls {len(calls)})')
-        globals()['VIEWERS_CAN_PULL'] = True
-        c5, _ = serve_data('viewer', 'surface', fn, 'USDJPY')
-        check('--viewers-can-pull lets viewers pull', c5 == 200 and len(calls) == 2)
+        BB.available = lambda: True                                        # pretend Bloomberg is up
+        BBG._ref_live = lambda self_, t, f: calls.append(('ref', tuple(t))) or {tk: ({'PX_MID': 1.5} if tk.startswith('A') else {}) for tk in t}
+        BBG._hist_live = lambda self_, t, f, s0, e0: calls.append(('hist', s0)) or {tk: {s0 + timedelta(days=i): 1.0 + i for i in range((e0 - s0).days + 1)} for tk in t}
+        STORE.__init__()
+        with data_mode_ctx('store'):
+            try:
+                BB.ref(['A1', 'B1'], ['PX_MID'])
+                miss = False
+            except NotInStore:
+                miss = True
+        r1 = BB.ref(['A1', 'B1'], ['PX_MID'])
+        with data_mode_ctx('store'):
+            r2 = BB.ref(['A1', 'B1'], ['PX_MID'])
+        check('quotes: a viewer miss is queued, never pulled; after your pull the store answers identically (incl. "no data")',
+              miss and len(calls) == 1 and r1 == r2 and r2['B1'] == {} and 'A1' not in STORE.wanted_ref, f'(Bloomberg calls {len(calls)})')
+        d0, d1 = date.today() - timedelta(days=40), date.today()
+        BB.hist(['H1'], 'PX_LAST', d0, d1)
+        with data_mode_ctx('store'):
+            ok_in = len(BB.hist(['H1'], 'PX_LAST', d0 + timedelta(days=5), d1)['H1']) == 36
+            try:
+                BB.hist(['H1'], 'PX_LAST', d0 - timedelta(days=30), d1)
+                miss_h = False
+            except NotInStore:
+                miss_h = True
+        n_c = len(calls)
+        with data_mode_ctx('prefer_store'):
+            BB.ref(['A1'], ['PX_MID'])                                   # in store: no pull
+        check('history: served if the stored range covers the request, queued if it starts earlier; store-first reloads don\'t pull',
+              ok_in and miss_h and len(calls) == n_c and STORE.wanted_hist.get(('H1', 'PX_LAST')) == d0 - timedelta(days=30))
+        STORE.want_combo('ZZZUSD', None)
+        globals()['get_surface'], real_gs = (lambda pr: calls.append(('combo', pr)) or {}), get_surface
+        try:
+            n_c = len(calls)
+            refresh_shared('selftest')
+        finally:
+            globals()['get_surface'] = real_gs
+        new = calls[n_c:]
+        hist_starts = [c_[1] for c_ in new if c_[0] == 'hist']
+        with data_mode_ctx('store'):
+            ok_after = len(BB.hist(['H1'], 'PX_LAST', d0 - timedelta(days=30), d1)['H1']) == 71
+        check('refresh: re-pulls every stored quote, the queued longer history, and queued pair bundles; then serves it',
+              ('ref', ('A1', 'B1')) in new and d0 - timedelta(days=30) in hist_starts and ('combo', 'ZZZUSD') in new and ok_after
+              and not STORE.wanted_hist and not STORE.wanted_combos and REFRESH['last_error'] == '', f"({REFRESH['last_counts']})")
+        n_c = len(calls)
+        refresh_shared('selftest')
+        inc = [c_[1] for c_ in calls[n_c:] if c_[0] == 'hist']
+        check('refresh tops up history incrementally (last 10 days, not the whole range)', inc and min(inc) >= d1 - timedelta(days=10), f'(from {min(inc) if inc else None})')
+        STORE.__init__()
+        globals()['VIEWERS_CAN_PULL'] = False
+        n_c = len(calls)
+        c1, o1 = serve_data('viewer', 'corr', get_corr, 'EURUSD', 'USDCAD')
+        check('viewer request for a pair nobody pulled: 409 in plain words, whole pair queued, zero Bloomberg calls',
+              c1 == 409 and len(calls) == n_c and "EURUSD/USDCAD corr isn't in the shared data yet" in o1['error'] and ('EURUSD', 'USDCAD') in STORE.wanted_combos)
     finally:
-        BB.available = real_av
-        globals()['VIEWERS_CAN_PULL'] = real_vp
-        _DATA_CACHE.clear()
+        BB.available, BBG._ref_live, BBG._hist_live = real[:3]
+        globals()['VIEWERS_CAN_PULL'] = real[3]
+        STORE.__init__()
+    nx = lambda y, mo, d, h, mi, **k: next_refresh_after(datetime(y, mo, d, h, mi), **k)
+    W = (6 * 60, 20 * 60)
+    check('hourly schedule: on the hour, inside the window, weekdays',
+          nx(2026, 10, 22, 16, 14, mins=60, window=W, weekdays_only=True) == datetime(2026, 10, 22, 17, 0)
+          and nx(2026, 10, 22, 20, 30, mins=60, window=W, weekdays_only=True) == datetime(2026, 10, 23, 6, 0)
+          and nx(2026, 10, 23, 20, 5, mins=60, window=W, weekdays_only=True) == datetime(2026, 10, 26, 6, 0)
+          and nx(2026, 10, 24, 23, 59, mins=60) == datetime(2026, 10, 25, 0, 0) and nx(2026, 10, 22, 9, 0, mins=0) is None
+          and nx(2026, 10, 22, 9, 0, mins=60, window=W) == datetime(2026, 10, 22, 10, 0))
     check('loopback detection (host role)', all(is_loopback(x) for x in ('127.0.0.1', '::1', '::ffff:127.0.0.1'))
           and not any(is_loopback(x) for x in ('10.1.2.3', '192.168.0.9', 'fe80::1', 'junk')))
     check('Host header parsing', [host_of(x) for x in ('Box:8090', '[::1]:8090', '10.0.0.5', 'EVIL.com:8090', None)]
@@ -4951,6 +5390,9 @@ def main():
     ap.add_argument('--allow-host', action='append', default=[], help='extra hostname/IP colleagues use to reach you (repeatable)')
     ap.add_argument('--viewers-can-pull', action='store_true', help='let signed-in viewers trigger Bloomberg pulls on your session')
     ap.add_argument('--insecure-http', action='store_true', help='allow --lan without HTTPS (passwords would cross the network in clear)')
+    ap.add_argument('--refresh-mins', type=int, default=60, help='shared Bloomberg refresh interval in minutes, on the clock (0 = off)')
+    ap.add_argument('--refresh-window', default='06:00-20:00', help='local hours the refresh runs, e.g. 07:00-18:00, or "all"')
+    ap.add_argument('--refresh-weekends', action='store_true', help='also refresh on Saturday / Sunday')
     args = ap.parse_args()
     if args.hash_password:
         label = 'CAD-tab' if args.hash_password == 'cad' else 'network sign-in'
@@ -4961,6 +5403,16 @@ def main():
         return
     if args.selftest:
         raise SystemExit(0 if selftest() else 1)
+    REFRESH['mins'] = max(0, args.refresh_mins)
+    REFRESH['weekdays_only'] = not args.refresh_weekends
+    if args.refresh_window.strip().lower() in ('all', '24h', ''):
+        REFRESH['window'] = None
+    else:
+        try:
+            w0, w1 = [int(x.split(':')[0]) * 60 + int(x.split(':')[1]) for x in args.refresh_window.split('-')]
+            REFRESH['window'] = (w0, w1)
+        except (ValueError, IndexError):
+            raise SystemExit('--refresh-window must look like 06:00-20:00 (or "all")')
     bind = args.host or ('0.0.0.0' if args.lan else '127.0.0.1')
     SERVER['lan'] = not is_loopback(bind)
     VIEWERS_CAN_PULL = bool(args.viewers_can_pull)
@@ -4984,12 +5436,18 @@ def main():
             log(f'    {scheme}://{n}:{args.port}')
         log('  They sign in with the network password; you (this machine) have full control at ' + url)
         log('  Viewers ' + ('CAN trigger Bloomberg pulls on your session (--viewers-can-pull)' if VIEWERS_CAN_PULL
-                             else 'cannot trigger Bloomberg pulls: they see the data you last loaded'
-                             + ('' if BB.available() else ' (Bloomberg offline now, so everyone sees placeholders)')))
+                             else 'can use everything except Bloomberg pulls: they work from the shared data (your pulls + the scheduled refresh)'
+                             + ('' if BB.available() else '; Bloomberg is offline now, so everyone sees placeholders')))
         if use_tls and not args.cert:
             log('  Self-signed certificate: browsers will warn once. Tell colleagues to check this fingerprint')
             log('  (browser padlock -> certificate details) before clicking through:')
             log('    SHA-256 ' + cert_fingerprint(cert))
+    if REFRESH['mins']:
+        threading.Thread(target=refresh_scheduler, daemon=True).start()
+        time.sleep(0.05)
+        ri = refresh_info()
+        log(f"Shared Bloomberg refresh every {REFRESH['mins']} min ({'all day' if ri['window'] is None else ri['window']}"
+            f"{', weekdays' if REFRESH['weekdays_only'] else ''}); next {ri['next'] or 'none'}")
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
