@@ -1247,6 +1247,73 @@ def corr_monitor(dates, spot_a, spot_b, implied, pair_a, pair_b, window=21, ma=5
             'window': window, 'ma': ma}
 
 
+# ======================================================================
+# Triangle + cross gamma hedging
+# ----------------------------------------------------------------------
+# a, b = daily log-returns of the two currencies vs USD (Y_A, Y_B); cross X = Y_A / Y_B, x = a - b.
+# Delta-hedged gamma P&L of an option on pair P:  1/2 * G_P * r_P^2, with G_P = Gamma * S^2 (cash gamma,
+# per unit squared return), converted to USD. For the book (cross + two legs):
+#   1/2 [ G_X (a - b)^2 + G_A a^2 + G_B b^2 ] = 1/2 z' M z,  M = [[G_X+G_A, -G_X], [-G_X, G_X+G_B]]
+# The -G_X*ab term cannot be offset by leg options: the residual is a correlation (cross-gamma) position.
+# ======================================================================
+TENOR_YEARS = {'1W': 7 / 365, '2W': 14 / 365, '1M': 1 / 12, '2M': 2 / 12, '3M': 0.25, '6M': 0.5, '9M': 0.75,
+               '1Y': 1.0, '18M': 1.5, '2Y': 2.0}
+
+
+def triangle_cross(sa, sb, rho_y):
+    return math.sqrt(max(sa * sa + sb * sb - 2 * rho_y * sa * sb, 0.0))
+
+
+def triangle_leg(other, sx, rho_y):
+    """Solve the unknown leg vol v from sx^2 = v^2 + o^2 - 2 rho v o. Returns the positive roots."""
+    disc = sx * sx - other * other * (1 - rho_y * rho_y)
+    if disc < 0:
+        return []
+    r = math.sqrt(disc)
+    return sorted({round(v, 12) for v in (rho_y * other + r, rho_y * other - r) if v > 0})
+
+
+def atm_cash_gamma_usd(S, sig, T, usd_per_quote):
+    """ATM option, 1 unit of base-ccy notional: Gamma * S^2 in USD per unit squared return
+    (undiscounted Black; d1 = sigma sqrt(T) / 2). '1% gamma' = this x 0.01."""
+    sd = sig * math.sqrt(T)
+    return S * float(npdf(0.5 * sd)) / sd * usd_per_quote
+
+
+def atm_vega_usd(S, sig, T, usd_per_quote):
+    """ATM option, 1 unit of base-ccy notional: USD per 1.00 of vol (x 0.01 for per vol point)."""
+    sd = sig * math.sqrt(T)
+    return S * float(npdf(0.5 * sd)) * math.sqrt(T) * usd_per_quote
+
+
+def gamma_hedge_ratios(sa, sb, rho_y, mode='corr'):
+    """Leg cash gammas as multiples of the cross cash gamma: G_A = -rA G_X, G_B = -rB G_X.
+    corr    : expected gamma P&L depends only on realized rho (vega- and theta-neutral at these vols)
+    minvar  : minimises the variance of daily gamma P&L for normal returns with this rho
+    cash    : 1:1 cash gamma, leaves exposure to realized covariance rho*sa*sb"""
+    if mode == 'corr':
+        return 1 - rho_y * sb / sa, 1 - rho_y * sa / sb
+    if mode == 'minvar':
+        k = 2 * rho_y / (1 + rho_y * rho_y)
+        return 1 - k * sb / sa, 1 - k * sa / sb
+    return 1.0, 1.0
+
+
+def hedge_book(Gx, Ga, Gb, sa, sb, rho_y, days=252):
+    """Daily stats of the book's gamma P&L (USD) with returns ~ N(0, Sigma/days)."""
+    M = np.array([[Gx + Ga, -Gx], [-Gx, Gx + Gb]])
+    Sig = np.array([[sa * sa, rho_y * sa * sb], [rho_y * sa * sb, sb * sb]]) / days
+    MS = M @ Sig
+    sx2 = sa * sa + sb * sb - 2 * rho_y * sa * sb
+    return {'resid_sd': math.sqrt(0.5 * float(np.trace(MS @ MS))),
+            'unhedged_sd': abs(Gx) * sx2 / days / math.sqrt(2),
+            # expected daily carry vs implied, per +0.01 realized rho_Y and per +1 vol point realized leg vol
+            'carry_per_rho01': -Gx * sa * sb / days * 0.01,
+            'carry_per_volA': (Gx * (sa - rho_y * sb) + Ga * sa) / days * 0.01,
+            'carry_per_volB': (Gx * (sb - rho_y * sa) + Gb * sb) / days * 0.01,
+            'M': M}
+
+
 # ######################################################################
 #                       DATA: BLOOMBERG + PLACEHOLDERS
 # ######################################################################
@@ -1864,6 +1931,8 @@ details summary{cursor:pointer;color:var(--text-secondary);margin-top:8px}
 .kv tr.h td{color:var(--text-primary);font-weight:650;padding-top:9px;border-bottom:1px solid var(--border)}
 .ev{margin:10px 0 0;padding-left:18px;color:var(--text-primary)} .ev li{margin:3px 0}
 .pos{color:var(--good)} .negv{color:var(--critical)}
+#triRight table.kv tr:not(.h) td:last-child{white-space:normal;text-align:right}
+#triRight table.kv td:first-child{padding-right:14px}
 table.grid td{padding:1px 2px}
 table.grid input.num{width:100%;min-width:58px;border-radius:3px;cursor:cell}
 table.grid input.num:focus{outline:2px solid var(--accent);outline-offset:-1px;cursor:text}
@@ -1891,13 +1960,14 @@ table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
 <section class="grid2"><div class="card" id="cardA"></div><div class="card" id="cardB"></div></section>
 <section class="card" id="cardC"></section>
 <section class="card" id="results"><h2>Cross surface</h2><div class="empty">Generate to build the cross surface.</div></section>
+<section class="card" id="cardTri"></section>
 <section class="card" id="cardMon"></section>
 <section class="card" id="cardAn"></section>
 </main>
 <script>
 const TENORS=['1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y'];
 const FIELDS=[['fwd_pts','Fwd pts'],['atm','ATM'],['rr25','25 RR'],['rr10','10 RR'],['bf25','25 BF'],['bf10','10 BF']];
-const LS='crossvol_state_v5';
+const LS='crossvol_state_v6';
 let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
        legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
 const $=id=>document.getElementById(id);
@@ -2002,8 +2072,8 @@ function legGrid(which){
   const commit=(el)=>{const r=+el.dataset.r,c=+el.dataset.c,v=parseCell(el.value);
     if(Number.isNaN(v)){el.value=show(get(r,c));status('Not a number: "'+el.value+'"','err');return;}
     const old=get(r,c);if(old===v||(old!=null&&v!=null&&Math.abs(old-v)<1e-12))return;
-    snap();set(r,c,v);save();paint();};
-  const done=(msg,cls)=>{save();paint(true);if(msg)status(msg,cls);};
+    snap();set(r,c,v);save();paint();renderTri();};
+  const done=(msg,cls)=>{save();paint(true);if(msg)status(msg,cls);renderTri();};
   G.api={paste(text){                               // used by the paste handler and the tests
       const p=planPaste(text,box().r0,box().c0,nR,nC);
       if(p.cells.length===1&&multi()){                  // one value into a range: fill the range (Excel)
@@ -2090,7 +2160,7 @@ function renderLeg(which){
     +'<b>Excel-style:</b> paste a block from Excel into any cell (or a whole sheet with headers / tenor labels, matched by name); arrows / Enter / Tab move; '
     +'click + type replaces, double-click or F2 edits in place; shift+arrows or drag select; Ctrl+C copies, Delete clears, Ctrl+D fills down, Ctrl+Z undoes. Changed cells are outlined.</div>';
   el.innerHTML=h;
-  el.querySelectorAll('.meta input[data-k]').forEach(inp=>inp.onchange=()=>{const v=parseCell(inp.value);if(v!=null&&!Number.isNaN(v))L[inp.dataset.k]=v;inp.classList.add('dirty');save();});
+  el.querySelectorAll('.meta input[data-k]').forEach(inp=>inp.onchange=()=>{const v=parseCell(inp.value);if(v!=null&&!Number.isNaN(v))L[inp.dataset.k]=v;inp.classList.add('dirty');save();renderTri();});
   $('gCopy'+which).onclick=async()=>{const txt=gridTSV(which);try{await navigator.clipboard.writeText(txt);status('Copied '+L.pair+' table (paste straight into Excel)');}
     catch(e){status('Clipboard blocked by the browser — select a range and use Ctrl+C instead','warn');}};
   $('gRevert'+which).onclick=()=>$('grid'+which)._g.api.revert();
@@ -2141,6 +2211,7 @@ function renderCorr(){
   el.querySelectorAll('input.ovr').forEach(inp=>inp.onchange=()=>{const v=inp.value.trim();
     S.ov[inp.dataset.kind][inp.dataset.t]=v===''?null:parseFloat(v);save();renderCorr();});
   $('hlOv').onchange=e=>{const v=e.target.value.trim();S.hl_ov=v===''?null:parseFloat(v);save();renderCorr();};
+  renderTri();
   document.querySelectorAll('#rhoSrc button').forEach(b=>{b.classList.toggle('on',S.rho_src===b.dataset.v);
     b.onclick=()=>{S.rho_src=b.dataset.v;save();renderCorr();};});
   if(S.mkt)el.insertAdjacentHTML('beforeend','<div class="note">Implied ρ backs out the variance formula from the market '+S.mkt.cross
@@ -2539,6 +2610,182 @@ function drawMon(){
     hovertemplate:'%{x}<br>co-move %{y:.2f}<extra></extra>'}],L3,CFG);
 }
 
+// ===================== Triangle + cross gamma hedge =====================
+const TENOR_YRS={'1W':7/365,'2W':14/365,'1M':1/12,'2M':2/12,'3M':0.25,'6M':0.5,'9M':0.75,'1Y':1,'18M':1.5,'2Y':2};
+function npdfJ(x){return Math.exp(-0.5*x*x)/Math.sqrt(2*Math.PI);}
+function triX(a,b,ry){return Math.sqrt(Math.max(a*a+b*b-2*ry*a*b,0));}
+function triRhoY(a,b,x){return (a*a+b*b-x*x)/(2*a*b);}
+function triLeg(o,x,ry){const d=x*x-o*o*(1-ry*ry);if(d<0)return [];const r=Math.sqrt(d);return [ry*o+r,ry*o-r].filter(v=>v>0).filter((v,i,a)=>a.findIndex(w=>Math.abs(w-v)<1e-12)===i).sort((p,q)=>p-q);}
+function hedgeRatios(sa,sb,ry,mode){if(mode==='corr')return [1-ry*sb/sa,1-ry*sa/sb];
+  if(mode==='minvar'){const k=2*ry/(1+ry*ry);return [1-k*sb/sa,1-k*sa/sb];}return [1,1];}
+function hedgeBook(Gx,Ga,Gb,sa,sb,ry){         // sa, sb as decimals; mirrors hedge_book() in Python
+  const M=[[Gx+Ga,-Gx],[-Gx,Gx+Gb]],c=ry*sa*sb,Sg=[[sa*sa/252,c/252],[c/252,sb*sb/252]];
+  const P=[[M[0][0]*Sg[0][0]+M[0][1]*Sg[1][0],M[0][0]*Sg[0][1]+M[0][1]*Sg[1][1]],[M[1][0]*Sg[0][0]+M[1][1]*Sg[1][0],M[1][0]*Sg[0][1]+M[1][1]*Sg[1][1]]];
+  const tr2=P[0][0]*P[0][0]+2*P[0][1]*P[1][0]+P[1][1]*P[1][1],sx2=sa*sa+sb*sb-2*ry*sa*sb;
+  return {resid_sd:Math.sqrt(0.5*tr2),unhedged_sd:Math.abs(Gx)*sx2/252/Math.SQRT2,carry_per_rho01:-Gx*sa*sb/252*0.01,
+    carry_per_volA:(Gx*(sa-ry*sb)+Ga*sa)/252*0.01,carry_per_volB:(Gx*(sb-ry*sa)+Gb*sb)/252*0.01};}
+function atmGammaUSD(S,sig,T,upq){const sd=sig*Math.sqrt(T);return S*npdfJ(0.5*sd)/sd*upq;}
+function atmVegaUSD(S,sig,T,upq){const sd=sig*Math.sqrt(T);return S*npdfJ(0.5*sd)*Math.sqrt(T)*upq;}
+function triCfg(){const d={tenor:'3M',solve:'cross',notional:10000000,side:'buy',mode:'corr',cur:null};
+  if(!S.tri)S.tri={};for(const k in d)if(S.tri[k]===undefined)S.tri[k]=d[k];return S.tri;}
+function triBase(t){                           // current marks for the tenor, vol points / quoted rho
+  const A=S.legs.A,B=S.legs.B;if(!A||!B||!A.rows[t]||!B.rows[t])return null;
+  const a=+A.rows[t].atm,b=+B.rows[t].atm,rq=used('rho',t);if(!(a>0&&b>0)||rq==null)return null;
+  const sg=orient(A.pair)*orient(B.pair),x=triX(a,b,sg*rq);
+  const mx=S.mkt&&S.mkt.rows&&S.mkt.rows[t]?+S.mkt.rows[t].atm:null;
+  return {a,b,rho:rq,x,mkt:mx>0?mx:null,sg};
+}
+function triSolve(st,solve,sg){                // fill in the solved variable; returns {ok,msg,roots}
+  const o={...st};let msg='',ok=true,roots=null;
+  if(solve==='cross'){o.x=triX(o.a,o.b,sg*o.rho);}
+  else if(solve==='rho'){const ry=triRhoY(o.a,o.b,o.x);o.rho=sg*ry;if(Math.abs(ry)>1){ok=false;msg='No correlation in [−1, 1] gives this cross vol: it must lie between '+f(Math.abs(o.a-o.b),3)+' and '+f(o.a+o.b,3)+'.';}}
+  else{const leg=solve==='a'?'a':'b',oth=leg==='a'?o.b:o.a;roots=triLeg(oth,o.x,sg*o.rho);
+    if(!roots.length){ok=false;msg='Infeasible: with this ρ the cross vol can\'t be below '+f(oth*Math.sqrt(1-o.rho*o.rho),3)+'.';o[leg]=NaN;}
+    else{const prev=st[leg];o[leg]=roots.reduce((p,q)=>Math.abs(q-prev)<Math.abs(p-prev)?q:p);if(roots.length>1)msg='Two solutions: '+roots.map(v=>f(v,3)).join(' and ')+' (showing the one nearer the current mark).';}}
+  return {v:o,ok,msg,roots};
+}
+function renderTri(){
+  const el=$('cardTri');if(!el)return;const C=triCfg(),c=crossNm(),pa=S.pairA,pb=S.pairB;
+  let h='<h2>Triangle &amp; gamma hedge — '+c+'<span style="flex:1"></span><label class="f" style="flex-direction:row;align-items:center;gap:6px;font-weight:400">Tenor <select id="triTenor">'
+    +TENORS.map(t=>'<option'+(t===C.tenor?' selected':'')+'>'+t+'</option>').join('')+'</select></label></h2>';
+  const B=triBase(C.tenor);
+  if(!B){el.innerHTML=h+'<div class="empty">Load both legs and a correlation for '+C.tenor+' first.</div>';$('triTenor').onchange=e=>{C.tenor=e.target.value;C.cur=null;save();renderTri();};return;}
+  if(!C.cur||C.cur.tenor!==C.tenor||C.cur.pa!==pa||C.cur.pb!==pb)C.cur={tenor:C.tenor,pa,pb,a:B.a,b:B.b,rho:B.rho,x:B.mkt!=null&&S.rho_src==='implied'?B.mkt:B.x};
+  h+='<div class="controls" style="margin-bottom:8px"><div class="f"><label class="f">Solve for</label><div class="seg" id="triSolve">'
+    +[['cross',c+' vol'],['rho','ρ'],['a',pa+' vol'],['b',pb+' vol']].map(([v,l])=>'<button data-v="'+v+'">'+l+'</button>').join('')+'</div></div>'
+    +'<button class="act" id="triReset">Reset to current marks</button>'
+    +'<div class="meta" style="margin:14px 0 0">Current marks from the leg grids and the ρ used for the build ('+(ovr('rho',C.tenor)!==null?'override':S.rho_src)+')'+(B.mkt!=null?' · market '+c+' '+C.tenor+' ATM '+f(B.mkt,3):'')+'</div></div>';
+  h+='<div class="an-top" style="grid-template-columns:minmax(420px,1fr) minmax(420px,1fr)"><div id="triLeft"></div><div id="triRight"></div></div>';
+  el.innerHTML=h;
+  $('triTenor').onchange=e=>{C.tenor=e.target.value;C.cur=null;save();renderTri();};
+  document.querySelectorAll('#triSolve button').forEach(b=>{b.classList.toggle('on',C.solve===b.dataset.v);b.onclick=()=>{C.solve=b.dataset.v;save();renderTri();};});
+  $('triReset').onclick=()=>{C.cur=null;save();renderTri();};
+  renderTriBody();
+}
+function triDefs(){const C=triCfg(),c=crossNm(),pa=S.pairA,pb=S.pairB,t=C.tenor;
+  return [['a',pa+' '+t+' ATM','vol'],['b',pb+' '+t+' ATM','vol'],['rho','ρ '+pa+'/'+pb+' (as quoted)','rho'],['x',c+' '+t+' ATM','vol']];}
+function triSolveKey(){return {cross:'x',rho:'rho',a:'a',b:'b'}[triCfg().solve];}
+function triBaseVal(B,k){return k==='x'?(B.mkt!=null&&S.rho_src==='implied'?B.mkt:B.x):B[k];}
+function renderTriBody(){                 // builds the input table once; triUpdate() refreshes everything computed
+  const C=triCfg(),B=triBase(C.tenor),c=crossNm(),sk=triSolveKey();
+  let h='<table class="kv" id="triTbl"><tr class="h"><td>Input</td><td style="text-align:right">Current</td><td style="text-align:right">Scenario</td><td></td><td style="text-align:right">Change</td></tr>';
+  triDefs().forEach(([k,lab,kind])=>{const base=triBaseVal(B,k),cur=C.cur[k],isS=k===sk;
+    const lo=kind==='rho'?-0.99:Math.max(0.1,+(base-3).toFixed(2)),hi=kind==='rho'?0.99:+(base+3).toFixed(2);
+    h+='<tr'+(isS?' style="background:rgba(57,135,229,.10)"':'')+'><td>'+lab+(isS?' <span class="badge info">solved</span>':'')+'</td><td>'+f(base,3)+'</td>'
+      +'<td>'+(isS?'<b style="color:var(--text-primary)" id="triSolved">—</b>':'<input class="num wide" type="number" data-tri="'+k+'" step="'+(kind==='rho'?0.01:0.05)+'" value="'+(+cur).toFixed(3)+'">')+'</td>'
+      +'<td style="width:34%">'+(isS?'':'<input type="range" data-tris="'+k+'" min="'+lo+'" max="'+hi+'" step="'+(kind==='rho'?0.005:0.01)+'" value="'+cur+'" style="width:100%">')+'</td>'
+      +'<td id="triChg_'+k+'">—</td></tr>';});
+  h+='<tr><td colspan="5" style="color:var(--text-muted)" id="triRhoY"></td></tr></table><div id="triMsg"></div><div id="triOut"></div>'
+    +'<div class="meta" style="margin-top:10px"><b style="color:var(--text-primary)">'+c+' '+C.tenor+' vol vs ρ</b> at the scenario leg vols (dashed: current marks)</div><div id="chTri" class="chart" style="height:260px"></div>';
+  $('triLeft').innerHTML=h;
+  document.querySelectorAll('#triLeft input[data-tri]').forEach(inp=>inp.onchange=()=>{const x=parseFloat(inp.value);if(!Number.isFinite(x))return;
+    const k=inp.dataset.tri;if(k==='rho'&&Math.abs(x)>=1){status('ρ must be strictly between −1 and 1','err');inp.value=C.cur.rho.toFixed(3);return;}
+    if(k!=='rho'&&x<=0){status('Vols must be positive','err');inp.value=C.cur[k].toFixed(3);return;}
+    C.cur[k]=x;const sl=document.querySelector('#triLeft input[data-tris="'+k+'"]');if(sl)sl.value=x;save();triUpdate();});
+  document.querySelectorAll('#triLeft input[data-tris]').forEach(inp=>{
+    inp.oninput=()=>{const x=parseFloat(inp.value),k=inp.dataset.tris;C.cur[k]=x;const num=document.querySelector('#triLeft input[data-tri="'+k+'"]');if(num)num.value=x.toFixed(3);triLive();};
+    inp.onchange=()=>save();});
+  triUpdate();
+}
+function triUpdate(){
+  const C=triCfg(),B=triBase(C.tenor);if(!B)return;
+  const c=crossNm(),pa=S.pairA,pb=S.pairB,sg=B.sg,t=C.tenor,sk=triSolveKey();
+  const R=triSolve(C.cur,C.solve,sg),v=R.v;
+  if(R.ok&&Number.isFinite(v[sk]))C.cur[sk]=v[sk];                 // keep the solved value when switching modes
+  const sv=$('triSolved');if(sv)sv.textContent=Number.isFinite(v[sk])?f(v[sk],3):'—';
+  triDefs().forEach(([k])=>{const el=$('triChg_'+k),base=triBaseVal(B,k),cur=v[k];if(!el)return;
+    el.textContent=Number.isFinite(cur)?sgn(cur-base,3):'—';el.className=Number.isFinite(cur)&&Math.abs(cur-base)>1e-9?'hl':'';});
+  $('triRhoY').innerHTML='ρ in ccy-vs-USD terms (ρ<sub>Y</sub>): '+f(sg*v.rho,3)+' · σ²<sub>'+c+'</sub> = σ²<sub>A</sub> + σ²<sub>B</sub> − 2ρ<sub>Y</sub>σ<sub>A</sub>σ<sub>B</sub>';
+  $('triMsg').innerHTML=R.msg?'<div class="note '+(R.ok?'':'err')+'">'+R.msg+'</div>':'';
+  let h='';
+  if(R.ok){
+    const sa=v.a,sb=v.b,ry=sg*v.rho,sx=v.x;
+    const dA=(sa-ry*sb)/sx,dB=(sb-ry*sa)/sx,dR=-sa*sb/sx;
+    if(C.solve==='cross'){
+      const b0={a:B.a,b:B.b,r:B.rho},n0={a:v.a,b:v.b,r:v.rho},F=m=>triX(m.a,m.b,sg*m.r),keys=['a','b','r'],names={a:pa+' vol',b:pb+' vol',r:'ρ'};
+      const val=set=>{const m={};keys.forEach(k=>m[k]=set.includes(k)?n0[k]:b0[k]);return F(m);};
+      const phi={};keys.forEach(i=>{const o=keys.filter(k=>k!==i);let s=0;[[],[o[0]],[o[1]],o].forEach(S_=>{s+=(S_.length===1?1/6:1/3)*(val(S_.concat([i]))-val(S_));});phi[i]=s;});
+      const tot=F(n0)-F(b0);
+      h+='<table class="kv" style="margin-top:8px"><tr class="h"><td colspan="2">'+c+' '+t+' ATM: '+f(F(b0),3)+' → '+f(F(n0),3)+' ('+sgn(tot,3)+')</td></tr>'
+        +keys.map(k=>'<tr><td>from '+names[k]+'</td><td class="'+(Math.abs(phi[k])>1e-9?'hl':'')+'" data-phi="'+k+'">'+sgn(phi[k],3)+'</td></tr>').join('')
+        +'<tr><td colspan="2" style="color:var(--text-muted)">Shapley split: the parts add to the total exactly, whatever order the changes are applied in.</td></tr></table>';
+    }
+    h+='<table class="kv" style="margin-top:8px"><tr class="h"><td colspan="2">Sensitivities at the scenario</td></tr>'
+      +'<tr><td>∂σ<sub>'+c+'</sub> / ∂σ<sub>'+pa+'</sub></td><td>'+f(dA,3)+' vol per vol</td></tr>'
+      +'<tr><td>∂σ<sub>'+c+'</sub> / ∂σ<sub>'+pb+'</sub></td><td>'+f(dB,3)+' vol per vol</td></tr>'
+      +'<tr><td>∂σ<sub>'+c+'</sub> per +0.01 ρ (as quoted)</td><td>'+sgn(sg*dR*0.01,3)+' vol</td></tr></table>';
+    const shV=[-1,-0.5,-0.25,0.25,0.5,1],shR=[-0.1,-0.05,-0.02,0.02,0.05,0.1];
+    const outLab={x:c+' vol',rho:'ρ',a:pa+' vol',b:pb+' vol'}[sk];
+    h+='<div class="meta" style="margin-top:10px"><b style="color:var(--text-primary)">Ladder</b> change in '+outLab+' for a shock to one input at a time (vols in vol pts, ρ as quoted)</div>'
+      +'<div class="scroll"><table id="triLadder"><thead><tr><th>Shock to</th>'+shV.map((s,i)=>'<th>'+sgn(s,2)+' vol<br>'+sgn(shR[i],2)+' ρ</th>').join('')+'</tr></thead><tbody>';
+    triDefs().filter(d=>d[0]!==sk).forEach(([k,lab,kind])=>{const sh=kind==='rho'?shR:shV;
+      h+='<tr><td class="lab">'+lab.split(' (')[0]+'</td>'+sh.map(s=>{const st={...v};st[k]=st[k]+s;
+        if(k==='rho'&&Math.abs(st.rho)>=1)return '<td>—</td>';if(k!=='rho'&&st[k]<=0)return '<td>—</td>';
+        const r=triSolve(st,C.solve,sg),nv=r.v[sk];return '<td>'+(r.ok&&Number.isFinite(nv)?sgn(nv-v[sk],3):'—')+'</td>';}).join('')+'</tr>';});
+    h+='</tbody></table></div>';
+  }
+  $('triOut').innerHTML=h;
+  renderHedge(R);
+  if(R.ok)drawTri(R.v,B,sg);
+}
+let _triRaf=null;function triLive(){if(_triRaf)return;_triRaf=requestAnimationFrame(()=>{_triRaf=null;triUpdate();});}
+function drawTri(v,B,sg){
+  if(typeof Plotly==='undefined')return;const c=crossNm(),xs=[],y1=[],y0=[];
+  for(let r=-0.99;r<=0.9901;r+=0.01){xs.push(+r.toFixed(2));y1.push(triX(v.a,v.b,sg*r));y0.push(triX(B.a,B.b,sg*r));}
+  const L=baseLayout('vol');L.hovermode='x unified';L.xaxis.title={text:'ρ '+S.pairA+'/'+S.pairB+' (as quoted)'};L.margin.b=44;L.margin.t=34;L.legend={orientation:'h',x:0,y:1.16};
+  const tr=[{x:xs,y:y1,mode:'lines',name:'Scenario',line:{color:css('--s1'),width:2}},{x:xs,y:y0,mode:'lines',name:'Current marks',line:{color:css('--ref'),width:1.5,dash:'dash'}},
+    {x:[v.rho],y:[v.x],mode:'markers',name:'Scenario point',marker:{color:css('--s1'),size:10,line:{color:css('--surface-1'),width:2}}}];
+  if(B.mkt!=null)tr.push({x:[xs[0],xs[xs.length-1]],y:[B.mkt,B.mkt],mode:'lines',name:'Market '+c,line:{color:css('--s2'),width:1.5,dash:'dot'}});
+  Plotly.react('chTri',tr,L,CFG);
+}
+function renderHedge(R){
+  const el=$('triRight'),C=triCfg(),c=crossNm(),t=C.tenor,v=R.v;
+  if(!R.ok||!Number.isFinite(v.a)||!Number.isFinite(v.b)){el.innerHTML='<div class="empty">Fix the triangle inputs to see the hedge.</div>';return;}
+  const A=S.legs.A,Bl=S.legs.B,base=c.slice(0,3),quote=c.slice(3),T=TENOR_YRS[t];
+  const SA=+A.spot,SB=+Bl.spot,Y=(p,s)=>p.slice(3)==='USD'?s:1/s;            // USD per unit of the leg's ccy
+  const legOfBase=legCcy(A.pair)===base?'A':'B',YB=legOfBase==='A'?Y(Bl.pair,SB):Y(A.pair,SA),YA=legOfBase==='A'?Y(A.pair,SA):Y(Bl.pair,SB);
+  const SX=YA/YB,upq=p=>p.slice(3)==='USD'?1:1/(p===A.pair?SA:SB);
+  const sa=v.a/100,sb=v.b/100,sx=v.x/100,ry=orient(A.pair)*orient(Bl.pair)*v.rho;
+  const gX=atmGammaUSD(SX,sx,T,YB),gA=atmGammaUSD(SA,sa,T,upq(A.pair)),gB=atmGammaUSD(SB,sb,T,upq(Bl.pair));
+  const sgn_=C.side==='buy'?1:-1,NX=sgn_*Math.abs(C.notional||0),Gx=NX*gX;
+  const modes=[['corr','Correlation-only'],['minvar','Min-variance'],['cash','1:1 cash gamma']];
+  const book=m=>{const [rA,rB]=hedgeRatios(sa,sb,ry,m),Ga=-rA*Gx,Gb=-rB*Gx;return {rA,rB,NA:Ga/gA,NB:Gb/gB,Ga,Gb,st:hedgeBook(Gx,Ga,Gb,sa,sb,ry)};};
+  const bk=book(C.mode),vX=NX*atmVegaUSD(SX,sx,T,YB)/100,vA=bk.NA*atmVegaUSD(SA,sa,T,upq(A.pair))/100,vB=bk.NB*atmVegaUSD(SB,sb,T,upq(Bl.pair))/100;
+  const money=(x,d=0)=>{if(Math.abs(x)<0.5*Math.pow(10,-d))x=0;return (x<0?'−':'')+Math.abs(x).toLocaleString(undefined,{maximumFractionDigits:d,minimumFractionDigits:d});};
+  const act=x=>x>=0?'<span class="pos">Buy</span>':'<span class="negv">Sell</span>';
+  const nccy=p=>p.slice(0,3);
+  let h='<div class="controls" style="gap:8px 14px;margin-bottom:6px">'
+    +'<label class="f">'+c+' notional ('+base+')<input id="hNot" class="num wide" style="width:120px" value="'+Math.abs(C.notional).toLocaleString()+'"></label>'
+    +'<div class="f"><label class="f">Cross position</label><div class="seg" id="hSide"><button data-v="buy">Buy '+c+' (long γ)</button><button data-v="sell">Sell '+c+'</button></div></div>'
+    +'<div class="f"><label class="f">Hedge</label><div class="seg" id="hMode">'+modes.map(([m,l])=>'<button data-v="'+m+'">'+l+'</button>').join('')+'</div></div></div>';
+  h+='<div class="scroll"><table><thead><tr><th>'+t+' ATM option</th><th>Action</th><th>Notional</th><th>1% gamma (USD)</th><th>γ ratio</th><th>Vega (USD/vol)</th></tr></thead><tbody>'
+    +'<tr><td class="lab">'+c+'</td><td>'+act(NX)+'</td><td>'+base+' '+money(Math.abs(NX))+'</td><td>'+money(Gx*0.01)+'</td><td>1.000</td><td>'+money(vX)+'</td></tr>'
+    +'<tr><td class="lab">'+A.pair+'</td><td>'+act(bk.NA)+'</td><td>'+nccy(A.pair)+' '+money(Math.abs(bk.NA))+'</td><td>'+money(bk.Ga*0.01)+'</td><td>'+sgn(-bk.rA,3)+'</td><td>'+money(vA)+'</td></tr>'
+    +'<tr><td class="lab">'+Bl.pair+'</td><td>'+act(bk.NB)+'</td><td>'+nccy(Bl.pair)+' '+money(Math.abs(bk.NB))+'</td><td>'+money(bk.Gb*0.01)+'</td><td>'+sgn(-bk.rB,3)+'</td><td>'+money(vB)+'</td></tr>'
+    +'</tbody></table></div>';
+  const corrSide=(NX>0)?'SHORT':'LONG',life=Math.round(T*252);
+  const st=bk.st,red=1-st.resid_sd/st.unhedged_sd;
+  h+='<table class="kv" style="margin-top:8px"><tr class="h"><td colspan="2">What\'s left after the hedge</td></tr>'
+    +'<tr><td>Residual position</td><td><b style="color:var(--text-primary)">'+corrSide+' correlation</b> (ρ<sub>Y</sub> of '+base+' and '+quote+' vs USD, now '+f(ry,3)+')</td></tr>'
+    +'<tr><td>Carry per +0.01 realized ρ<sub>Y</sub> vs implied</td><td>'+money(st.carry_per_rho01)+' USD/day · '+money(st.carry_per_rho01*life)+' over '+life+' days</td></tr>'
+    +'<tr><td>Carry per +1 vol realized '+A.pair+' / '+Bl.pair+'</td><td>'+money(st.carry_per_volA)+' / '+money(st.carry_per_volB)+' USD/day'+(C.mode==='corr'?' (zero by construction)':'')+'</td></tr>'
+    +'<tr><td>Daily gamma P&L sd: unhedged → hedged</td><td>'+money(st.unhedged_sd)+' → '+money(st.resid_sd)+' USD ('+(red>=0?'−':'+')+f(Math.abs(red)*100,0)+'%)</td></tr>'
+    +'<tr><td>Vega to a 1-vol move in '+A.pair+' / '+Bl.pair+'<br><span style="color:var(--text-muted)">cross moving with it via the triangle</span></td><td>'+money(vX*(sa-ry*sb)/sx+vA)+' / '+money(vX*(sb-ry*sa)/sx+vB)+' USD</td></tr>'
+    +'<tr><td>Vega to a 1-vol move in '+c+' alone<br><span style="color:var(--text-muted)">i.e. implied ρ moving '+f(sx/(sa*sb)*0.01,3)+' per vol</span></td><td>'+money(vX)+' USD</td></tr></table>';
+  h+='<div class="meta" style="margin-top:10px"><b style="color:var(--text-primary)">Hedge choices</b> (leg γ per 1 of cross γ; per-day figures in USD)</div><div class="scroll"><table><thead><tr><th>Hedge</th><th>'+A.pair+'</th><th>'+Bl.pair+'</th><th>Daily P&L sd</th><th>per +0.01 ρ<sub>Y</sub></th><th>per +1 vol '+A.pair+'</th><th>per +1 vol '+Bl.pair+'</th></tr></thead><tbody>'
+    +modes.map(([m,l])=>{const b2=book(m),s2=b2.st;return '<tr'+(m===C.mode?' style="background:rgba(57,135,229,.10)"':'')+'><td class="lab">'+l+'</td><td>'+sgn(-b2.rA,3)+'</td><td>'+sgn(-b2.rB,3)+'</td><td>'+money(s2.resid_sd)+'</td><td>'+money(s2.carry_per_rho01)+'</td><td>'+money(s2.carry_per_volA)+'</td><td>'+money(s2.carry_per_volB)+'</td></tr>';}).join('')
+    +'</tbody></table></div>';
+  h+='<div class="note">Gamma P&L of the book = ½[G<sub>X</sub>(a−b)² + G<sub>A</sub>a² + G<sub>B</sub>b²], a, b = daily returns of '+base+' and '+quote+' vs USD; G = cash gamma (Γ·S²) in USD. '
+    +'The legs can cancel a² and b² but not the −G<sub>X</sub>·ab cross term, so no leg hedge is exactly gamma-neutral. '
+    +'<b>Correlation-only</b> (leg γ = 1 − ρσ<sub>other</sub>/σ<sub>own</sub>) makes the expected P&L depend only on realized vs implied ρ, and is vega- and theta-neutral: the same trade as the vega-neutral one in the analytics card. '
+    +'<b>Min-variance</b> gives the quietest daily P&L for this ρ but keeps leg-vol exposure. <b>1:1</b> leaves exposure to realized covariance. '
+    +'ATM options at the '+t+' tenor, undiscounted, each delta-hedged in its own pair; '+t+' ≈ '+f(T,3)+'y. 1% gamma = change in delta (USD) for a 1% spot move.</div>';
+  el.innerHTML=h;
+  $('hNot').onchange=e=>{const x=parseCell(e.target.value);if(x!=null&&!Number.isNaN(x)){C.notional=Math.abs(x);save();triUpdate();}};
+  document.querySelectorAll('#hSide button').forEach(b=>{b.classList.toggle('on',C.side===b.dataset.v);b.onclick=()=>{C.side=b.dataset.v;save();triUpdate();};});
+  document.querySelectorAll('#hMode button').forEach(b=>{b.classList.toggle('on',C.mode===b.dataset.v);b.onclick=()=>{C.mode=b.dataset.v;save();triUpdate();};});
+}
+
 async function init(){
   load();
   const st=await api('/api/status').catch(()=>({bbg:false,pairs:['EURUSD','USDCAD'],error:'server unreachable'}));
@@ -2553,7 +2800,7 @@ async function init(){
   if(S.legs.A&&S.legs.A.pair===S.pairA)renderLeg('A');else loadLeg('A');
   if(S.legs.B&&S.legs.B.pair===S.pairB)renderLeg('B');else loadLeg('B');
   if(S.corr&&S.corr.vol_vol)renderCorr();else loadCorr();
-  loadMkt();renderMonitor();renderAnalytics();
+  loadMkt();renderMonitor();renderAnalytics();renderTri();
 }
 init();
 </script></body></html>"""
@@ -2953,6 +3200,94 @@ def selftest():
     check('monitor endpoint: strict JSON, 21 table rows, ~1Y of dates',
           len(MM['rows']) == 21 and 240 <= len(MM['dates']) <= 253 and MM['diag']['cross_vol_direct'] is not None,
           f"({MM['source']}, {len(MM['dates'])} dates, realized today {MM['realized'][-1]:+.3f}, implied {MM['implied'][-1]:+.3f})")
+
+    print('\n14) Triangle and cross gamma hedging (full Black repricing)')
+    sa, sb, ry = 0.075, 0.060, 0.45                      # EURUSD 7.5, USDCAD 6.0, rho_Y 0.45 (quoted -0.45)
+    sx = triangle_cross(sa, sb, ry)
+    check('triangle: cross -> rho -> cross round trip', abs(implied_rho_y(sa, sb, sx) - ry) < 1e-12 and abs(sx * 100 - 7.1937) < 1e-4,
+          f'(7.5 / 6.0 / -0.45 -> {sx*100:.4f} -> rho_Y {implied_rho_y(sa, sb, sx):.6f})')
+    roots = triangle_leg(sb, sx, ry)
+    check('triangle: solve a leg (both roots reproduce the cross; infeasible below the floor)',
+          any(abs(v - sa) < 1e-12 for v in roots) and all(abs(triangle_cross(v, sb, ry) - sx) < 1e-12 for v in roots)
+          and triangle_leg(sb, 0.5 * sb * math.sqrt(1 - ry * ry), ry) == [],
+          f"(roots {[round(v * 100, 4) for v in roots]}; floor {sb*math.sqrt(1-ry*ry)*100:.3f})")
+    T = 0.25
+    SA, SB = 1.085, 1.37                                 # EURUSD, USDCAD
+    YA, YB = SA, 1 / SB                                  # USD per EUR, USD per CAD
+    SX = YA / YB                                         # EURCAD
+    upq = {'X': YB, 'A': 1.0, 'B': 1 / SB}               # USD per unit of each pair's quote ccy
+    gX, gA, gB = atm_cash_gamma_usd(SX, sx, T, upq['X']), atm_cash_gamma_usd(SA, sa, T, upq['A']), atm_cash_gamma_usd(SB, sb, T, upq['B'])
+
+    def dh_pnl(S0, sig, r, units):                       # delta-hedged ATM call, quote ccy, exact repricing
+        K = S0
+        c0 = float(black(S0, K, T, sig, 1))
+        dlt = float(ndtr(_d12(S0, K, T, sig)[0]))
+        S1 = S0 * math.exp(r)
+        return units * (float(black(S1, K, T, sig, 1)) - c0 - dlt * (S1 - S0))
+
+    def book_pnl(NX, NA, NB, a, b):
+        return (dh_pnl(SX, sx, a - b, NX) * upq['X'] + dh_pnl(SA, sa, a, NA) * upq['A']
+                + dh_pnl(SB, sb, -b, NB) * upq['B'])     # USDCAD return = -b
+
+    def fitted_M(NX, NA, NB, h=1e-4):
+        P = lambda a, b: book_pnl(NX, NA, NB, a, b)
+        m11 = (P(h, 0) + P(-h, 0)) / h ** 2
+        m22 = (P(0, h) + P(0, -h)) / h ** 2
+        m12 = ((P(h, h) + P(-h, -h)) / h ** 2 - m11 - m22) / 2
+        return np.array([[m11, m12], [m12, m22]])
+    NX = 10e6
+    Mx = fitted_M(NX, 0, 0)
+    Gx = NX * gX
+    err = np.max(np.abs(Mx - Gx * np.array([[1, -1], [-1, 1]]))) / Gx
+    check('cross cash gamma (EURCAD, CAD -> USD) matches repricing; P&L = 1/2 Gx (a-b)^2', err < 1e-3,
+          f'(rel err {err:.1e}; 1% gamma on EUR 10m = USD {Gx*0.01:,.0f})')
+    for nm, (S0, sg, g, sgn_) in {'EURUSD': (SA, sa, gA, 1), 'USDCAD': (SB, sb, gB, -1)}.items():
+        NN = 10e6
+        Mi = fitted_M(0, NN, 0) if nm == 'EURUSD' else fitted_M(0, 0, NN)
+        idx = 0 if nm == 'EURUSD' else 1
+        e = abs(Mi[idx, idx] - NN * g) / (NN * g)
+        check(f'{nm} cash gamma in USD matches repricing', e < 1e-3 and abs(Mi[0, 1]) < 1e-6 * NN * g, f'(rel err {e:.1e})')
+    for mode in ('corr', 'minvar', 'cash'):
+        rA, rB = gamma_hedge_ratios(sa, sb, ry, mode)
+        NA, NB = -rA * Gx / gA, -rB * Gx / gB
+        Mb = fitted_M(NX, NA, NB)
+        pred = hedge_book(Gx, NA * gA, NB * gB, sa, sb, ry)['M']
+        e = np.max(np.abs(Mb - pred)) / Gx
+        check(f'{mode:6} hedge: repriced book gamma matrix = prediction', e < 1e-3,
+              f'(ratios {rA:.4f}/{rB:.4f}; EURUSD EUR {NA/1e6:+.2f}m, USDCAD USD {NB/1e6:+.2f}m; residual cross-gamma {Mb[0,1]/Gx:+.4f} Gx)')
+    rA, rB = gamma_hedge_ratios(sa, sb, ry, 'corr')
+    NA, NB = -rA * Gx / gA, -rB * Gx / gB
+    vf = variance_formula(sa, sb, ry)
+    vX, vA, vB = NX * atm_vega_usd(SX, sx, T, upq['X']), NA * atm_vega_usd(SA, sa, T, upq['A']), NB * atm_vega_usd(SB, sb, T, upq['B'])
+    vega_leakA = vX * vf['d_sa'] + vA
+    vega_leakB = vX * vf['d_sb'] + vB
+    theta = -0.5 * (Gx * sx * sx + NA * gA * sa * sa + NB * gB * sb * sb)
+    st = hedge_book(Gx, NA * gA, NB * gB, sa, sb, ry)
+    check('corr hedge is vega-neutral to each leg and theta-neutral',
+          abs(vega_leakA) < 1e-6 * abs(vX) and abs(vega_leakB) < 1e-6 * abs(vX) and abs(theta) < 1e-6 * Gx * sx * sx,
+          f'(vega leak {vega_leakA:.2e}/{vega_leakB:.2e} USD per vol; theta {theta:.1e})')
+    check('corr hedge: carry independent of realized leg vols, depends only on rho',
+          abs(st['carry_per_volA']) < 1e-9 * Gx and abs(st['carry_per_volB']) < 1e-9 * Gx and st['carry_per_rho01'] < 0,
+          f"(per +0.01 realized rho: USD {st['carry_per_rho01']:,.0f}/day; long cross gamma = short correlation)")
+    Sig_i = np.array([[sa * sa, ry * sa * sb], [ry * sa * sb, sb * sb]]) / 252
+    Sig_r = np.array([[sa * sa, (ry + 0.01) * sa * sb], [(ry + 0.01) * sa * sb, sb * sb]]) / 252
+    carry = 0.5 * float(np.trace(st['M'] @ (Sig_r - Sig_i)))
+    check('carry per +0.01 rho = 1/2 tr(M dSigma)', abs(carry - st['carry_per_rho01']) < 1e-9 * Gx, f'({carry:,.2f})')
+    best = min(((hedge_book(Gx, -x * Gx, -y * Gx, sa, sb, ry)['resid_sd'], x, y)
+                for x in np.linspace(0, 1.2, 241) for y in np.linspace(0, 1.2, 241)))
+    mA, mB = gamma_hedge_ratios(sa, sb, ry, 'minvar')
+    check('min-variance ratios = brute-force minimum of residual P&L variance',
+          abs(best[1] - mA) < 0.006 and abs(best[2] - mB) < 0.006,
+          f'(formula {mA:.4f}/{mB:.4f}, grid {best[1]:.4f}/{best[2]:.4f})')
+    rng5 = np.random.default_rng(3)
+    L5 = np.linalg.cholesky(Sig_i)
+    z = rng5.standard_normal((400000, 2)) @ L5.T
+    for mode in ('corr', 'minvar'):
+        rA_, rB_ = gamma_hedge_ratios(sa, sb, ry, mode)
+        hb = hedge_book(Gx, -rA_ * Gx, -rB_ * Gx, sa, sb, ry)
+        pn = 0.5 * np.einsum('ij,jk,ik->i', z, hb['M'], z)
+        check(f'{mode:6} residual daily P&L sd: formula = Monte Carlo', abs(np.std(pn) / hb['resid_sd'] - 1) < 0.02,
+              f"(USD {hb['resid_sd']:,.0f} vs {np.std(pn):,.0f}; unhedged {hb['unhedged_sd']:,.0f})")
 
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)
