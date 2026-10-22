@@ -1864,6 +1864,11 @@ details summary{cursor:pointer;color:var(--text-secondary);margin-top:8px}
 .kv tr.h td{color:var(--text-primary);font-weight:650;padding-top:9px;border-bottom:1px solid var(--border)}
 .ev{margin:10px 0 0;padding-left:18px;color:var(--text-primary)} .ev li{margin:3px 0}
 .pos{color:var(--good)} .negv{color:var(--critical)}
+table.grid td{padding:1px 2px}
+table.grid input.num{width:100%;min-width:58px;border-radius:3px;cursor:cell}
+table.grid input.num:focus{outline:2px solid var(--accent);outline-offset:-1px;cursor:text}
+table.grid input.num.gsel{background:rgba(57,135,229,.20);border-color:var(--accent)}
+table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
 </style></head><body>
 <header><h1>Cross Vol Builder</h1><span class="pill"><span id="bbgDot" class="dot"></span><span id="bbgTxt">checking Bloomberg…</span></span>
 <span style="flex:1"></span><span class="pill">ATM: variance formula · RR: copula · wings: vol-of-vol</span></header>
@@ -1892,7 +1897,7 @@ details summary{cursor:pointer;color:var(--text-secondary);margin-top:8px}
 <script>
 const TENORS=['1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y'];
 const FIELDS=[['fwd_pts','Fwd pts'],['atm','ATM'],['rr25','25 RR'],['rr10','10 RR'],['bf25','25 BF'],['bf10','10 BF']];
-const LS='crossvol_state_v4';
+const LS='crossvol_state_v5';
 let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
        legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
 const $=id=>document.getElementById(id);
@@ -1911,24 +1916,185 @@ function segInit(){document.querySelectorAll('.seg').forEach(seg=>{const k=seg.d
   seg.querySelectorAll('button').forEach(b=>{b.classList.toggle('on',S[k]===b.dataset.v);
    b.onclick=()=>{S[k]=b.dataset.v;seg.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));save();};});});}
 
+// ===================== Excel-like input grid =====================
+const GRID_KEYS=FIELDS.map(x=>x[0]);
+const TENOR_ALIAS={'1W':'1W','1WK':'1W','2W':'2W','2WK':'2W','1M':'1M','1MO':'1M','2M':'2M','2MO':'2M','3M':'3M','3MO':'3M',
+  '6M':'6M','6MO':'6M','9M':'9M','9MO':'9M','1Y':'1Y','12M':'1Y','1YR':'1Y','18M':'18M','1.5Y':'18M','2Y':'2Y','24M':'2Y','2YR':'2Y'};
+function normTenor(s){
+  const k=String(s==null?'':s).toUpperCase().replace(/\s+/g,'')
+    .replace(/^(\d+(?:\.\d+)?)(WEEKS?|WKS?|WK)$/,'$1W').replace(/^(\d+(?:\.\d+)?)(MONTHS?|MTHS?|MOS?|MO)$/,'$1M').replace(/^(\d+(?:\.\d+)?)(YEARS?|YRS?|YR)$/,'$1Y');
+  return TENOR_ALIAS[k]||null;
+}
+const COL_ALIAS=[['fwd_pts',/^(FWD|FWDS|FORWARD|FORWARDS|FWDPTS|FWDPOINTS|FORWARDPOINTS|PTS|POINTS|SWAP|SWAPPTS|SWAPPOINTS)$/],
+  ['atm',/^(ATM|ATMVOL|VOL|IV|ATMV)$/],['rr25',/^(25RR|RR25|25R|25DRR|RR|25RISKY|25RISKREVERSAL)$/],['rr10',/^(10RR|RR10|10R|10DRR|10RISKY)$/],
+  ['bf25',/^(25BF|BF25|25B|25FLY|FLY25|25DBF|25DFLY|BF|FLY|25BFLY)$/],['bf10',/^(10BF|BF10|10B|10FLY|FLY10|10DBF|10DFLY|10BFLY)$/]];
+function headerKey(s){const k=String(s==null?'':s).toUpperCase().replace(/[\s_\-.()Δδ]/g,'');for(const [key,re] of COL_ALIAS)if(re.test(k))return key;
+  if(/^(TENOR|EXPIRY|MATURITY|TERM|PILLAR)$/.test(k))return '__tenor';return null;}
+// returns number, null (blank) or NaN (not a number)
+function parseCell(s){
+  let t=String(s==null?'':s).trim().replace(/[−–—]/g,'-').replace(/[,\s%$]/g,'');
+  if(t==='')return null;
+  let neg=false;const m=t.match(/^\((.*)\)$/);if(m){neg=true;t=m[1];}
+  if(!/^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(t))return NaN;
+  const v=parseFloat(t);return neg?-v:v;
+}
+function splitClip(text){
+  let lines=String(text).replace(/\r\n?/g,'\n').split('\n');
+  while(lines.length&&lines[lines.length-1].trim()==='')lines.pop();
+  const tabbed=lines.some(l=>l.includes('\t'));
+  return lines.map(l=>tabbed?l.split('\t'):(l.trim()===''?['']:l.trim().split(/\s{2,}|\s*;\s*|\s+/)));
+}
+// plan where a pasted block goes: {cells:[[r,c,raw]], mode, info}
+function planPaste(text,r0,c0,nRows,nCols){
+  const M=splitClip(text);if(!M.length)return {cells:[],mode:'empty',info:''};
+  let body=M,colMap=null,mode='positional';
+  const first=M[0],isNum=v=>{const p=parseCell(v);return p!==null&&!Number.isNaN(p);};
+  // a header row has text and no numbers (a data row with one bad cell is still data)
+  const isHeader=!first.some(isNum)&&first.some(v=>String(v).trim()!=='')&&!normTenor(first[0]);
+  const hk=first.map(headerKey);
+  if(isHeader&&hk.some(k=>k&&k!=='__tenor')){colMap=hk;body=M.slice(1);mode='header';}
+  else if(isHeader){body=M.slice(1);mode='positional (header row ignored)';}
+  const tenorCol=colMap?colMap.indexOf('__tenor'):-1;
+  let tc=tenorCol>=0?tenorCol:-1;
+  if(tc<0&&body.length){const hits=body.filter(r=>normTenor(r[0])).length;if(hits>=Math.max(1,Math.ceil(body.length/2)))tc=0;}
+  const cells=[];let skipped=0,outside=0;
+  body.forEach((row,i)=>{
+    let r;
+    if(tc>=0){const tn=normTenor(row[tc]);if(!tn){skipped++;return;}r=TENORS.indexOf(tn);}
+    else r=r0+i;
+    if(r<0||r>=nRows){outside++;return;}
+    let ci=0;
+    row.forEach((raw,j)=>{
+      if(j===tc)return;
+      let c;
+      if(colMap){const key=colMap[j];if(!key||key==='__tenor')return;c=GRID_KEYS.indexOf(key);}
+      else{c=c0+ci;ci++;}
+      if(c<0||c>=nCols){outside++;return;}
+      cells.push([r,c,raw]);
+    });
+  });
+  if(tc>=0)mode+=' + tenor labels';
+  return {cells,mode,skipped,outside};
+}
+function legGrid(which){
+  const L=S.legs[which];if(!L)return;
+  const tbl=$('grid'+which);if(!tbl)return;
+  const G=tbl._g||(tbl._g={sel:{r0:0,c0:0,r1:0,c1:0},act:{r:0,c:0},drag:false,undo:[]});
+  const nR=TENORS.length,nC=GRID_KEYS.length;
+  const cell=(r,c)=>tbl.querySelector('input[data-r="'+r+'"][data-c="'+c+'"]');
+  const get=(r,c)=>{const row=L.rows[TENORS[r]];return row?row[GRID_KEYS[c]]:null;};
+  const set=(r,c,v)=>{const t=TENORS[r];L.rows[t]=L.rows[t]||{};L.rows[t][GRID_KEYS[c]]=v;};
+  const orig=(r,c)=>{const o=L._orig&&L._orig[TENORS[r]];return o?o[GRID_KEYS[c]]:undefined;};
+  const snap=()=>{G.undo.push(JSON.stringify(L.rows));if(G.undo.length>60)G.undo.shift();};
+  const show=v=>(v===null||v===undefined||(typeof v==='number'&&!isFinite(v)))?'':String(v);
+  const paint=(force)=>{for(let r=0;r<nR;r++)for(let c=0;c<nC;c++){const el=cell(r,c);if(!el)continue;
+      if(force||document.activeElement!==el)el.value=show(get(r,c));
+      const o=orig(r,c),v=get(r,c);el.classList.toggle('dirty',o!==undefined&&!(o===v||(o==null&&v==null)||(o!=null&&v!=null&&Math.abs(o-v)<1e-12)));
+      const s=G.sel,inS=r>=Math.min(s.r0,s.r1)&&r<=Math.max(s.r0,s.r1)&&c>=Math.min(s.c0,s.c1)&&c<=Math.max(s.c0,s.c1);
+      el.classList.toggle('gsel',inS&&!(s.r0===s.r1&&s.c0===s.c1));}
+    const nd=tbl.querySelectorAll('input.dirty').length,el=$('gridInfo'+which);
+    if(el)el.textContent=nd?nd+' cell'+(nd>1?'s':'')+' changed from the pull':'';};
+  const multi=()=>!(G.sel.r0===G.sel.r1&&G.sel.c0===G.sel.c1);
+  const box=()=>({r0:Math.min(G.sel.r0,G.sel.r1),r1:Math.max(G.sel.r0,G.sel.r1),c0:Math.min(G.sel.c0,G.sel.c1),c1:Math.max(G.sel.c0,G.sel.c1)});
+  const focus=(r,c,extend)=>{r=Math.max(0,Math.min(nR-1,r));c=Math.max(0,Math.min(nC-1,c));
+    if(extend){G.sel.r1=r;G.sel.c1=c;}else{G.sel={r0:r,c0:c,r1:r,c1:c};}
+    G.act={r,c};G.inEdit=false;const el=cell(r,c);G.noSel=!!extend;el.focus();if(!extend)el.select();paint();};
+  const commit=(el)=>{const r=+el.dataset.r,c=+el.dataset.c,v=parseCell(el.value);
+    if(Number.isNaN(v)){el.value=show(get(r,c));status('Not a number: "'+el.value+'"','err');return;}
+    const old=get(r,c);if(old===v||(old!=null&&v!=null&&Math.abs(old-v)<1e-12))return;
+    snap();set(r,c,v);save();paint();};
+  const done=(msg,cls)=>{save();paint(true);if(msg)status(msg,cls);};
+  G.api={paste(text){                               // used by the paste handler and the tests
+      const p=planPaste(text,box().r0,box().c0,nR,nC);
+      if(p.cells.length===1&&multi()){                  // one value into a range: fill the range (Excel)
+        const v=parseCell(p.cells[0][2]);if(Number.isNaN(v)||v===null)return done('Not a number','err');
+        snap();const b=box();for(let r=b.r0;r<=b.r1;r++)for(let c=b.c0;c<=b.c1;c++)set(r,c,v);
+        return done('Filled '+((b.r1-b.r0+1)*(b.c1-b.c0+1))+' cells with '+v);}
+      snap();let n=0,bad=0;let rMin=nR,rMax=-1,cMin=nC,cMax=-1;
+      p.cells.forEach(([r,c,raw])=>{const v=parseCell(raw);if(v===null)return;if(Number.isNaN(v)){bad++;return;}
+        set(r,c,v);n++;rMin=Math.min(rMin,r);rMax=Math.max(rMax,r);cMin=Math.min(cMin,c);cMax=Math.max(cMax,c);});
+      if(n)G.sel={r0:rMin,c0:cMin,r1:rMax,c1:cMax};
+      return done('Pasted '+n+' value'+(n===1?'':'s')+' into '+L.pair+' ('+p.mode+')'+(bad?' · '+bad+' non-numeric skipped':'')
+        +(p.skipped?' · '+p.skipped+' unrecognised tenor rows skipped':'')+(p.outside?' · '+p.outside+' outside the grid':'')+'. Blank cells leave values unchanged. Ctrl+Z to undo.',bad||p.skipped?'warn':'');},
+    copyText(){const b=box(),out=[];for(let r=b.r0;r<=b.r1;r++){const line=[];for(let c=b.c0;c<=b.c1;c++)line.push(show(get(r,c)));out.push(line.join('\t'));}return out.join('\n');},
+    clear(){const b=box();snap();for(let r=b.r0;r<=b.r1;r++)for(let c=b.c0;c<=b.c1;c++)set(r,c,null);done('Cleared '+((b.r1-b.r0+1)*(b.c1-b.c0+1))+' cells');},
+    fillDown(){const b=box();if(b.r1===b.r0)return;snap();for(let c=b.c0;c<=b.c1;c++){const v=get(b.r0,c);for(let r=b.r0+1;r<=b.r1;r++)set(r,c,v);}done('Filled down');},
+    undo(){if(!G.undo.length)return status('Nothing to undo');L.rows=JSON.parse(G.undo.pop());done('Undone');},
+    select(r0,c0,r1,c1){G.sel={r0,c0,r1,c1};G.act={r:r1,c:c1};paint();},
+    revert(){if(!L._orig)return;snap();L.rows=JSON.parse(JSON.stringify(L._orig));done('Reverted '+L.pair+' to the pulled values');}};
+  if(!tbl._wired){tbl._wired=true;
+    tbl.addEventListener('mousedown',e=>{const el=e.target.closest('input[data-r]');if(!el)return;const r=+el.dataset.r,c=+el.dataset.c;
+      if(e.detail<2)G.inEdit=false;
+      if(e.shiftKey){e.preventDefault();focus(G.act.r,G.act.c,false);G.sel={r0:G.act.r,c0:G.act.c,r1:r,c1:c};paint();return;}
+      G.drag=true;G.sel={r0:r,c0:c,r1:r,c1:c};G.act={r,c};paint();});
+    tbl.addEventListener('mouseover',e=>{if(!G.drag)return;const el=e.target.closest('input[data-r]');if(!el)return;
+      G.sel.r1=+el.dataset.r;G.sel.c1=+el.dataset.c;paint();});
+    document.addEventListener('mouseup',()=>{G.drag=false;});
+    // Excel: a click selects the cell so typing replaces it; double-click (or F2) edits in place
+    // deferred so it runs after the browser's own caret placement; skipped while editing in place
+    tbl.addEventListener('mouseup',e=>{const el=e.target.closest('input[data-r]');if(!el||multi()||e.detail>1)return;
+      G.pendingSel=el;setTimeout(()=>{if(G.pendingSel===el){G.pendingSel=null;if(!G.inEdit&&document.activeElement===el&&!multi())el.select();}},0);});
+    tbl.addEventListener('dblclick',e=>{const el=e.target.closest('input[data-r]');if(!el)return;G.inEdit=true;G.pendingSel=null;const n=el.value.length;el.setSelectionRange(n,n);});
+    tbl.addEventListener('focusin',e=>{const el=e.target.closest('input[data-r]');if(!el)return;const r=+el.dataset.r,c=+el.dataset.c;
+      if(!G.drag&&!G.noSel&&!(G.act.r===r&&G.act.c===c&&multi()))G.sel={r0:r,c0:c,r1:r,c1:c};G.act={r,c};G.noSel=false;
+      paint();});
+    tbl.addEventListener('change',e=>{const el=e.target.closest('input[data-r]');if(el)commit(el);});
+    tbl.addEventListener('keydown',e=>{const el=e.target.closest('input[data-r]');if(!el)return;
+      const r=+el.dataset.r,c=+el.dataset.c,mod=e.ctrlKey||e.metaKey,len=el.value.length;
+      if(G.pendingSel===el){G.pendingSel=null;if(!G.inEdit&&!multi())el.select();}     // keystroke beat the deferred click-select
+      const whole=el.selectionStart===0&&el.selectionEnd===len;   // (after any pending select above)
+      const mv=(dr,dc)=>{e.preventDefault();commit(el);
+        if(e.shiftKey&&!['Enter','Tab'].includes(e.key)){const nr=Math.max(0,Math.min(nR-1,G.sel.r1+dr)),nc=Math.max(0,Math.min(nC-1,G.sel.c1+dc));G.sel.r1=nr;G.sel.c1=nc;paint();return;}
+        focus(r+dr,c+dc,false);};
+      if(mod&&(e.key==='z'||e.key==='Z')){e.preventDefault();G.api.undo();return;}
+      if(mod&&(e.key==='d'||e.key==='D')){e.preventDefault();commit(el);G.api.fillDown();return;}
+      if(mod&&(e.key==='a'||e.key==='A')&&multi()){e.preventDefault();G.api.select(0,0,nR-1,nC-1);return;}
+      if(e.key==='Enter'){mv(e.shiftKey?-1:1,0);return;}
+      if(e.key==='Tab'){mv(0,e.shiftKey?-1:1);return;}
+      if(e.key==='ArrowUp'){mv(-1,0);return;}
+      if(e.key==='ArrowDown'){mv(1,0);return;}
+      if(e.key==='ArrowLeft'&&(!G.inEdit||whole||el.selectionStart===0||e.shiftKey)){mv(0,-1);return;}
+      if(e.key==='ArrowRight'&&(!G.inEdit||whole||el.selectionEnd===len||e.shiftKey)){mv(0,1);return;}
+      if((e.key==='Delete'||e.key==='Backspace')&&multi()){e.preventDefault();G.api.clear();return;}
+      if(e.key==='Escape'){el.value=show(get(r,c));el.select();return;}
+      if(e.key==='F2'){e.preventDefault();G.inEdit=true;const n=el.value.length;el.setSelectionRange(n,n);return;}
+      if(multi()&&e.key.length===1&&!mod){G.sel={r0:r,c0:c,r1:r,c1:c};el.select();paint();}});   // typing collapses the range to the active cell
+    tbl.addEventListener('paste',e=>{const el=e.target.closest('input[data-r]');if(!el)return;
+      const text=(e.clipboardData||window.clipboardData).getData('text');
+      if(!/[\t\n]/.test(text.trim())&&!multi())return;          // single value into one cell: normal typing paste
+      e.preventDefault();G.api.paste(text);});
+    tbl.addEventListener('copy',e=>{if(!multi())return;e.preventDefault();e.clipboardData.setData('text/plain',G.api.copyText());
+      status('Copied '+((box().r1-box().r0+1)*(box().c1-box().c0+1))+' cells');});
+  }
+  paint(true);
+}
+function gridTSV(which){const L=S.legs[which];const out=[['Tenor'].concat(FIELDS.map(x=>x[1])).join('\t')];
+  TENORS.forEach(t=>{const r=L.rows[t]||{};out.push([t].concat(GRID_KEYS.map(k=>r[k]==null?'':r[k])).join('\t'));});return out.join('\n');}
 function renderLeg(which){
   const L=S.legs[which],el=$('card'+which),pair=which==='A'?S.pairA:S.pairB;
   if(!L){el.innerHTML='<h2>'+pair+'</h2><div class="empty">loading…</div>';return;}
-  let h='<h2>Leg '+which+' — '+L.pair+' <span class="badge '+L.source+'">'+L.source+'</span></h2>';
+  if(!L._orig)L._orig=JSON.parse(JSON.stringify(L.rows));
+  let h='<h2>Leg '+which+' — '+L.pair+' <span class="badge '+L.source+'">'+L.source+'</span><span style="flex:1"></span>'
+    +'<button class="act" style="padding:3px 9px;font-size:11px" id="gCopy'+which+'">Copy table</button>'
+    +'<button class="act" style="padding:3px 9px;font-size:11px" id="gRevert'+which+'">Revert to pull</button></h2>';
   h+='<div class="meta"><label>Spot <input class="num wide" data-k="spot" value="'+L.spot+'"></label>'
     +'<label>Fwd scale <input class="num" data-k="fwd_scale" value="'+L.fwd_scale+'"></label>'
-    +(L.asof?'<span>as of '+L.asof+'</span>':'')+'</div>';
-  h+='<div class="scroll"><table><thead><tr><th>Tenor</th>'+FIELDS.map(x=>'<th>'+x[1]+'</th>').join('')+'</tr></thead><tbody>';
-  TENORS.forEach(t=>{const r=L.rows[t];h+='<tr><td class="lab">'+t+'</td>';
-    FIELDS.forEach(([k])=>{const v=r?r[k]:'';h+='<td><input class="num" data-t="'+t+'" data-k="'+k+'" value="'+(v===null||v===undefined?'':v)+'"></td>';});
+    +(L.asof?'<span>as of '+L.asof+'</span>':'')+'<span id="gridInfo'+which+'" class="warn"></span></div>';
+  h+='<div class="scroll"><table class="grid" id="grid'+which+'"><thead><tr><th>Tenor</th>'+FIELDS.map(x=>'<th>'+x[1]+'</th>').join('')+'</tr></thead><tbody>';
+  TENORS.forEach((t,r)=>{h+='<tr><td class="lab">'+t+'</td>';
+    GRID_KEYS.forEach((k,c)=>{h+='<td><input class="num" autocomplete="off" spellcheck="false" data-r="'+r+'" data-c="'+c+'"></td>';});
     h+='</tr>';});
   h+='</tbody></table></div>';
   if(L.note)h+='<div class="note '+(L.source==='PLACEHOLDER'?'warn':'')+'">'+L.note+'</div>';
-  h+='<div class="note">RR = '+L.pair.slice(0,3)+' calls minus puts. Vols/RR/BF in vol points; fwd pts in pips (F = spot + pts / scale).</div>';
+  h+='<div class="note">RR = '+L.pair.slice(0,3)+' calls minus puts. Vols/RR/BF in vol points; fwd pts in pips (F = spot + pts / scale). '
+    +'<b>Excel-style:</b> paste a block from Excel into any cell (or a whole sheet with headers / tenor labels, matched by name); arrows / Enter / Tab move; '
+    +'click + type replaces, double-click or F2 edits in place; shift+arrows or drag select; Ctrl+C copies, Delete clears, Ctrl+D fills down, Ctrl+Z undoes. Changed cells are outlined.</div>';
   el.innerHTML=h;
-  el.querySelectorAll('input').forEach(inp=>inp.onchange=()=>{const v=parseFloat(inp.value);const k=inp.dataset.k;
-    if(inp.dataset.t){L.rows[inp.dataset.t]=L.rows[inp.dataset.t]||{};L.rows[inp.dataset.t][k]=isFinite(v)?v:null;}else L[k]=v;
-    inp.classList.add('dirty');save();});
+  el.querySelectorAll('.meta input[data-k]').forEach(inp=>inp.onchange=()=>{const v=parseCell(inp.value);if(v!=null&&!Number.isNaN(v))L[inp.dataset.k]=v;inp.classList.add('dirty');save();});
+  $('gCopy'+which).onclick=async()=>{const txt=gridTSV(which);try{await navigator.clipboard.writeText(txt);status('Copied '+L.pair+' table (paste straight into Excel)');}
+    catch(e){status('Clipboard blocked by the browser — select a range and use Ctrl+C instead','warn');}};
+  $('gRevert'+which).onclick=()=>$('grid'+which)._g.api.revert();
+  legGrid(which);
 }
 
 function ovr(kind,t){const o=S.ov[kind][t];return (o!==undefined&&o!==null&&o!==''&&isFinite(o))?+o:null;}
@@ -2221,40 +2387,57 @@ function drawAnCharts(){
 
 
 // ===================== 21-day correlation monitor =====================
+function monCfg(){                     // fill defaults IN PLACE: handlers hold a reference to S.mon
+  const d={tenor:'1M',window:21,ma:5,years:1,maType:'sma',showMaI:true,showMaR:true,zoom:21};
+  if(!S.mon)S.mon={};for(const k in d)if(S.mon[k]===undefined)S.mon[k]=d[k];return S.mon;}
+function maSeries(x,k,type){
+  const n=x.length,out=new Array(n).fill(null);k=Math.max(1,Math.round(k||1));
+  if(k===1)return x.map(v=>v==null?null:v);
+  if(type==='ema'){                       // seeded with the first value, reported once k values have been seen
+    const a=2/(k+1);let e=null,cnt=0;
+    for(let i=0;i<n;i++){const v=x[i];if(v==null){out[i]=(e!=null&&cnt>=k)?e:null;continue;}
+      e=(e==null)?v:a*v+(1-a)*e;cnt++;out[i]=cnt>=k?e:null;}
+    return out;}
+  for(let i=k-1;i<n;i++){let s=0,ok=true;for(let j=i-k+1;j<=i;j++){if(x[j]==null){ok=false;break;}s+=x[j];}out[i]=ok?s/k:null;}
+  return out;
+}
+function monMAs(){const D=S.monData,C=monCfg();return {imp:maSeries(D.implied,C.ma,C.maType),real:maSeries(D.realized,C.ma,C.maType)};}
+function maLabel(){const C=monCfg();return C.ma+'d '+(C.maType==='ema'?'EMA':'MA');}
 function renderMonitor(){
-  const el=$('cardMon'),C=S.mon,c=crossNm();
+  const el=$('cardMon'),C=monCfg(),c=crossNm();
   let h='<h2>Correlation monitor — '+c+(S.monData?' <span class="badge '+(S.monData.source==='BBG'?'BBG':'PLACEHOLDER')+'">'+S.monData.source+'</span>':'')+'</h2>';
-  h+='<div class="meta">Rolling implied ρ (from the '+C.tenor+' ATMs) vs rolling realized ρ over the last '+C.window+' daily returns, with '+C.ma+'-day moving averages and the day-over-day moves. '
-    +'ρ = corr(ccy vs USD) as in the analytics card; realized is zero-mean.</div>';
+  h+='<div class="meta">Rolling implied ρ (from the '+C.tenor+' ATMs) vs rolling realized ρ over the last '+C.window+' daily returns. '
+    +'ρ = corr(ccy vs USD) as in the analytics card; realized is zero-mean. Moving average and the last-N-days view update instantly.</div>';
   h+='<div class="controls" style="margin-bottom:10px">'
     +'<label class="f">Implied tenor<select id="monTenor">'+TENORS.map(t=>'<option'+(t===C.tenor?' selected':'')+'>'+t+'</option>').join('')+'</select></label>'
     +'<label class="f">Realized window (days)<input id="monWin" class="num" value="'+C.window+'"></label>'
-    +'<label class="f">MA (days)<input id="monMa" class="num" value="'+C.ma+'"></label>'
     +'<label class="f">Lookback<select id="monYears">'+[[0.5,'6M'],[1,'1Y'],[2,'2Y'],[3,'3Y']].map(([v,l])=>'<option value="'+v+'"'+(v==C.years?' selected':'')+'>'+l+'</option>').join('')+'</select></label>'
     +'<button class="act primary" id="btnMon">Load monitor</button></div>';
-  h+='<div id="monBody">'+(S.monData?'':'<div class="empty">Load to see rolling implied vs realized, the moving averages and the last '+C.window+' days\' moves.</div>')+'</div>';
+  h+='<div id="monBody">'+(S.monData?'':'<div class="empty">Load to see rolling implied vs realized, the moving averages, the last 21 days and their average, and the day-over-day moves.</div>')+'</div>';
   el.innerHTML=h;
   $('monTenor').onchange=e=>{C.tenor=e.target.value;save();};
   $('monWin').onchange=e=>{C.window=Math.max(5,parseInt(e.target.value)||21);save();};
-  $('monMa').onchange=e=>{C.ma=Math.max(1,parseInt(e.target.value)||5);save();};
   $('monYears').onchange=e=>{C.years=+e.target.value;save();};
   $('btnMon').onclick=loadMon;
   if(S.monData)renderMonBody();
 }
 async function loadMon(){
-  const C=S.mon;$('monBody').innerHTML='<div class="empty">Loading…</div>';
-  try{S.monData=await api('/api/corr_monitor?a='+S.pairA+'&b='+S.pairB+'&tenor='+C.tenor+'&window='+C.window+'&ma='+C.ma+'&years='+C.years);renderMonitor();}
+  const C=monCfg();$('monBody').innerHTML='<div class="empty">Loading…</div>';
+  try{S.monData=await api('/api/corr_monitor?a='+S.pairA+'&b='+S.pairB+'&tenor='+C.tenor+'&window='+C.window+'&ma='+C.ma+'&years='+C.years);
+    if(!S.mon.zoomSet)S.mon.zoom=S.monData.window;renderMonitor();}
   catch(e){$('monBody').innerHTML='<div class="empty err">Monitor failed: '+e.message+'</div>';}
 }
 function renderMonBody(){
-  const D=S.monData,el=$('monBody'),rows=D.rows,last=rows[rows.length-1]||{},d=D.diag,ni=D.noise_implied||{},nr=D.noise_realized_dd||{};
+  const D=S.monData,C=monCfg(),el=$('monBody'),rows=D.rows,last=rows[rows.length-1]||{},d=D.diag,ni=D.noise_implied||{},nr=D.noise_realized_dd||{};
   const lagBad=d.lag_band!=null&&(Math.abs(d.lag_ab)>d.lag_band||Math.abs(d.lag_ba)>d.lag_band);
+  const MA=monMAs(),idx={};D.dates.forEach((x,i)=>idx[x]=i);
+  const maAt=(arr,dt)=>{const i=idx[dt];return i==null?null:arr[i];};
   const row=(k,v,cl)=>'<tr><td>'+k+'</td><td class="'+(cl||'')+'">'+v+'</td></tr>';
   const W=D.window;
   let t='<table class="kv">';
   t+='<tr class="h"><td colspan="2">Today ('+(last.date||'—')+')</td></tr>';
-  t+=row('Implied ρ ('+D.tenor+')',f(last.implied,3)+' · d/d '+sgn(last.d_implied,3)+' · '+D.ma+'d MA '+f(last.ma_implied,3));
-  t+=row('Realized ρ ('+W+'d)',f(last.realized,3)+' · d/d '+sgn(last.d_realized,3)+' · '+D.ma+'d MA '+f(last.ma_realized,3));
+  t+=row('Implied ρ ('+D.tenor+')',f(last.implied,3)+' · d/d '+sgn(last.d_implied,3)+' · '+maLabel()+' <span id="kpiMaI">'+f(maAt(MA.imp,last.date),3)+'</span>');
+  t+=row('Realized ρ ('+W+'d)',f(last.realized,3)+' · d/d '+sgn(last.d_realized,3)+' · '+maLabel()+' <span id="kpiMaR">'+f(maAt(MA.real,last.date),3)+'</span>');
   t+=row('Implied − realized',sgn(last.spread,3));
   t+='<tr class="h"><td colspan="2">Noise vs movement (over the lookback)</td></tr>';
   t+=row('Implied: daily change sd',f(ni.daily_sd,4)+' · mark noise ±'+f(ni.noise_sd,4)+' · genuine daily move '+f(ni.true_daily_sd,4));
@@ -2262,7 +2445,6 @@ function renderMonBody(){
   t+=row('Realized: daily change sd',f(nr.daily_sd,4)+' (one day in, one day out of the window)');
   t+=row('Realized: sampling error of the '+W+'d level',D.sampling_sd!=null?'± '+f(D.sampling_sd,3)+' (1−ρ²)/√'+W:'—');
   t+='</table>';
-  // realized-calculation checks
   const cc=d.cross_close_vs_legs_bp;
   let k='<table class="kv"><tr class="h"><td colspan="2">Realized-calculation checks</td></tr>';
   k+=row('Zero-mean vs Pearson today',f(d.zero_mean_today,3)+' vs '+f(d.pearson_today,3)+' (diff '+sgn(d.zero_mean_today-d.pearson_today,3)+')');
@@ -2279,35 +2461,69 @@ function renderMonBody(){
   if(cc&&cc.median>5)notes.push('The cross close differs from the legs\' product by a median '+f(cc.median,1)+'bp: the cross and legs close at different times or sources.');
   if(d.cross_vol_direct!=null&&Math.abs(d.cross_vol_direct-d.cross_vol_from_legs)>0.25)notes.push('Realized cross vol measured directly differs from legs+ρ by '+f(Math.abs(d.cross_vol_direct-d.cross_vol_from_legs),2)+' vol: the identity is exact for simultaneous closes, so this points to timing.');
   if(!notes.length)notes.push('Checks pass: closes look simultaneous and the realized identity holds'+(d.cross_vol_direct!=null?' ('+f(d.cross_vol_from_legs,2)+' vs '+f(d.cross_vol_direct,2)+')':'')+'.');
+  // MA + zoom controls (client-side, instant)
+  const ctl='<div class="controls" style="gap:8px 14px;margin:4px 0 6px">'
+    +'<label class="f">MA length<input id="monMa" class="num" value="'+C.ma+'"></label>'
+    +'<div class="f"><label class="f">MA type</label><div class="seg" id="monMaType"><button data-v="sma">SMA</button><button data-v="ema">EMA</button></div></div>'
+    +'<label class="f" style="flex-direction:row;align-items:center;gap:5px;margin-top:14px"><input type="checkbox" id="monShowI"'+(C.showMaI?' checked':'')+'> on implied</label>'
+    +'<label class="f" style="flex-direction:row;align-items:center;gap:5px;margin-top:14px"><input type="checkbox" id="monShowR"'+(C.showMaR?' checked':'')+'> on realized</label></div>';
+  const ctl2='<div class="controls" style="gap:8px 14px;margin:4px 0 6px"><label class="f">Days shown<input id="monZoom" class="num" value="'+C.zoom+'"></label>'
+    +'<div id="monZoomAvg" class="meta" style="margin:14px 0 0"></div></div>';
   // table
   const fx=(x,dp)=>x==null?'—':Number(x).toFixed(dp);
   let tb='<div class="scroll"><table><thead><tr><th>Date</th><th class="sep">'+D.leg_base+' bp</th><th>'+D.leg_quote+' bp</th><th>Co-move</th>'
     +'<th class="sep">Realized</th><th>Δ d/d</th><th>from in/out day</th><th>from vols</th><th class="sep">Implied</th><th>Δ d/d</th>'
-    +'<th class="sep">MA impl</th><th>MA real</th><th class="sep">Impl − real</th></tr></thead><tbody>';
+    +'<th class="sep">'+maLabel()+' impl</th><th>'+maLabel()+' real</th><th class="sep">Impl − real</th></tr></thead><tbody>';
   rows.slice().reverse().forEach(r=>{tb+='<tr><td class="lab">'+r.date+'</td><td class="sep">'+fx(r.ret_a_bp,1)+'</td><td>'+fx(r.ret_b_bp,1)+'</td>'
     +'<td class="'+(r.score==null?'':(r.score>=0?'pos':'negv'))+'">'+sgn(r.score,2)+'</td>'
     +'<td class="sep hl">'+fx(r.realized,3)+'</td><td>'+sgn(r.d_realized,3)+'</td><td>'+sgn(r.d_comove,3)+'</td><td>'+sgn(r.d_vols,3)+'</td>'
     +'<td class="sep hl">'+fx(r.implied,3)+'</td><td>'+sgn(r.d_implied,3)+'</td>'
-    +'<td class="sep">'+fx(r.ma_implied,3)+'</td><td>'+fx(r.ma_realized,3)+'</td><td class="sep">'+sgn(r.spread,3)+'</td></tr>';});
+    +'<td class="sep">'+fx(maAt(MA.imp,r.date),3)+'</td><td>'+fx(maAt(MA.real,r.date),3)+'</td><td class="sep">'+sgn(r.spread,3)+'</td></tr>';});
   tb+='</tbody></table></div><div class="note">Leg returns are as quoted. Co-move = the day\'s (ccy vs USD) return product ÷ today\'s '+W+'-day RMS vols; the mean of the last '+W+' co-moves is today\'s realized ρ exactly. '
     +'Realized Δ d/d splits exactly into "from in/out day" (the day that entered vs the day that dropped out) + "from vols" (renormalisation as the window\'s vols change). '
     +'Noise split: daily change variance = 2 × mark-noise² + genuine-move², with mark noise estimated from how much daily changes reverse the next day.</div>';
   el.innerHTML='<div class="an-top"><div>'+t+'</div><div>'+k+'<ul class="ev">'+notes.map(x=>'<li>'+x+'</li>').join('')+'</ul></div></div>'
-    +'<div class="charts" style="margin-top:14px;grid-template-columns:1.5fr 1fr 1fr">'
-    +'<div><div class="meta"><b style="color:var(--text-primary)">Rolling implied vs '+W+'d realized</b> (dashed = '+D.ma+'d MA) · '+D.note+'</div><div id="chMonLvl" class="chart"></div></div>'
+    +'<div class="charts" style="margin-top:14px;grid-template-columns:1.45fr 1fr">'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Rolling implied vs '+W+'d realized</b> · '+D.note+'</div>'+ctl+'<div id="chMonLvl" class="chart"></div></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Last N days</b> daily implied and '+W+'d realized, flat lines = average over the days shown</div>'+ctl2+'<div id="chMon21" class="chart"></div></div></div>'
+    +'<div class="charts" style="margin-top:14px;grid-template-columns:1fr 1fr">'
     +'<div><div class="meta"><b style="color:var(--text-primary)">Day-over-day moves</b> last '+rows.length+' days (dotted = ±1 sd of daily Δ implied)</div><div id="chMonDD" class="chart"></div></div>'
     +'<div><div class="meta"><b style="color:var(--text-primary)">Daily co-move</b> last '+W+' days (dashed = mean = realized)</div><div id="chMonSc" class="chart"></div></div></div>'
     +'<div style="margin-top:12px">'+tb+'</div>';
+  $('monMa').onchange=e=>{C.ma=Math.max(1,parseInt(e.target.value)||5);save();renderMonBody();};
+  document.querySelectorAll('#monMaType button').forEach(b=>{b.classList.toggle('on',C.maType===b.dataset.v);b.onclick=()=>{C.maType=b.dataset.v;save();renderMonBody();};});
+  $('monShowI').onchange=e=>{C.showMaI=e.target.checked;save();drawMonLvl();};
+  $('monShowR').onchange=e=>{C.showMaR=e.target.checked;save();drawMonLvl();};
+  $('monZoom').onchange=e=>{C.zoom=Math.max(3,parseInt(e.target.value)||21);C.zoomSet=true;save();drawMon21();};
   drawMon();
+}
+function drawMonLvl(){
+  if(typeof Plotly==='undefined')return;
+  const D=S.monData,C=monCfg(),x=D.dates,W=D.window,MA=monMAs();
+  const tr=[{x,y:D.implied,mode:'lines',name:'Implied '+D.tenor,line:{color:css('--s1'),width:2}},
+    {x,y:D.realized,mode:'lines',name:'Realized '+W+'d',line:{color:css('--s2'),width:2}}];
+  if(C.showMaI)tr.push({x,y:MA.imp,mode:'lines',name:maLabel()+' implied',line:{color:css('--s1'),width:1.5,dash:'dash'}});
+  if(C.showMaR)tr.push({x,y:MA.real,mode:'lines',name:maLabel()+' realized',line:{color:css('--s2'),width:1.5,dash:'dash'}});
+  Plotly.react('chMonLvl',tr,baseLayout('ρ'),CFG);
+}
+function drawMon21(){
+  if(typeof Plotly==='undefined')return;
+  const D=S.monData,C=monCfg(),W=D.window,n=Math.min(C.zoom,D.dates.length);
+  const x=D.dates.slice(-n).map(s=>s.slice(5)),yi=D.implied.slice(-n),yr=D.realized.slice(-n);
+  const avg=a=>{const v=a.filter(z=>z!=null);return v.length?v.reduce((p,q)=>p+q,0)/v.length:null;};
+  const ai=avg(yi),ar=avg(yr);
+  const L=baseLayout('ρ');L.xaxis.type='category';L.xaxis.tickangle=-45;L.margin.b=60;L.margin.r=70;
+  const tr=[{x,y:yi,mode:'lines+markers',name:'Implied '+D.tenor,line:{color:css('--s1'),width:2},marker:{size:7}},
+    {x,y:yr,mode:'lines+markers',name:'Realized '+W+'d',line:{color:css('--s2'),width:2},marker:{size:7}}];
+  const flat=(v,c,nm)=>v==null?[]:[{x:[x[0],x[x.length-1]],y:[v,v],mode:'lines',name:nm+' avg',line:{color:css(c),width:1.5,dash:'dash'},hovertemplate:nm+' '+n+'d avg %{y:.3f}<extra></extra>'},
+    {x:[x[x.length-1]],y:[v],mode:'text',text:['avg '+v.toFixed(3)],textposition:'middle right',cliponaxis:false,textfont:{color:css('--text-secondary'),size:10},showlegend:false,hoverinfo:'skip'}];
+  Plotly.react('chMon21',tr.concat(flat(ai,'--s1','Implied'),flat(ar,'--s2','Realized')),L,CFG);
+  const el=$('monZoomAvg');if(el)el.innerHTML=n+'-day avg: implied <b style="color:var(--text-primary)">'+f(ai,3)+'</b> · realized <b style="color:var(--text-primary)">'+f(ar,3)+'</b> · spread '+sgn(ai!=null&&ar!=null?ai-ar:null,3);
 }
 function drawMon(){
   if(typeof Plotly==='undefined')return;
-  const D=S.monData,x=D.dates,rows=D.rows,W=D.window;
-  const L1=baseLayout('ρ');
-  Plotly.react('chMonLvl',[{x,y:D.implied,mode:'lines',name:'Implied '+D.tenor,line:{color:css('--s1'),width:2}},
-    {x,y:D.realized,mode:'lines',name:'Realized '+W+'d',line:{color:css('--s2'),width:2}},
-    {x,y:D.ma_implied,mode:'lines',name:D.ma+'d MA implied',line:{color:css('--s1'),width:1.5,dash:'dash'}},
-    {x,y:D.ma_realized,mode:'lines',name:D.ma+'d MA realized',line:{color:css('--s2'),width:1.5,dash:'dash'}}],L1,CFG);
+  const D=S.monData,rows=D.rows,W=D.window;
+  drawMonLvl();drawMon21();
   const dx=rows.map(r=>r.date.slice(5));
   const L2=baseLayout('Δρ');L2.barmode='group';L2.bargap=0.25;L2.xaxis.type='category';L2.xaxis.tickangle=-45;L2.margin.b=60;
   const sd=(D.noise_implied||{}).daily_sd;
