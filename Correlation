@@ -1931,6 +1931,25 @@ details summary{cursor:pointer;color:var(--text-secondary);margin-top:8px}
 .kv tr.h td{color:var(--text-primary);font-weight:650;padding-top:9px;border-bottom:1px solid var(--border)}
 .ev{margin:10px 0 0;padding-left:18px;color:var(--text-primary)} .ev li{margin:3px 0}
 .pos{color:var(--good)} .negv{color:var(--critical)}
+.cardwrap{position:relative;min-width:0}
+.cardwrap>.exp-btn{position:absolute;top:10px;right:12px;padding:2px 9px;font-size:11px;z-index:3;opacity:.85}
+.cardwrap>.exp-btn:hover{opacity:1}
+.cardwrap>.card>h2:first-of-type{padding-right:84px}
+.exp-caption{font-size:11px;color:var(--text-muted);margin:-2px 0 8px}
+body.exporting .scroll{overflow:visible!important}
+body.exporting .modebar-container{display:none!important}
+body.exporting .card button.act{display:none!important}
+#banner{align-items:center;gap:10px;flex-wrap:wrap;padding:8px 12px;border:1px solid var(--s4);border-radius:8px;background:var(--surface-2);color:var(--text-primary);font-size:12px}
+#expMenu{position:absolute;z-index:20;flex-direction:column;gap:2px;padding:6px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.35);font-size:12px}
+#expMenu button{background:none;border:0;color:var(--text-primary);text-align:left;padding:5px 12px;border-radius:5px;cursor:pointer;font:inherit}
+#expMenu button:hover{background:var(--surface-1)}
+#expMenu label{color:var(--text-secondary);padding:4px 8px 2px;display:flex;gap:5px;align-items:center}
+#expPanel{position:absolute;right:18px;top:52px;z-index:20;width:290px;padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.4);font-size:12px}
+.expRow{display:flex;gap:6px;align-items:center;padding:3px 0;color:var(--text-primary)}
+:root[data-theme="light"]{color-scheme:light;--bg:#f4f4f2;--surface-1:#fcfcfb;--surface-2:#f0efec;--border:#dcdbd5;--text-primary:#0b0b0b;--text-secondary:#52514e;
+ --text-muted:#76756f;--grid:#e8e7e3;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--ref:#76756f;--input:#ffffff;--accent:#2a78d6}
+@media print{header,section.controls,#status,#banner,.exp-btn,#expPanel,#expMenu,.modebar-container{display:none!important}
+ .print-hide{display:none!important}.card{break-inside:avoid;border-color:#ccc}.scroll{overflow:visible!important}}
 #triRight table.kv tr:not(.h) td:last-child{white-space:normal;text-align:right}
 #triRight table.kv td:first-child{padding-right:14px}
 table.grid td{padding:1px 2px}
@@ -1940,7 +1959,9 @@ table.grid input.num.gsel{background:rgba(57,135,229,.20);border-color:var(--acc
 table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
 </style></head><body>
 <header><h1>Cross Vol Builder</h1><span class="pill"><span id="bbgDot" class="dot"></span><span id="bbgTxt">checking Bloomberg…</span></span>
-<span style="flex:1"></span><span class="pill">ATM: variance formula · RR: copula · wings: vol-of-vol</span></header>
+<span class="pill" id="asof" style="background:none"></span><span style="flex:1"></span><span class="pill">ATM: variance formula · RR: copula · wings: vol-of-vol</span>
+<button class="act" id="btnExport">Export…</button></header>
+<div id="expPanel" style="display:none"></div><div id="expMenu" style="display:none"></div>
 <main>
 <section class="card controls">
   <label class="f">Leg A<select id="pairA"></select></label>
@@ -1952,10 +1973,12 @@ table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
   <div class="f"><label class="f">Cross ATM</label><div class="seg" data-k="atm_anchor"><button data-v="formula">Variance formula</button><button data-v="copula">Raw copula</button></div></div>
   <div class="f"><label class="f">Delta</label><div class="seg" data-k="delta_mode"><button data-v="auto">Auto</button><button data-v="spot">Spot</button><button data-v="forward">Fwd</button></div></div>
   <span style="flex:1"></span>
-  <button class="act" id="btnPull">Pull Bloomberg</button>
+  <button class="act" id="btnPull" title="Fresh Bloomberg pull of both legs and the market cross quotes (implied ρ)">Refresh BBG + implied ρ</button>
   <button class="act" id="btnCorr">Pull realized</button>
   <button class="act primary" id="btnBuild">Generate cross surface</button>
+  <button class="act primary" id="btnAll" title="Refresh, realized ρ, build, triangle, monitor and analytics in one go">Load all</button>
 </section>
+<div id="banner" style="display:none"></div>
 <div class="status" id="status"></div>
 <section class="grid2"><div class="card" id="cardA"></div><div class="card" id="cardB"></div></section>
 <section class="card" id="cardC"></section>
@@ -1967,7 +1990,7 @@ table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
 <script>
 const TENORS=['1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y'];
 const FIELDS=[['fwd_pts','Fwd pts'],['atm','ATM'],['rr25','25 RR'],['rr10','10 RR'],['bf25','25 BF'],['bf10','10 BF']];
-const LS='crossvol_state_v6';
+const LS='crossvol_state_v7';
 let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
        legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
 const $=id=>document.getElementById(id);
@@ -2221,7 +2244,7 @@ function renderCorr(){
 
 async function loadLeg(which){
   const pair=which==='A'?S.pairA:S.pairB;S.legs[which]=null;renderLeg(which);
-  try{S.legs[which]=await api('/api/surface?pair='+pair);}catch(e){status('Surface '+pair+': '+e.message,'err');}
+  try{S.legs[which]=await api('/api/surface?pair='+pair);S.asof=new Date();updateAsof();}catch(e){status('Surface '+pair+': '+e.message,'err');}
   renderLeg(which);save();
 }
 async function loadMkt(){try{S.mkt=await api('/api/cross_market?a='+S.pairA+'&b='+S.pairB);}catch(e){S.mkt=null;status('Cross quotes: '+e.message,'err');}
@@ -2786,6 +2809,176 @@ function renderHedge(R){
   document.querySelectorAll('#hMode button').forEach(b=>{b.classList.toggle('on',C.mode===b.dataset.v);b.onclick=()=>{C.mode=b.dataset.v;save();triUpdate();};});
 }
 
+// ===================== Refresh / Load all =====================
+function legEdits(L){                        // cells the user changed vs the last pull: [[tenor,key,value]]
+  const out=[];if(!L||!L._orig)return out;
+  TENORS.forEach(t=>{const r=L.rows[t]||{},o=L._orig[t]||{};GRID_KEYS.forEach(k=>{const v=r[k],w=o[k];
+    const same=(v==null&&w==null)||(v!=null&&w!=null&&Math.abs(v-w)<1e-12);if(!same)out.push([t,k,v]);});});
+  return out;
+}
+function askEdits(n){                         // inline prompt; resolves 'keep' | 'discard' | 'cancel'
+  return new Promise(res=>{const el=$('banner');
+    el.innerHTML='<span>You have <b>'+n+'</b> edited cell'+(n>1?'s':'')+' in the leg grids. A refresh replaces them with Bloomberg.</span>'
+      +'<button class="act primary" data-a="keep">Refresh, keep my edits</button><button class="act" data-a="discard">Refresh, discard edits</button><button class="act" data-a="cancel">Cancel</button>';
+    el.style.display='flex';
+    el.querySelectorAll('button').forEach(b=>b.onclick=()=>{el.style.display='none';el.innerHTML='';res(b.dataset.a);});});
+}
+async function refreshMarket(opts){          // legs (fresh Bloomberg pull) + market cross quotes (implied rho)
+  opts=opts||{};
+  const ed={A:legEdits(S.legs.A),B:legEdits(S.legs.B)},n=ed.A.length+ed.B.length;
+  let choice=opts.choice||'discard';
+  if(n&&!opts.choice){choice=await askEdits(n);if(choice==='cancel'){status('Refresh cancelled');return 'cancel';}}
+  status('Refreshing Bloomberg legs and '+crossNm()+' quotes…');
+  const pull=async w=>{const pair=w==='A'?S.pairA:S.pairB;
+    try{const L=await api('/api/surface?pair='+pair);L._orig=JSON.parse(JSON.stringify(L.rows));
+      if(choice==='keep')ed[w].forEach(([t,k,v])=>{L.rows[t]=L.rows[t]||{};L.rows[t][k]=v;});
+      S.legs[w]=L;return null;}catch(e){return pair+': '+e.message;}};
+  const errs=(await Promise.all([pull('A'),pull('B')])).filter(Boolean);
+  try{S.mkt=await api('/api/cross_market?a='+S.pairA+'&b='+S.pairB);}catch(e){errs.push('cross quotes: '+e.message);}
+  S.asof=new Date();if(S.tri)S.tri.cur=null;      // new marks: the triangle scenario restarts from them
+  renderLeg('A');renderLeg('B');renderCorr();save();updateAsof();
+  status(errs.length?'Refresh finished with errors: '+errs.join('; '):'Refreshed '+S.pairA+', '+S.pairB+' and '+crossNm()+' quotes'
+    +(n?(choice==='keep'?' · kept your '+n+' edit'+(n>1?'s':''):' · discarded '+n+' edit'+(n>1?'s':'')):'')
+    +' · implied ρ updated',errs.length?'err':'');
+  return !errs.length;
+}
+function updateAsof(){const el=$('asof');if(!el)return;el.textContent=S.asof?'Data refreshed '+new Date(S.asof).toLocaleTimeString():'';}
+let _loadingAll=false;
+async function loadAll(){
+  if(_loadingAll)return;_loadingAll=true;const btn=$('btnAll');btn.disabled=true;const t0=performance.now(),probs=[];
+  const step=(i,txt)=>status('Load all '+i+'/6 · '+txt+'…');
+  try{
+    step(1,'Bloomberg legs + implied ρ');
+    const ok=await refreshMarket();if(ok==='cancel'){status('Load all cancelled');return;}if(ok===false)probs.push('market refresh');
+    if(!S.legs.A||!S.legs.B){status('Load all stopped: legs not loaded','err');return;}
+    step(2,'realized correlation');await loadCorr();if(!S.corr)probs.push('realized correlation');
+    step(3,'cross surface');S.result=null;await build();if(!S.result)probs.push('cross surface');
+    step(4,'triangle & hedge');renderTri();
+    step(5,'correlation monitor');S.monData=null;await loadMon();if(!S.monData)probs.push('monitor');
+    step(6,'analytics history');S.hist=null;await loadHist();if(!S.hist)probs.push('analytics');
+    const secs=((performance.now()-t0)/1000).toFixed(1);
+    status(probs.length?'Loaded with problems in: '+probs.join(', ')+' ('+secs+'s)':'Loaded everything for '+crossNm()+' in '+secs+'s',probs.length?'warn':'');
+  }finally{_loadingAll=false;btn.disabled=false;}
+}
+
+// ===================== Export (PNG / JPG / PDF) =====================
+const EXPORT_LIBS={
+  htmlToImage:['https://cdn.jsdelivr.net/npm/html-to-image@1.11.11/dist/html-to-image.js','https://unpkg.com/html-to-image@1.11.11/dist/html-to-image.js'],
+  jspdf:['https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js','https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js']};
+function loadScriptOnce(name){
+  if(window[name])return Promise.resolve(true);
+  return EXPORT_LIBS[name].reduce((p,url)=>p.then(ok=>ok||new Promise(res=>{const s=document.createElement('script');s.src=url;
+    s.onload=()=>res(!!window[name]);s.onerror=()=>{s.remove();res(false);};document.head.appendChild(s);})),Promise.resolve(false));
+}
+function sectionDefs(){const c=crossNm(),A=S.legs.A,B=S.legs.B;
+  return [['cardA','Leg A'+(A?' — '+A.pair:'')],['cardB','Leg B'+(B?' — '+B.pair:'')],['cardC','Correlation inputs'],['results','Cross surface'],
+    ['cardTri','Triangle & gamma hedge'],['cardMon','Correlation monitor'],['cardAn','Correlation analytics']].map(([id,l])=>({id,label:l,cross:c}));}
+function slug(s){return s.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');}
+function stamp(){const d=new Date(),p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'_'+p(d.getHours())+p(d.getMinutes());}
+function redrawCharts(){
+  try{if(S.result){drawSmile();drawTerms();}}catch(e){}
+  try{if(S.monData)drawMon();}catch(e){}
+  try{if(S.hist)drawAnCharts();}catch(e){}
+  try{if($('chTri'))triUpdate();}catch(e){}
+}
+function freezeInputs(root){                  // copy live values into attributes so the clone shows them
+  root.querySelectorAll('input').forEach(i=>{if(i.type==='checkbox'||i.type==='radio'){if(i.checked)i.setAttribute('checked','');else i.removeAttribute('checked');}
+    else i.setAttribute('value',i.value);});
+  root.querySelectorAll('select').forEach(sel=>[...sel.options].forEach(o=>{if(o.selected)o.setAttribute('selected','');else o.removeAttribute('selected');}));
+}
+async function captureSection(id,pr){
+  const el=$(id),def=sectionDefs().find(d=>d.id===id);
+  const cap=document.createElement('div');cap.className='exp-caption';
+  const src=[S.legs.A&&S.legs.A.source,S.mkt&&S.mkt.source].filter(Boolean);
+  cap.textContent=def.cross+' · '+def.label+' · '+new Date().toLocaleString()+(src.length?' · data: '+[...new Set(src)].join('/'):'');
+  el.insertBefore(cap,el.firstChild);freezeInputs(el);
+  try{
+    const w=Math.max(el.scrollWidth,el.clientWidth),h=Math.max(el.scrollHeight,el.clientHeight);
+    let ratio=pr;while(ratio>1&&(w*ratio>16000||h*ratio>16000))ratio-=0.5;
+    return await htmlToImage.toCanvas(el,{pixelRatio:ratio,backgroundColor:css('--surface-1'),width:w,height:h,cacheBust:true,
+      filter:n=>!(n.classList&&(n.classList.contains('exp-btn')||n.classList.contains('modebar-container')))});
+  }finally{cap.remove();}
+}
+async function exportSections(ids,fmt,opts){
+  opts=opts||{};ids=ids.filter(id=>$(id)&&$(id).innerText.trim().length);
+  if(!ids.length){status('Nothing to export yet','warn');return null;}
+  status('Preparing export…');
+  const okImg=await loadScriptOnce('htmlToImage'),okPdf=fmt!=='pdf'||await loadScriptOnce('jspdf');
+  if(!okImg||!okPdf){status('Export libraries could not load (CDN blocked?) — opening the print dialog instead: choose "Save as PDF".','warn');printSections(ids);return null;}
+  const prevTheme=document.documentElement.getAttribute('data-theme'),light=!!opts.light;
+  document.body.classList.add('exporting');
+  if(light){document.documentElement.setAttribute('data-theme','light');redrawCharts();await new Promise(r=>setTimeout(r,60));}
+  const name=crossNm()+'_'+(ids.length===1?slug(sectionDefs().find(d=>d.id===ids[0]).label):'export')+'_'+stamp();
+  try{
+    const canv=[];for(const id of ids){status('Capturing '+sectionDefs().find(d=>d.id===id).label+'…');canv.push(await captureSection(id,opts.pixelRatio||2));}
+    let out;
+    if(fmt==='pdf'){
+      const {jsPDF}=window.jspdf,W=842;let doc=null;
+      canv.forEach((cv,i)=>{const H=W*cv.height/cv.width,o=W>=H?'l':'p';
+        if(!doc)doc=new jsPDF({orientation:o,unit:'pt',format:[W,H],compress:true});else doc.addPage([W,H],o);
+        // explicit alias per page: without it jsPDF can treat the PNGs as one image and repeat page 1
+        doc.addImage(cv.toDataURL('image/png'),'PNG',0,0,W,H,'sec'+i+'_'+cv.width+'x'+cv.height,'FAST');});
+      out={name:name+'.pdf',pages:canv.length,blob:doc.output('blob')};
+      if(!opts.noDownload)doc.save(out.name);
+    }else{
+      let cv=canv[0];
+      if(canv.length>1){const gap=Math.round(24*(opts.pixelRatio||2)),W=Math.max(...canv.map(c=>c.width)),H=canv.reduce((s,c)=>s+c.height,0)+gap*(canv.length-1);
+        cv=document.createElement('canvas');cv.width=W;cv.height=H;const g=cv.getContext('2d');g.fillStyle=css('--bg');g.fillRect(0,0,W,H);
+        let y=0;canv.forEach(c=>{g.drawImage(c,0,y);y+=c.height+gap;});}
+      const mime=fmt==='jpg'?'image/jpeg':'image/png';
+      const blob=await new Promise(r=>cv.toBlob(r,mime,0.93));
+      out={name:name+'.'+fmt,width:cv.width,height:cv.height,blob};
+      if(!opts.noDownload){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=out.name;document.body.appendChild(a);a.click();
+        setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},2000);}
+    }
+    status('Exported '+out.name+(out.pages?' ('+out.pages+' page'+(out.pages>1?'s':'')+')':' ('+out.width+'×'+out.height+')'));
+    window._lastExport=out;return out;
+  }catch(e){status('Export failed: '+e.message,'err');return null;}
+  finally{document.body.classList.remove('exporting');
+    if(light){if(prevTheme==null)document.documentElement.removeAttribute('data-theme');else document.documentElement.setAttribute('data-theme',prevTheme);redrawCharts();}}
+}
+function printSections(ids){                  // fallback when the libraries can't load: browser Print -> Save as PDF
+  document.body.classList.add('printing');sectionDefs().forEach(d=>{const w=$(d.id).closest('.cardwrap');if(w)w.classList.toggle('print-hide',!ids.includes(d.id));});
+  setTimeout(()=>{window.print();document.body.classList.remove('printing');document.querySelectorAll('.print-hide').forEach(x=>x.classList.remove('print-hide'));},50);
+}
+function initExportUI(){
+  // a small export button on every card (lives outside the card so re-renders don't remove it)
+  sectionDefs().forEach(d=>{const card=$(d.id);if(!card||card.parentElement.classList.contains('cardwrap'))return;
+    const w=document.createElement('div');w.className='cardwrap';card.parentElement.insertBefore(w,card);w.appendChild(card);
+    const b=document.createElement('button');b.className='act exp-btn';b.textContent='Export ▾';b.title='Export this section';b.dataset.sec=d.id;w.appendChild(b);
+    b.onclick=e=>{e.stopPropagation();openExpMenu(b,d.id);};});
+  $('btnExport').onclick=e=>{e.stopPropagation();openExportPanel();};
+  document.addEventListener('click',e=>{const m=$('expMenu');if(m&&!m.contains(e.target))m.style.display='none';
+    const p=$('expPanel');if(p&&p.style.display!=='none'&&!p.contains(e.target)&&e.target.id!=='btnExport')p.style.display='none';});
+}
+function openExpMenu(btn,id){
+  const m=$('expMenu'),r=btn.getBoundingClientRect();
+  m.innerHTML=['png','jpg','pdf'].map(f=>'<button data-f="'+f+'">'+f.toUpperCase()+'</button>').join('')
+    +'<label><input type="checkbox" id="expMenuLight"'+(S.expLight?' checked':'')+'> light theme</label>';
+  m.style.display='flex';m.style.top=(window.scrollY+r.bottom+4)+'px';m.style.left=(window.scrollX+r.right-m.offsetWidth)+'px';
+  $('expMenuLight').onchange=e=>{S.expLight=e.target.checked;save();};
+  m.querySelectorAll('button').forEach(b=>b.onclick=()=>{m.style.display='none';exportSections([id],b.dataset.f,{light:S.expLight});});
+}
+function openExportPanel(){
+  const p=$('expPanel'),defs=sectionDefs(),sel=S.expSel||defs.map(d=>d.id),fmt=S.expFmt||'pdf';
+  p.innerHTML='<div style="font-weight:650;margin-bottom:6px">Export sections</div>'
+    +defs.map(d=>{const has=$(d.id).innerText.trim().length&&!$(d.id).querySelector(':scope > .empty');
+      return '<label class="expRow"><input type="checkbox" data-id="'+d.id+'"'+(sel.includes(d.id)?' checked':'')+'> '+d.label+(has?'':' <span style="color:var(--text-muted)">(not loaded)</span>')+'</label>';}).join('')
+    +'<div style="display:flex;gap:6px;margin:6px 0"><button class="act" id="expAll" style="padding:2px 8px">All</button><button class="act" id="expNone" style="padding:2px 8px">None</button></div>'
+    +'<div class="seg" id="expFmt">'+['pdf','png','jpg'].map(f=>'<button data-v="'+f+'"'+(f===fmt?' class="on"':'')+'>'+f.toUpperCase()+'</button>').join('')+'</div>'
+    +'<label class="expRow" style="margin-top:6px"><input type="checkbox" id="expLight"'+(S.expLight?' checked':'')+'> light theme (email / print)</label>'
+    +'<div class="note">PDF: one page per section. PNG/JPG: sections stacked in one image.</div>'
+    +'<button class="act primary" id="expGo" style="margin-top:8px;width:100%">Export</button>';
+  p.style.display='block';
+  const cur=()=>[...p.querySelectorAll('input[data-id]')].filter(i=>i.checked).map(i=>i.dataset.id);
+  p.querySelectorAll('input[data-id]').forEach(i=>i.onchange=()=>{S.expSel=cur();save();});
+  $('expAll').onclick=()=>{p.querySelectorAll('input[data-id]').forEach(i=>i.checked=true);S.expSel=cur();save();};
+  $('expNone').onclick=()=>{p.querySelectorAll('input[data-id]').forEach(i=>i.checked=false);S.expSel=cur();save();};
+  p.querySelectorAll('#expFmt button').forEach(b=>b.onclick=()=>{S.expFmt=b.dataset.v;save();p.querySelectorAll('#expFmt button').forEach(x=>x.classList.toggle('on',x===b));});
+  $('expLight').onchange=e=>{S.expLight=e.target.checked;save();};
+  $('expGo').onclick=()=>{p.style.display='none';exportSections(cur(),S.expFmt||'pdf',{light:S.expLight});};
+}
+
 async function init(){
   load();
   const st=await api('/api/status').catch(()=>({bbg:false,pairs:['EURUSD','USDCAD'],error:'server unreachable'}));
@@ -2795,8 +2988,9 @@ async function init(){
     $(id).onchange=async e=>{S[id]=e.target.value;S.ov={rho:{},rs:{},sr:{}};updateCross();save();S.hist=null;S.mkt=null;S.monData=null;renderAnalytics();renderMonitor();await Promise.all([loadLeg(id==='pairA'?'A':'B'),loadCorr(),loadMkt()]);renderCorr();};});
   $('usdRate').value=S.usd_rate;$('usdRate').onchange=e=>{S.usd_rate=parseFloat(e.target.value)||0;save();};
   segInit();updateCross();
-  $('btnPull').onclick=async()=>{await Promise.all([loadLeg('A'),loadLeg('B'),loadMkt()]);renderCorr();};
-  $('btnCorr').onclick=loadCorr;$('btnBuild').onclick=build;
+  $('btnPull').onclick=()=>refreshMarket();
+  $('btnCorr').onclick=loadCorr;$('btnBuild').onclick=build;$('btnAll').onclick=loadAll;
+  initExportUI();updateAsof();
   if(S.legs.A&&S.legs.A.pair===S.pairA)renderLeg('A');else loadLeg('A');
   if(S.legs.B&&S.legs.B.pair===S.pairB)renderLeg('B');else loadLeg('B');
   if(S.corr&&S.corr.vol_vol)renderCorr();else loadCorr();
