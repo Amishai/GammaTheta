@@ -39,8 +39,13 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import getpass
+import hashlib
+import hmac
 import json
 import math
+import os
+import secrets
 import threading
 import time
 import traceback
@@ -105,7 +110,13 @@ PLACEHOLDER_RHO = {  # correlation of the legs AS QUOTED
     ('EURUSD', 'USDNOK'): -0.65, ('USDMXN', 'USDZAR'): 0.55, ('USDCAD', 'USDMXN'): 0.45,
     ('USDBRL', 'USDMXN'): 0.60, ('USDBRL', 'USDCLP'): 0.55, ('USDCLP', 'USDMXN'): 0.50,
     ('EURUSD', 'USDMXN'): -0.30, ('EURUSD', 'USDBRL'): -0.25, ('EURUSD', 'USDCLP'): -0.35,
-    ('EURUSD', 'USDILS'): -0.35, ('USDILS', 'USDJPY'): 0.15, ('AUDUSD', 'USDCLP'): -0.45}
+    ('EURUSD', 'USDILS'): -0.35, ('USDILS', 'USDJPY'): 0.15, ('AUDUSD', 'USDCLP'): -0.45,
+    ('NZDUSD', 'USDCAD'): -0.55, ('USDCAD', 'USDCHF'): 0.30}
+# Password for the CAD crosses tab. Only a salted PBKDF2 hash is stored here, never the password.
+# To change it: python cross_vol.py --hash-password   and paste the printed dict over this one.
+CAD_TAB_PASSWORD = {'algo': 'pbkdf2_sha256', 'iter': 390000, 'salt': 'c5316446c9262040882bc36a9e333cdc',
+                    'hash': '2e3df2b58a531722eac479118fd960a2a331bf049386361b707440deb6a026be'}
+
 PLACEHOLDER_VOL_VOL_CORR = 0.60
 PLACEHOLDER_CORR_VOL = 0.20
 PLACEHOLDER_RHO_HALF_LIFE = 0.5      # years
@@ -1314,6 +1325,114 @@ def hedge_book(Gx, Ga, Gb, sa, sb, rho_y, days=252):
             'M': M}
 
 
+# ======================================================================
+# Vol / correlation ladders for the cross + leg-hedge book (full repricing)
+# ----------------------------------------------------------------------
+# Book: ATM options (strike = today's spot, zero rates, undiscounted Black, as in the hedge card),
+# each delta-hedged at inception in its own pair. Spot is held fixed along every ladder.
+#   correlation ladder : rho bumped, leg vols fixed, cross vol from the triangle
+#   leg-vol ladders    : one leg vol bumped, rho fixed, cross vol from the triangle
+# Non-dephased Greeks are per instrument (vega to its own pair's vol). Dephased Greeks re-express the
+# cross in USD-leg risk factors:  vega_X * dsX/dsA, vega_X * dsX/dsB, vega_X * dsX/drho,
+# delta by currency vs USD, and the 2x2 cash-gamma matrix in (base ccy vs USD, quote ccy vs USD).
+# ======================================================================
+def _atm_opt(S, K, sig, T):
+    """Black call, F = S (zero rates), per unit base notional, quote ccy. Returns value, delta, cash gamma
+    (Gamma*S^2, per unit squared return), vega per 1.00 of vol."""
+    sd = sig * math.sqrt(T)
+    d1 = (math.log(S / K) + 0.5 * sd * sd) / sd
+    d2 = d1 - sd
+    pdf = float(npdf(d1))
+    return {'v': S * float(ndtr(d1)) - K * float(ndtr(d2)), 'delta': float(ndtr(d1)),
+            'cgamma': S * pdf / sd, 'vega': S * pdf * math.sqrt(T)}
+
+
+def ladder_book_setup(pair_a, pair_b, SA, SB, sa, sb, rho_q, T, notional, side='buy', mode='corr'):
+    """Freeze the book at today's marks (vol decimals, rho as quoted between the legs)."""
+    base, quote = cross_ccys(pair_a, pair_b)
+    sg = leg_info(pair_a)[1] * leg_info(pair_b)[1]
+    Y = {leg_info(pair_a)[0]: SA if leg_info(pair_a)[1] > 0 else 1 / SA,
+         leg_info(pair_b)[0]: SB if leg_info(pair_b)[1] > 0 else 1 / SB}
+    SX = Y[base] / Y[quote]
+    upq = {'X': Y[quote], 'A': 1.0 if pair_a[3:] == 'USD' else 1 / SA, 'B': 1.0 if pair_b[3:] == 'USD' else 1 / SB}
+    ry = sg * rho_q
+    sx = triangle_cross(sa, sb, ry)
+    gX = atm_cash_gamma_usd(SX, sx, T, upq['X'])
+    gA = atm_cash_gamma_usd(SA, sa, T, upq['A'])
+    gB = atm_cash_gamma_usd(SB, sb, T, upq['B'])
+    NX = (1 if side == 'buy' else -1) * abs(notional)
+    rA, rB = gamma_hedge_ratios(sa, sb, ry, mode)
+    NA, NB = -rA * NX * gX / gA, -rB * NX * gX / gB
+    inst = {'X': {'S': SX, 'N': NX, 'sig0': sx}, 'A': {'S': SA, 'N': NA, 'sig0': sa}, 'B': {'S': SB, 'N': NB, 'sig0': sb}}
+    for k, d in inst.items():
+        o = _atm_opt(d['S'], d['S'], d['sig0'], T)
+        d.update({'K': d['S'], 'v0': o['v'], 'hedge': o['delta'], 'upq': upq[k]})
+    leg_ccy = {'A': leg_info(pair_a)[0], 'B': leg_info(pair_b)[0]}
+    return {'pairs': {'A': pair_a, 'B': pair_b, 'X': base + quote}, 'base': base, 'quote': quote, 'sg': sg, 'T': T, 'Y': Y,
+            'inst': inst, 'leg_ccy': leg_ccy, 'sa0': sa, 'sb0': sb, 'rq0': rho_q}
+
+
+def ladder_node(book, sa, sb, rho_q):
+    """Reprice the frozen book at (sa, sb, rho as quoted). Spot unchanged."""
+    T, sg, Y = book['T'], book['sg'], book['Y']
+    ry = sg * rho_q
+    sx = triangle_cross(sa, sb, ry)
+    sig = {'X': sx, 'A': sa, 'B': sb}
+    pnl, nd = 0.0, {}
+    for k, d in book['inst'].items():
+        o = _atm_opt(d['S'], d['K'], sig[k], T)
+        pnl += d['N'] * (o['v'] - d['v0']) * d['upq']
+        nd[k] = {'vega': d['N'] * o['vega'] * d['upq'] * 0.01,               # USD per vol point of its own pair
+                 'g1': d['N'] * o['cgamma'] * d['upq'] * 0.01,                # USD 1% gamma
+                 'cg': d['N'] * o['cgamma'] * d['upq'],                       # USD per unit return^2
+                 'delta': d['N'] * (o['delta'] - d['hedge'])}                 # base-ccy units, net of the inception hedge
+    dA, dB = (sa - ry * sb) / sx, (sb - ry * sa) / sx
+    dRq = sg * (-sa * sb / sx)                                                # d sigma_X / d rho_quoted (decimals)
+    vX = nd['X']['vega']
+    deph = {'vega_A': nd['A']['vega'] + vX * dA, 'vega_B': nd['B']['vega'] + vX * dB,
+            'vega_rho': vX * dRq * 100 * 0.01}                                # USD per +0.01 rho (as quoted)
+    # dephased delta: USD value of each non-USD currency vs USD
+    dd = {book['base']: 0.0, book['quote']: 0.0}
+    base, quote = book['base'], book['quote']
+    dd[base] += nd['X']['delta'] * Y[base]
+    dd[quote] -= nd['X']['delta'] * Y[base]
+    for k in ('A', 'B'):
+        ccy, orient = leg_info(book['pairs'][k])
+        if orient > 0:                       # cUSD: long base ccy
+            dd[ccy] += nd[k]['delta'] * Y[ccy]
+        else:                                # USDc: long USD, short ccy (USD notional)
+            dd[ccy] -= nd[k]['delta']
+    kA = 'A' if book['leg_ccy']['A'] == base else 'B'
+    kB = 'B' if kA == 'A' else 'A'
+    GX = nd['X']['cg']
+    M = [[GX + nd[kA]['cg'], -GX], [-GX, GX + nd[kB]['cg']]]
+    deph.update({'delta_base': dd[base], 'delta_quote': dd[quote],
+                 'g_base': M[0][0] * 0.01, 'g_quote': M[1][1] * 0.01, 'g_cross': M[0][1] * 0.01})
+    return {'sa': sa, 'sb': sb, 'rho_q': rho_q, 'sx': sx, 'pnl': pnl, 'inst': nd, 'deph': deph,
+            'dsx': {'A': dA, 'B': dB, 'rho_q': dRq}}
+
+
+def ladder(book, which, bumps):
+    """which: 'rho' (bumps in rho), 'A' / 'B' (bumps in vol points). Nodes outside (-1, 1) / <= 0 vol are skipped."""
+    out = []
+    for b in bumps:
+        sa, sb, rq = book['sa0'], book['sb0'], book['rq0']
+        if which == 'rho':
+            rq += b
+            if not -0.999 < rq < 0.999:
+                continue
+        elif which == 'A':
+            sa += b / 100
+        else:
+            sb += b / 100
+        if sa <= 0 or sb <= 0:
+            continue
+        n = ladder_node(book, sa, sb, rq)
+        n['bump'] = b
+        out.append(n)
+    return out
+
+
 # ######################################################################
 #                       DATA: BLOOMBERG + PLACEHOLDERS
 # ######################################################################
@@ -1733,6 +1852,226 @@ def get_corr_monitor(a, b, tenor='1M', window=21, ma=5, years=1.0, days=21):
 
 
 # ######################################################################
+#                 CAD CROSSES BOARD (password-protected tab)
+# ######################################################################
+CAD_CROSSES = [('EURUSD', 'USDCAD'), ('GBPUSD', 'USDCAD'), ('USDCAD', 'USDJPY'), ('AUDUSD', 'USDCAD'),
+               ('NZDUSD', 'USDCAD'), ('USDCAD', 'USDMXN'), ('USDCAD', 'USDCHF')]
+CAD_SESSION_HOURS = 8
+_SESSIONS = {}                     # token -> expiry (epoch seconds)
+_AUTH_FAILS = {'n': 0, 'until': 0.0}
+_AUTH_LOCK = threading.Lock()
+
+
+def hash_password(pw, iterations=390000):
+    salt = secrets.token_hex(16)
+    return {'algo': 'pbkdf2_sha256', 'iter': iterations, 'salt': salt,
+            'hash': hashlib.pbkdf2_hmac('sha256', pw.encode(), bytes.fromhex(salt), iterations).hex()}
+
+
+def check_password(pw):
+    h = CAD_TAB_PASSWORD
+    dk = hashlib.pbkdf2_hmac('sha256', str(pw).encode(), bytes.fromhex(h['salt']), int(h['iter'])).hex()
+    return hmac.compare_digest(dk, h['hash'])
+
+
+def auth_login(pw):
+    """Returns (status, token_or_message). 5 wrong attempts -> 60s lockout."""
+    with _AUTH_LOCK:
+        now = time.time()
+        if now < _AUTH_FAILS['until']:
+            return 429, f'Too many attempts — try again in {int(_AUTH_FAILS["until"] - now) + 1}s'
+    ok = check_password(pw)                                   # slow on purpose (PBKDF2); outside the lock
+    with _AUTH_LOCK:
+        if not ok:
+            _AUTH_FAILS['n'] += 1
+            if _AUTH_FAILS['n'] >= 5:
+                _AUTH_FAILS.update(n=0, until=time.time() + 60)
+                return 429, 'Too many attempts — locked for 60s'
+            return 401, 'Wrong password'
+        _AUTH_FAILS['n'] = 0
+        tok = secrets.token_urlsafe(32)
+        _SESSIONS[tok] = time.time() + CAD_SESSION_HOURS * 3600
+        for k in [k for k, v in _SESSIONS.items() if v < time.time()]:
+            _SESSIONS.pop(k, None)
+        return 200, tok
+
+
+def auth_ok(cookie_header):
+    tok = None
+    for part in (cookie_header or '').split(';'):
+        k, _, v = part.strip().partition('=')
+        if k == 'cv_cad':
+            tok = v
+    with _AUTH_LOCK:
+        exp = _SESSIONS.get(tok) if tok else None
+        if exp and exp > time.time():
+            return tok
+        if tok:
+            _SESSIONS.pop(tok, None)
+    return None
+
+
+def auth_logout(tok):
+    with _AUTH_LOCK:
+        _SESSIONS.pop(tok, None)
+
+
+def _cad_build_worker(args):
+    """Runs in a worker process: one cross surface."""
+    legA, legB, rho, rs, sr, hl = args
+    try:
+        return build_surface(legA, legB, rho, rho_sig_by_tenor=rs, sig_rho_by_tenor=sr, rho_half_life=hl)
+    except Exception as e:
+        return {'fatal': f'{type(e).__name__}: {e}'}
+
+
+class CadBoard:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.snapshot = None
+        self.building = False
+        self.progress = {'done': 0, 'total': len(CAD_CROSSES), 'stage': ''}
+        self.error = ''
+        self._corr_cache = {}          # (a, b, date) -> get_corr payload (history-based, refreshed daily)
+        self._pool = None
+
+    def status(self):
+        with self.lock:
+            return {'building': self.building, 'progress': dict(self.progress), 'error': self.error,
+                    'asof': self.snapshot['asof'] if self.snapshot else None}
+
+    def start(self, rho_src='implied'):
+        with self.lock:
+            if self.building:
+                return False
+            self.building, self.error = True, ''
+            self.progress = {'done': 0, 'total': len(CAD_CROSSES), 'stage': 'pulling market data'}
+        threading.Thread(target=self._run, args=(rho_src,), daemon=True).start()
+        return True
+
+    def _corr(self, a, b):
+        key = (a, b, date.today())
+        if key not in self._corr_cache:
+            self._corr_cache[key] = get_corr(a, b)
+        return self._corr_cache[key]
+
+    def _pool_map(self, jobs):
+        try:
+            if self._pool is None:
+                from concurrent.futures import ProcessPoolExecutor
+                self._pool = ProcessPoolExecutor(max_workers=max(1, min(len(jobs), (os.cpu_count() or 2))))
+            futs = [self._pool.submit(_cad_build_worker, j) for j in jobs]
+            out = []
+            for f in futs:
+                out.append(f.result())
+                with self.lock:
+                    self.progress['done'] += 1
+            return out
+        except Exception as e:                                 # no process pool available: build serially
+            log(f'process pool unavailable ({e}); building serially')
+            self._pool = None
+            out = []
+            for j in jobs:
+                out.append(_cad_build_worker(j))
+                with self.lock:
+                    self.progress['done'] += 1
+            return out
+
+    def _run(self, rho_src):
+        t0 = time.time()
+        try:
+            legs = {}
+            for p in sorted({p for ab in CAD_CROSSES for p in ab}):
+                legs[p] = get_surface(p)
+            prep = []
+            for a, b in CAD_CROSSES:
+                La, Lb = legs[a], legs[b]
+                M = get_cross_market(a, b)
+                C = self._corr(a, b)
+                sA, sB = leg_info(a)[1], leg_info(b)[1]
+                sg = sA * sB
+                imp_q, real_q, used_q = {}, {}, {}
+                for t in TENORS:
+                    ra, rb, mx = La['rows'].get(t), Lb['rows'].get(t), (M.get('rows') or {}).get(t)
+                    iq = None
+                    if ra and rb and mx and mx.get('atm'):
+                        v = sg * implied_rho_y(ra['atm'], rb['atm'], mx['atm'])
+                        iq = v if -1 < v < 1 else None
+                    rq = (C['by_tenor'].get(t) or {}).get('rho_quoted')
+                    imp_q[t], real_q[t] = iq, rq
+                    u = iq if (rho_src == 'implied' and iq is not None) else rq
+                    if u is not None:
+                        used_q[t] = u
+                rs = {t: v['rho_sig'] for t, v in C.get('vol_vol', {}).items() if v.get('rho_sig') is not None}
+                cv = C.get('corr_vol') or {}
+                sr = {t: cv.get('value') for t in TENORS if cv.get('value') is not None}
+                hl = cv.get('half_life') or DEFAULT_RHO_HALF_LIFE
+                prep.append({'a': a, 'b': b, 'La': La, 'Lb': Lb, 'M': M, 'C': C, 'sg': sg,
+                             'imp': imp_q, 'real': real_q, 'used': used_q, 'job': (La, Lb, used_q, rs, sr, hl)})
+            with self.lock:
+                self.progress['stage'] = 'building surfaces'
+            built = self._pool_map([p['job'] for p in prep])
+            crosses = [self._summarise(p, s, rho_src) for p, s in zip(prep, built)]
+            snap = {'asof': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'secs': round(time.time() - t0, 1),
+                    'rho_src': rho_src, 'crosses': crosses, 'tenors': TENORS,
+                    'sources': sorted({legs[p]['source'] for p in legs})}
+            with self.lock:
+                self.snapshot = snap
+        except Exception as e:
+            log(traceback.format_exc())
+            with self.lock:
+                self.error = f'{type(e).__name__}: {e}'
+        finally:
+            with self.lock:
+                self.building = False
+                self.progress['stage'] = 'done'
+
+    @staticmethod
+    def _summarise(p, s, rho_src):
+        a, b, La, Lb, M, sg = p['a'], p['b'], p['La'], p['Lb'], p['M'], p['sg']
+        base, quote = cross_ccys(a, b)
+        cad_leg = a if 'CAD' in a else b
+        other = b if cad_leg == a else a
+        if 'fatal' in s:
+            return {'cross': base + quote, 'legs': [a, b], 'other_leg': other, 'cad_leg': cad_leg, 'error': s['fatal'], 'rows': []}
+        Y = {leg_info(a)[0]: La['spot'] if leg_info(a)[1] > 0 else 1 / La['spot'],
+             leg_info(b)[0]: Lb['spot'] if leg_info(b)[1] > 0 else 1 / Lb['spot']}
+        SX = Y[base] / Y[quote]
+        pts = lambda x: None if x is None or not math.isfinite(x) else round(x * 100, 4)
+        rows = []
+        by_t = {r['tenor']: r for r in s['tenors']}
+        for t in TENORS:
+            r = by_t.get(t)
+            mk = (M.get('rows') or {}).get(t) or {}
+            if not r:
+                rows.append({'tenor': t, 'error': s['errors'].get(t, 'no inputs')})
+                continue
+            sa_, sb_ = La['rows'][t]['atm'] / 100, Lb['rows'][t]['atm'] / 100
+            ry = sg * r['rho_quoted']
+            sx = triangle_cross(sa_, sb_, ry)
+            d_a, d_b = (sa_ - ry * sb_) / sx, (sb_ - ry * sa_) / sx
+            d_other, d_cad = (d_b, d_a) if cad_leg == a else (d_a, d_b)
+            d_rhoY01 = -sa_ * sb_ / sx * 0.01 * 100              # vol pts of cross per +0.01 rho_Y
+            T = TENOR_YEARS[t]
+            v = r['res']
+            rows.append({'tenor': t, 'rho_y_impl': None if p['imp'][t] is None else sg * p['imp'][t],
+                         'rho_y_real': None if p['real'][t] is None else sg * p['real'][t], 'rho_y_used': ry,
+                         'atm': pts(v['atm']), 'rr25': pts(v['rr25']), 'rr10': pts(v['rr10']),
+                         'bf25': pts(v['bf25b']), 'bf10': pts(v['bf10b']),
+                         'mkt': {k: mk.get(k) for k in ('atm', 'rr25', 'rr10', 'bf25', 'bf10')},
+                         'sig_other': (Lb if other == b else La)['rows'][t]['atm'], 'sig_cad': (La if cad_leg == a else Lb)['rows'][t]['atm'],
+                         'd_other': d_other, 'd_cad': d_cad, 'd_rho01': d_rhoY01,
+                         'vega_unit': atm_vega_usd(SX, sx, T, Y[quote]) * 0.01,     # USD per vol pt per 1 unit base notional
+                         'flags': list(r['notes'])})
+        return {'cross': base + quote, 'legs': [a, b], 'other_leg': other, 'cad_leg': cad_leg, 'spot': SX,
+                'base': base, 'quote': quote, 'sources': [La['source'], Lb['source'], M.get('source')],
+                'rows': rows, 'errors': s['errors']}
+
+
+CAD_BOARD = CadBoard()
+
+
+# ######################################################################
 #                                BUILD
 # ######################################################################
 def _fine_curve(F, smile, ks, n=241):
@@ -1799,11 +2138,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, payload, ctype='application/json'):
+    def _send(self, code, payload, ctype='application/json', headers=None):
         data = payload if isinstance(payload, bytes) else json.dumps(payload, default=_jsonable).encode()
         self.send_response(code)
         self.send_header('Content-Type', ctype)
         self.send_header('Cache-Control', 'no-store')
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1823,6 +2164,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, get_corr(q['a'], q['b']))
             elif u.path == '/api/cross_market':
                 self._send(200, get_cross_market(q['a'], q['b']))
+            elif u.path == '/api/cad/status':
+                tok = auth_ok(self.headers.get('Cookie'))
+                self._send(200, {'authed': bool(tok), **(CAD_BOARD.status() if tok else {})})
+            elif u.path == '/api/cad/snapshot':
+                if not auth_ok(self.headers.get('Cookie')):
+                    self._send(401, {'error': 'locked'})
+                else:
+                    with CAD_BOARD.lock:
+                        snap = CAD_BOARD.snapshot
+                    self._send(200, {'snapshot': snap, **CAD_BOARD.status()})
             elif u.path == '/api/corr_monitor':
                 self._send(200, get_corr_monitor(q['a'], q['b'], q.get('tenor', '1M'), int(q.get('window', 21)),
                                                  int(q.get('ma', 5)), float(q.get('years', 1))))
@@ -1838,7 +2189,28 @@ class Handler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get('Content-Length', 0))
             body = json.loads(self.rfile.read(n) or b'{}')
-            if urlparse(self.path).path == '/api/build':
+            path = urlparse(self.path).path
+            if path == '/api/auth':
+                code, val = auth_login(body.get('password', ''))
+                if code == 200:
+                    self._send(200, {'ok': True}, headers={'Set-Cookie': f'cv_cad={val}; HttpOnly; SameSite=Strict; Path=/; Max-Age={CAD_SESSION_HOURS * 3600}'})
+                else:
+                    self._send(code, {'error': val})
+                return
+            if path == '/api/logout':
+                tok = auth_ok(self.headers.get('Cookie'))
+                if tok:
+                    auth_logout(tok)
+                self._send(200, {'ok': True}, headers={'Set-Cookie': 'cv_cad=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'})
+                return
+            if path == '/api/cad/refresh':
+                if not auth_ok(self.headers.get('Cookie')):
+                    self._send(401, {'error': 'locked'})
+                    return
+                started = CAD_BOARD.start(body.get('rho_src', 'implied'))
+                self._send(200, {'started': started, **CAD_BOARD.status()})
+                return
+            if path == '/api/build':
                 res = run_build(body)
                 log(f"built {res['cross']} {len(res['rows'])} tenors in {res['secs']}s"
                     + (f" errors={res['errors']}" if res['errors'] else ''))
@@ -1931,6 +2303,10 @@ details summary{cursor:pointer;color:var(--text-secondary);margin-top:8px}
 .kv tr.h td{color:var(--text-primary);font-weight:650;padding-top:9px;border-bottom:1px solid var(--border)}
 .ev{margin:10px 0 0;padding-left:18px;color:var(--text-primary)} .ev li{margin:3px 0}
 .pos{color:var(--good)} .negv{color:var(--critical)}
+#tabs{display:flex;gap:4px;padding:8px 18px 0;border-bottom:1px solid var(--border);background:var(--surface-1)}
+#tabs button{background:none;border:0;border-bottom:2px solid transparent;color:var(--text-secondary);padding:7px 14px;font:inherit;font-weight:600;cursor:pointer}
+#tabs button.on{color:var(--text-primary);border-bottom-color:var(--accent)}
+@media print{#tabs{display:none!important}}
 .cardwrap{position:relative;min-width:0}
 .cardwrap>.exp-btn{position:absolute;top:10px;right:12px;padding:2px 9px;font-size:11px;z-index:3;opacity:.85}
 .cardwrap>.exp-btn:hover{opacity:1}
@@ -1951,6 +2327,7 @@ body.exporting .card button.act{display:none!important}
 @media print{header,section.controls,#status,#banner,.exp-btn,#expPanel,#expMenu,.modebar-container{display:none!important}
  .print-hide{display:none!important}.card{break-inside:avoid;border-color:#ccc}.scroll{overflow:visible!important}}
 #triRight table.kv tr:not(.h) td:last-child{white-space:normal;text-align:right}
+table.ladder td,table.ladder th{font-size:12px;padding:2px 6px}
 #triRight table.kv td:first-child{padding-right:14px}
 table.grid td{padding:1px 2px}
 table.grid input.num{width:100%;min-width:58px;border-radius:3px;cursor:cell}
@@ -1962,7 +2339,8 @@ table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
 <span class="pill" id="asof" style="background:none"></span><span style="flex:1"></span><span class="pill">ATM: variance formula · RR: copula · wings: vol-of-vol</span>
 <button class="act" id="btnExport">Export…</button></header>
 <div id="expPanel" style="display:none"></div><div id="expMenu" style="display:none"></div>
-<main>
+<nav id="tabs"><button data-tab="main" class="on">Cross builder</button><button data-tab="cad">CAD crosses 🔒</button></nav>
+<main id="tabMain">
 <section class="card controls">
   <label class="f">Leg A<select id="pairA"></select></label>
   <label class="f">Leg B<select id="pairB"></select></label>
@@ -1984,13 +2362,15 @@ table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
 <section class="card" id="cardC"></section>
 <section class="card" id="results"><h2>Cross surface</h2><div class="empty">Generate to build the cross surface.</div></section>
 <section class="card" id="cardTri"></section>
+<section class="card" id="cardLad"></section>
 <section class="card" id="cardMon"></section>
 <section class="card" id="cardAn"></section>
 </main>
+<main id="tabCad" style="display:none"></main>
 <script>
 const TENORS=['1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y'];
 const FIELDS=[['fwd_pts','Fwd pts'],['atm','ATM'],['rr25','25 RR'],['rr10','10 RR'],['bf25','25 BF'],['bf10','10 BF']];
-const LS='crossvol_state_v7';
+const LS='crossvol_state_v9';
 let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
        legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
 const $=id=>document.getElementById(id);
@@ -2672,7 +3052,7 @@ function renderTri(){
   let h='<h2>Triangle &amp; gamma hedge — '+c+'<span style="flex:1"></span><label class="f" style="flex-direction:row;align-items:center;gap:6px;font-weight:400">Tenor <select id="triTenor">'
     +TENORS.map(t=>'<option'+(t===C.tenor?' selected':'')+'>'+t+'</option>').join('')+'</select></label></h2>';
   const B=triBase(C.tenor);
-  if(!B){el.innerHTML=h+'<div class="empty">Load both legs and a correlation for '+C.tenor+' first.</div>';$('triTenor').onchange=e=>{C.tenor=e.target.value;C.cur=null;save();renderTri();};return;}
+  if(!B){el.innerHTML=h+'<div class="empty">Load both legs and a correlation for '+C.tenor+' first.</div>';$('triTenor').onchange=e=>{C.tenor=e.target.value;C.cur=null;save();renderTri();};renderLadder();return;}
   if(!C.cur||C.cur.tenor!==C.tenor||C.cur.pa!==pa||C.cur.pb!==pb)C.cur={tenor:C.tenor,pa,pb,a:B.a,b:B.b,rho:B.rho,x:B.mkt!=null&&S.rho_src==='implied'?B.mkt:B.x};
   h+='<div class="controls" style="margin-bottom:8px"><div class="f"><label class="f">Solve for</label><div class="seg" id="triSolve">'
     +[['cross',c+' vol'],['rho','ρ'],['a',pa+' vol'],['b',pb+' vol']].map(([v,l])=>'<button data-v="'+v+'">'+l+'</button>').join('')+'</div></div>'
@@ -2750,6 +3130,7 @@ function triUpdate(){
   $('triOut').innerHTML=h;
   renderHedge(R);
   if(R.ok)drawTri(R.v,B,sg);
+  renderLadder();
 }
 let _triRaf=null;function triLive(){if(_triRaf)return;_triRaf=requestAnimationFrame(()=>{_triRaf=null;triUpdate();});}
 function drawTri(v,B,sg){
@@ -2870,9 +3251,18 @@ function loadScriptOnce(name){
   return EXPORT_LIBS[name].reduce((p,url)=>p.then(ok=>ok||new Promise(res=>{const s=document.createElement('script');s.src=url;
     s.onload=()=>res(!!window[name]);s.onerror=()=>{s.remove();res(false);};document.head.appendChild(s);})),Promise.resolve(false));
 }
-function sectionDefs(){const c=crossNm(),A=S.legs.A,B=S.legs.B;
+function allSectionDefs(){const c=crossNm(),A=S.legs.A,B=S.legs.B;
   return [['cardA','Leg A'+(A?' — '+A.pair:'')],['cardB','Leg B'+(B?' — '+B.pair:'')],['cardC','Correlation inputs'],['results','Cross surface'],
-    ['cardTri','Triangle & gamma hedge'],['cardMon','Correlation monitor'],['cardAn','Correlation analytics']].map(([id,l])=>({id,label:l,cross:c}));}
+    ['cardTri','Triangle & gamma hedge'],['cardLad','Vol & correlation ladders'],['cardMon','Correlation monitor'],['cardAn','Correlation analytics']].map(([id,l])=>({id,label:l,cross:c}))
+    .concat([['cadOverview','CAD crosses — overview'],['cadBook','CAD book — dephased vega'],['cadSurf','CAD crosses — surfaces']].map(([id,l])=>({id,label:l,cross:'CAD'})));}
+function sectionDefs(){return allSectionDefs().filter(d=>{const e=$(d.id);return e&&e.offsetParent!==null;});}   // sections on the visible tab
+function wrapExportButtons(){
+  // a small export button on every card (lives outside the card so re-renders don't remove it)
+  allSectionDefs().forEach(d=>{const card=$(d.id);if(!card||card.parentElement.classList.contains('cardwrap'))return;
+    const w=document.createElement('div');w.className='cardwrap';card.parentElement.insertBefore(w,card);w.appendChild(card);
+    const b=document.createElement('button');b.className='act exp-btn';b.textContent='Export ▾';b.title='Export this section';b.dataset.sec=d.id;w.appendChild(b);
+    b.onclick=e=>{e.stopPropagation();openExpMenu(b,d.id);};});
+}
 function slug(s){return s.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');}
 function stamp(){const d=new Date(),p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'_'+p(d.getHours())+p(d.getMinutes());}
 function redrawCharts(){
@@ -2880,6 +3270,7 @@ function redrawCharts(){
   try{if(S.monData)drawMon();}catch(e){}
   try{if(S.hist)drawAnCharts();}catch(e){}
   try{if($('chTri'))triUpdate();}catch(e){}
+  try{const bk=ladderBook();if(bk)drawLadders(bk);}catch(e){}
 }
 function freezeInputs(root){                  // copy live values into attributes so the clone shows them
   root.querySelectorAll('input').forEach(i=>{if(i.type==='checkbox'||i.type==='radio'){if(i.checked)i.setAttribute('checked','');else i.removeAttribute('checked');}
@@ -2887,7 +3278,7 @@ function freezeInputs(root){                  // copy live values into attribute
   root.querySelectorAll('select').forEach(sel=>[...sel.options].forEach(o=>{if(o.selected)o.setAttribute('selected','');else o.removeAttribute('selected');}));
 }
 async function captureSection(id,pr){
-  const el=$(id),def=sectionDefs().find(d=>d.id===id);
+  const el=$(id),def=allSectionDefs().find(d=>d.id===id);
   const cap=document.createElement('div');cap.className='exp-caption';
   const src=[S.legs.A&&S.legs.A.source,S.mkt&&S.mkt.source].filter(Boolean);
   cap.textContent=def.cross+' · '+def.label+' · '+new Date().toLocaleString()+(src.length?' · data: '+[...new Set(src)].join('/'):'');
@@ -2908,9 +3299,9 @@ async function exportSections(ids,fmt,opts){
   const prevTheme=document.documentElement.getAttribute('data-theme'),light=!!opts.light;
   document.body.classList.add('exporting');
   if(light){document.documentElement.setAttribute('data-theme','light');redrawCharts();await new Promise(r=>setTimeout(r,60));}
-  const name=crossNm()+'_'+(ids.length===1?slug(sectionDefs().find(d=>d.id===ids[0]).label):'export')+'_'+stamp();
+  const name=(allSectionDefs().find(d=>d.id===ids[0]).cross==='CAD'?'CAD-crosses':crossNm())+'_'+(ids.length===1?slug(allSectionDefs().find(d=>d.id===ids[0]).label):'export')+'_'+stamp();
   try{
-    const canv=[];for(const id of ids){status('Capturing '+sectionDefs().find(d=>d.id===id).label+'…');canv.push(await captureSection(id,opts.pixelRatio||2));}
+    const canv=[];for(const id of ids){status('Capturing '+allSectionDefs().find(d=>d.id===id).label+'…');canv.push(await captureSection(id,opts.pixelRatio||2));}
     let out;
     if(fmt==='pdf'){
       const {jsPDF}=window.jspdf,W=842;let doc=null;
@@ -2938,15 +3329,11 @@ async function exportSections(ids,fmt,opts){
     if(light){if(prevTheme==null)document.documentElement.removeAttribute('data-theme');else document.documentElement.setAttribute('data-theme',prevTheme);redrawCharts();}}
 }
 function printSections(ids){                  // fallback when the libraries can't load: browser Print -> Save as PDF
-  document.body.classList.add('printing');sectionDefs().forEach(d=>{const w=$(d.id).closest('.cardwrap');if(w)w.classList.toggle('print-hide',!ids.includes(d.id));});
+  document.body.classList.add('printing');allSectionDefs().forEach(d=>{const e=$(d.id);const w=e&&e.closest('.cardwrap');if(w)w.classList.toggle('print-hide',!ids.includes(d.id));});
   setTimeout(()=>{window.print();document.body.classList.remove('printing');document.querySelectorAll('.print-hide').forEach(x=>x.classList.remove('print-hide'));},50);
 }
 function initExportUI(){
-  // a small export button on every card (lives outside the card so re-renders don't remove it)
-  sectionDefs().forEach(d=>{const card=$(d.id);if(!card||card.parentElement.classList.contains('cardwrap'))return;
-    const w=document.createElement('div');w.className='cardwrap';card.parentElement.insertBefore(w,card);w.appendChild(card);
-    const b=document.createElement('button');b.className='act exp-btn';b.textContent='Export ▾';b.title='Export this section';b.dataset.sec=d.id;w.appendChild(b);
-    b.onclick=e=>{e.stopPropagation();openExpMenu(b,d.id);};});
+  wrapExportButtons();
   $('btnExport').onclick=e=>{e.stopPropagation();openExportPanel();};
   document.addEventListener('click',e=>{const m=$('expMenu');if(m&&!m.contains(e.target))m.style.display='none';
     const p=$('expPanel');if(p&&p.style.display!=='none'&&!p.contains(e.target)&&e.target.id!=='btnExport')p.style.display='none';});
@@ -2960,7 +3347,7 @@ function openExpMenu(btn,id){
   m.querySelectorAll('button').forEach(b=>b.onclick=()=>{m.style.display='none';exportSections([id],b.dataset.f,{light:S.expLight});});
 }
 function openExportPanel(){
-  const p=$('expPanel'),defs=sectionDefs(),sel=S.expSel||defs.map(d=>d.id),fmt=S.expFmt||'pdf';
+  const p=$('expPanel'),defs=sectionDefs(),saved=(S.expSel||[]).filter(id=>defs.some(d=>d.id===id)),sel=saved.length?saved:defs.map(d=>d.id),fmt=S.expFmt||'pdf';
   p.innerHTML='<div style="font-weight:650;margin-bottom:6px">Export sections</div>'
     +defs.map(d=>{const has=$(d.id).innerText.trim().length&&!$(d.id).querySelector(':scope > .empty');
       return '<label class="expRow"><input type="checkbox" data-id="'+d.id+'"'+(sel.includes(d.id)?' checked':'')+'> '+d.label+(has?'':' <span style="color:var(--text-muted)">(not loaded)</span>')+'</label>';}).join('')
@@ -2979,6 +3366,226 @@ function openExportPanel(){
   $('expGo').onclick=()=>{p.style.display='none';exportSections(cur(),S.expFmt||'pdf',{light:S.expLight});};
 }
 
+// ===================== Vol / correlation ladders (mirrors ladder_book_setup / ladder_node) =====================
+function ncdfJ(x){                       // double-precision normal CDF: series for |x|<5, continued fraction beyond
+  if(x<-5||x>5){const t=Math.abs(x);let f=0;for(let k=60;k>=1;k--)f=k/(t+f);const tail=npdfJ(t)/(t+f);return x>0?1-tail:tail;}
+  let term=x,sum=x;for(let k=1;k<200;k++){term*=x*x/(2*k+1);sum+=term;if(Math.abs(term)<1e-17*Math.abs(sum))break;}
+  return 0.5+npdfJ(x)*sum;}
+function atmOptJ(S,K,sig,T){const sd=sig*Math.sqrt(T),d1=(Math.log(S/K)+0.5*sd*sd)/sd,d2=d1-sd,pd=npdfJ(d1);
+  return {v:S*ncdfJ(d1)-K*ncdfJ(d2),delta:ncdfJ(d1),cgamma:S*pd/sd,vega:S*pd*Math.sqrt(T)};}
+function ladderBook(){                    // the triangle card's book, frozen at the triangle scenario
+  const C=triCfg(),B=triBase(C.tenor);if(!B||!C.cur)return null;
+  const R=triSolve(C.cur,C.solve,B.sg);if(!R.ok)return null;const v=R.v;
+  const A=S.legs.A,Bl=S.legs.B,pa=A.pair,pb=Bl.pair,c=crossNm(),base=c.slice(0,3),quote=c.slice(3),T=TENOR_YRS[C.tenor];
+  const SA=+A.spot,SB=+Bl.spot,Yof=(p,s)=>p.slice(3)==='USD'?s:1/s,Y={};Y[legCcy(pa)]=Yof(pa,SA);Y[legCcy(pb)]=Yof(pb,SB);
+  const SX=Y[base]/Y[quote],upq={X:Y[quote],A:pa.slice(3)==='USD'?1:1/SA,B:pb.slice(3)==='USD'?1:1/SB};
+  const sa=v.a/100,sb=v.b/100,rq=v.rho,sg=B.sg,ry=sg*rq,sx=triX(sa,sb,ry);
+  const gX=atmGammaUSD(SX,sx,T,upq.X),gA=atmGammaUSD(SA,sa,T,upq.A),gB=atmGammaUSD(SB,sb,T,upq.B);
+  const NX=(C.side==='buy'?1:-1)*Math.abs(C.notional||0),[rA,rB]=hedgeRatios(sa,sb,ry,C.mode);
+  const inst={X:{S:SX,N:NX,sig0:sx},A:{S:SA,N:-rA*NX*gX/gA,sig0:sa},B:{S:SB,N:-rB*NX*gX/gB,sig0:sb}};
+  Object.entries(inst).forEach(([k,d])=>{const o=atmOptJ(d.S,d.S,d.sig0,T);Object.assign(d,{K:d.S,v0:o.v,hedge:o.delta,upq:upq[k]});});
+  return {pairs:{A:pa,B:pb,X:c},base,quote,sg,T,Y,inst,legCcy:{A:legCcy(pa),B:legCcy(pb)},sa0:sa,sb0:sb,rq0:rq,tenor:C.tenor,side:C.side,mode:C.mode};
+}
+function ladderNode(bk,sa,sb,rq){
+  const ry=bk.sg*rq,sx=triX(sa,sb,ry),sig={X:sx,A:sa,B:sb},nd={};let pnl=0;
+  Object.entries(bk.inst).forEach(([k,d])=>{const o=atmOptJ(d.S,d.K,sig[k],bk.T);pnl+=d.N*(o.v-d.v0)*d.upq;
+    nd[k]={vega:d.N*o.vega*d.upq*0.01,g1:d.N*o.cgamma*d.upq*0.01,cg:d.N*o.cgamma*d.upq,delta:d.N*(o.delta-d.hedge)};});
+  const dA=(sa-ry*sb)/sx,dB=(sb-ry*sa)/sx,dRq=bk.sg*(-sa*sb/sx),vX=nd.X.vega;
+  const dd={};dd[bk.base]=0;dd[bk.quote]=0;
+  dd[bk.base]+=nd.X.delta*bk.Y[bk.base];dd[bk.quote]-=nd.X.delta*bk.Y[bk.base];
+  ['A','B'].forEach(k=>{const p=bk.pairs[k],ccy=legCcy(p);if(p.slice(3)==='USD')dd[ccy]+=nd[k].delta*bk.Y[ccy];else dd[ccy]-=nd[k].delta;});
+  const kA=bk.legCcy.A===bk.base?'A':'B',kB=kA==='A'?'B':'A',GX=nd.X.cg;
+  return {sa,sb,rq,sx,pnl,inst:nd,deph:{vega_A:nd.A.vega+vX*dA,vega_B:nd.B.vega+vX*dB,vega_rho:vX*dRq,
+    delta_base:dd[bk.base],delta_quote:dd[bk.quote],g_base:(GX+nd[kA].cg)*0.01,g_quote:(GX+nd[kB].cg)*0.01,g_cross:-GX*0.01}};
+}
+function parseBumps(txt){const v=String(txt||'').split(/[\s,;]+/).map(parseCell).filter(x=>x!=null&&!Number.isNaN(x));return [...new Set(v.concat([0]))].sort((a,b)=>a-b);}
+function ladderRun(bk,which,bumps){const out=[];bumps.forEach(b=>{let sa=bk.sa0,sb=bk.sb0,rq=bk.rq0;
+  if(which==='rho'){rq+=b;if(!(rq>-0.999&&rq<0.999))return;}else if(which==='A')sa+=b/100;else sb+=b/100;
+  if(sa<=0||sb<=0)return;const n=ladderNode(bk,sa,sb,rq);n.bump=b;out.push(n);});return out;}
+function ladCfg(){const d={which:'all',view:'both',rb:'-0.20, -0.10, -0.05, -0.02, 0, 0.02, 0.05, 0.10, 0.20',vb:'-2, -1, -0.5, -0.25, 0, 0.25, 0.5, 1, 2',chart:{}};
+  if(!S.lad)S.lad={};for(const k in d)if(S.lad[k]===undefined)S.lad[k]=d[k];return S.lad;}
+function ladCols(bk){const p=bk.pairs,b=bk.base,q=bk.quote;
+  return {scen:[['rq','ρ '+p.A+'/'+p.B,3,r=>r.rq],['sa','σ '+p.A,3,r=>r.sa*100],['sb','σ '+p.B,3,r=>r.sb*100],['sx','σ '+p.X,3,r=>r.sx*100],['pnl','P&L (USD)',0,r=>r.pnl]],
+    non:[['vX','Vega '+p.X,0,r=>r.inst.X.vega],['vA','Vega '+p.A,0,r=>r.inst.A.vega],['vB','Vega '+p.B,0,r=>r.inst.B.vega],
+         ['gX','1% γ '+p.X,0,r=>r.inst.X.g1],['gA','1% γ '+p.A,0,r=>r.inst.A.g1],['gB','1% γ '+p.B,0,r=>r.inst.B.g1],
+         ['dX','Δ '+p.X+' ('+p.X.slice(0,3)+')',0,r=>r.inst.X.delta],['dA','Δ '+p.A+' ('+p.A.slice(0,3)+')',0,r=>r.inst.A.delta],['dB','Δ '+p.B+' ('+p.B.slice(0,3)+')',0,r=>r.inst.B.delta]],
+    dep:[['eA','Vega to '+p.A+' vol',0,r=>r.deph.vega_A],['eB','Vega to '+p.B+' vol',0,r=>r.deph.vega_B],['eR','Vega to ρ (+0.01)',0,r=>r.deph.vega_rho],
+         ['eDb','Δ '+b+' (USD)',0,r=>r.deph.delta_base],['eDq','Δ '+q+' (USD)',0,r=>r.deph.delta_quote],
+         ['eGb','1% γ '+b,0,r=>r.deph.g_base],['eGq','1% γ '+q,0,r=>r.deph.g_quote],['eGx','1% γ '+b+'×'+q,0,r=>r.deph.g_cross]]};}
+function renderLadder(){
+  const el=$('cardLad');if(!el)return;const L=ladCfg(),bk=ladderBook(),c=crossNm();
+  let h='<h2>Vol &amp; correlation ladders — '+c+(bk?' '+bk.tenor+' book':'')+'</h2>';
+  if(!bk){el.innerHTML=h+'<div class="empty">Set up the book in the Triangle &amp; gamma hedge card first (legs, ρ and a feasible scenario).</div>';return;}
+  const p=bk.pairs,money=(x,d=0)=>{if(x==null||!Number.isFinite(x))return '—';if(Math.abs(x)<0.5*Math.pow(10,-d))x=0;return (x<0?'−':'')+Math.abs(x).toLocaleString(undefined,{maximumFractionDigits:d,minimumFractionDigits:d});};
+  const I=bk.inst,act=n=>n>=0?'Buy':'Sell';
+  h+='<div class="meta">Book from the triangle card ('+({corr:'correlation-only',minvar:'min-variance',cash:'1:1 cash gamma'}[bk.mode])+' hedge): '
+    +act(I.X.N)+' '+p.X.slice(0,3)+' '+money(Math.abs(I.X.N))+' '+p.X+' · '+act(I.A.N)+' '+p.A.slice(0,3)+' '+money(Math.abs(I.A.N))+' '+p.A+' · '+act(I.B.N)+' '+p.B.slice(0,3)+' '+money(Math.abs(I.B.N))+' '+p.B
+    +' — '+bk.tenor+' ATM, struck at today\'s spot, each delta-hedged in its own pair. Spot is held fixed; every node is fully repriced.</div>';
+  h+='<div class="controls" style="gap:8px 14px;margin:6px 0 8px">'
+    +'<div class="f"><label class="f">Ladder</label><div class="seg" id="ladWhich">'+[['all','All three'],['rho','Correlation'],['A',p.A+' vol'],['B',p.B+' vol']].map(([v,l])=>'<button data-v="'+v+'">'+l+'</button>').join('')+'</div></div>'
+    +'<div class="f"><label class="f">Greeks</label><div class="seg" id="ladView">'+[['both','Both'],['dep','Dephased'],['non','Non-dephased']].map(([v,l])=>'<button data-v="'+v+'">'+l+'</button>').join('')+'</div></div>'
+    +'<label class="f">ρ bumps<input id="ladRb" style="width:250px" value="'+L.rb+'"></label>'
+    +'<label class="f">Vol bumps (vol pts)<input id="ladVb" style="width:220px" value="'+L.vb+'"></label></div>';
+  const cols=ladCols(bk),show=[].concat(cols.scen,L.view!=='non'?cols.dep:[],L.view!=='dep'?cols.non:[]);
+  const ladders=[['rho','Correlation ladder','ρ bump (as quoted)',parseBumps(L.rb),'Legs fixed; '+p.X+' vol moves through the triangle.'],
+    ['A',p.A+' vol ladder','vol bump',parseBumps(L.vb),'ρ fixed; '+p.X+' vol moves with '+p.A+' vol.'],
+    ['B',p.B+' vol ladder','vol bump',parseBumps(L.vb),'ρ fixed; '+p.X+' vol moves with '+p.B+' vol.']].filter(x=>L.which==='all'||L.which===x[0]);
+  ladders.forEach(([k,title,blab,bumps,note])=>{
+    const rows=ladderRun(bk,k,bumps);
+    h+='<div class="meta" style="margin-top:12px"><b style="color:var(--text-primary)">'+title+'</b> '+note+'</div>';
+    h+='<div class="scroll"><table class="ladder" data-lad="'+k+'"><thead><tr><th></th><th class="grp sep" colspan="'+cols.scen.length+'">Scenario</th>'
+      +(L.view!=='non'?'<th class="grp sep" colspan="'+cols.dep.length+'">Dephased (by USD-leg risk factor)</th>':'')
+      +(L.view!=='dep'?'<th class="grp sep" colspan="'+cols.non.length+'">Non-dephased (by instrument; vega per vol of its own pair)</th>':'')+'</tr><tr><th>'+blab+'</th>'
+      +show.map((x,i)=>'<th class="'+((i===0||x===cols.non[0]||x===cols.dep[0])?'sep':'')+'">'+x[1]+'</th>').join('')+'</tr></thead><tbody>';
+    rows.forEach(r=>{const isB=Math.abs(r.bump)<1e-12;
+      h+='<tr'+(isB?' style="background:rgba(57,135,229,.12)"':'')+' data-bump="'+r.bump+'"><td class="lab">'+(k==='rho'?sgn(r.bump,2):sgn(r.bump,2)+' vol')+(isB?' (now)':'')+'</td>'
+        +show.map((x,i)=>{const val=x[3](r);return '<td class="'+((i===0||x===cols.non[0]||x===cols.dep[0])?'sep ':'')+(x[0]==='pnl'?'hl':'')+'" data-col="'+x[0]+'">'+(x[2]?Number(val).toFixed(x[2]):money(val))+'</td>';}).join('')+'</tr>';});
+    h+='</tbody></table></div>';
+    const opts=[['pnl','P&L (USD)'],['__vegas','Dephased leg vegas (both)']].concat(cols.dep.map(x=>[x[0],x[1]]),cols.non.map(x=>[x[0],x[1]]));
+    const sel=L.chart[k]||'pnl';
+    h+='<div class="meta" style="margin-top:6px">Chart <select data-ladchart="'+k+'">'+opts.map(([v,l])=>'<option value="'+v+'"'+(v===sel?' selected':'')+'>'+l+'</option>').join('')+'</select></div>'
+      +'<div id="chLad_'+k+'" class="chart" style="height:240px"></div>';
+  });
+  h+='<div class="note">Non-dephased: each option\'s Greeks against its own pair (the cross vega is to '+p.X+' vol). Dephased: the cross re-expressed in USD-leg risk factors — '
+    +'vega to '+p.A+' vol = '+p.A+' vega + '+p.X+' vega × ∂σ<sub>X</sub>/∂σ<sub>'+p.A+'</sub>, likewise for '+p.B+', and vega to ρ = '+p.X+' vega × ∂σ<sub>X</sub>/∂ρ; '
+    +'deltas by currency vs USD (in USD); gamma as the 2×2 matrix in ('+bk.base+', '+bk.quote+') vs USD, whose off-diagonal '+bk.base+'×'+bk.quote+' term is the correlation exposure the legs can\'t hedge. '
+    +'Deltas are net of each option\'s inception hedge, so they are 0 at "now" and show vanna along the vol ladders. 1% γ = change in delta (USD) for a 1% move.</div>';
+  el.innerHTML=h;
+  document.querySelectorAll('#ladWhich button').forEach(b=>{b.classList.toggle('on',L.which===b.dataset.v);b.onclick=()=>{L.which=b.dataset.v;save();renderLadder();};});
+  document.querySelectorAll('#ladView button').forEach(b=>{b.classList.toggle('on',L.view===b.dataset.v);b.onclick=()=>{L.view=b.dataset.v;save();renderLadder();};});
+  $('ladRb').onchange=e=>{L.rb=e.target.value;save();renderLadder();};$('ladVb').onchange=e=>{L.vb=e.target.value;save();renderLadder();};
+  document.querySelectorAll('select[data-ladchart]').forEach(s=>s.onchange=()=>{L.chart[s.dataset.ladchart]=s.value;save();drawLadders(bk);});
+  drawLadders(bk);
+}
+function drawLadders(bk){
+  if(typeof Plotly==='undefined')return;const L=ladCfg(),cols=ladCols(bk),all=[].concat(cols.scen,cols.non,cols.dep);
+  [['rho',L.rb],['A',L.vb],['B',L.vb]].forEach(([k,txt])=>{const div=$('chLad_'+k);if(!div)return;
+    const rows=ladderRun(bk,k,parseBumps(txt)),x=rows.map(r=>r.bump),sel=L.chart[k]||'pnl';
+    const lay=baseLayout(sel==='__vegas'?'USD per vol':(all.find(c=>c[0]===sel)||[0,''])[1]);lay.xaxis.title={text:k==='rho'?'ρ bump (as quoted)':'vol bump (vol pts)'};lay.hovermode='x unified';
+    lay.yaxis.zeroline=true;lay.yaxis.zerolinecolor=css('--text-muted');lay.margin.b=44;
+    let tr;
+    if(sel==='__vegas')tr=[{x,y:rows.map(r=>r.deph.vega_A),mode:'lines+markers',name:'Vega to '+bk.pairs.A+' vol',line:{color:css('--s1'),width:2},marker:{size:7}},
+      {x,y:rows.map(r=>r.deph.vega_B),mode:'lines+markers',name:'Vega to '+bk.pairs.B+' vol',line:{color:css('--s2'),width:2},marker:{size:7}}];
+    else{const c=all.find(z=>z[0]===sel)||all.find(z=>z[0]==='pnl');tr=[{x,y:rows.map(c[3]),mode:'lines+markers',name:c[1],line:{color:css('--s1'),width:2},marker:{size:7}}];lay.showlegend=false;}
+    Plotly.react(div,tr,lay,CFG);});
+}
+
+// ===================== CAD crosses tab (server-side password; nothing stored in the browser) =====================
+const CAD={snap:null,st:null,pos:{},tenor:'3M',rho_src:'implied',auto:0,timer:null,poll:null,show:'all'};
+function showTab(t){
+  S.tab=t;save();$('tabMain').style.display=t==='main'?'':'none';$('tabCad').style.display=t==='cad'?'':'none';
+  document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab===t));
+  if(t==='cad')cadEnter();
+}
+async function cadEnter(){
+  let st;try{st=await api('/api/cad/status');}catch(e){$('tabCad').innerHTML='<section class="card"><div class="empty err">'+e.message+'</div></section>';return;}
+  if(!st.authed){cadClear();renderCadLock();return;}
+  CAD.st=st;if(!CAD.snap)await cadLoadSnap();else renderCad();
+  if(!CAD.snap&&!st.building)cadRefresh();else if(st.building)cadPoll();
+}
+function cadClear(){CAD.snap=null;CAD.st=null;CAD.pos={};if(CAD.timer){clearInterval(CAD.timer);CAD.timer=null;}if(CAD.poll){clearInterval(CAD.poll);CAD.poll=null;}CAD.auto=0;}
+function renderCadLock(msg){
+  $('tabCad').innerHTML='<section class="card" style="max-width:420px;margin:40px auto"><h2>CAD crosses 🔒</h2>'
+    +'<div class="meta">This tab is password protected. The password is checked by the server; data is only sent after you unlock.</div>'
+    +'<form id="cadLockForm" style="display:flex;gap:8px;margin-top:8px"><input id="cadPw" type="password" autocomplete="current-password" placeholder="Password" style="flex:1">'
+    +'<button class="act primary" type="submit">Unlock</button></form><div id="cadLockMsg" class="note '+(msg?'err':'')+'">'+(msg||'')+'</div></section>';
+  $('cadPw').focus();
+  $('cadLockForm').onsubmit=async e=>{e.preventDefault();const pw=$('cadPw').value;$('cadPw').value='';$('cadLockMsg').className='note';$('cadLockMsg').textContent='Checking…';
+    try{await api('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});cadEnter();}
+    catch(err){renderCadLock(err.message);}};
+}
+async function cadLock(){try{await api('/api/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}cadClear();renderCadLock('Locked.');}
+async function cadLoadSnap(){
+  try{const r=await api('/api/cad/snapshot');CAD.snap=r.snapshot;CAD.st=r;renderCad();}
+  catch(e){if(/locked/.test(e.message)){cadClear();renderCadLock('Session expired — unlock again.');}else status('CAD board: '+e.message,'err');}
+}
+async function cadRefresh(){
+  try{const r=await api('/api/cad/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rho_src:CAD.rho_src})});CAD.st=r;renderCadStatus();cadPoll();}
+  catch(e){if(/locked/.test(e.message)){cadClear();renderCadLock('Session expired — unlock again.');}else status('CAD refresh: '+e.message,'err');}
+}
+function cadPoll(){if(CAD.poll)return;CAD.poll=setInterval(async()=>{
+  try{const st=await api('/api/cad/status');if(!st.authed){cadClear();renderCadLock('Session expired — unlock again.');return;}
+    CAD.st=st;renderCadStatus();if(!st.building){clearInterval(CAD.poll);CAD.poll=null;await cadLoadSnap();}}catch(e){}},1000);}
+function cadSetAuto(min){CAD.auto=min;if(CAD.timer){clearInterval(CAD.timer);CAD.timer=null;}
+  if(min>0)CAD.timer=setInterval(()=>{if(S.tab==='cad'&&!(CAD.st&&CAD.st.building))cadRefresh();},min*60000);}
+function renderCadStatus(){const el=$('cadStatus');if(!el)return;const st=CAD.st||{},p=st.progress||{};
+  el.innerHTML=(st.building?'<b style="color:var(--warning)">Updating… '+(p.stage||'')+(p.stage==='building surfaces'?' '+p.done+'/'+p.total:'')+'</b> · ':'')
+    +(CAD.snap?'as of '+CAD.snap.asof+' ('+CAD.snap.secs+'s build, ρ '+CAD.snap.rho_src+', data '+CAD.snap.sources.join('/')+')':'no data yet')
+    +(st.error?' · <span class="err">'+st.error+'</span>':'');}
+function cadRow(c,t){return (c.rows||[]).find(r=>r.tenor===t)||null;}
+function renderCad(){
+  const el=$('tabCad'),S_=CAD.snap,fx=(x,d=3)=>x==null||!Number.isFinite(x)?'—':Number(x).toFixed(d);
+  const money=(x)=>{if(x==null||!Number.isFinite(x))return '—';if(Math.abs(x)<0.5)x=0;return (x<0?'−':'')+Math.round(Math.abs(x)).toLocaleString();};
+  const per=10000;
+  let h='<section class="card" id="cadOverview"><h2>CAD crosses — overview <span class="badge info">🔓 unlocked</span><span style="flex:1"></span>'
+    +'<button class="act" id="cadLockBtn" style="padding:3px 9px;font-size:11px">Lock</button></h2>'
+    +'<div class="controls" style="gap:8px 14px;margin-bottom:6px">'
+    +'<div class="f"><label class="f">Correlation</label><div class="seg" id="cadRho"><button data-v="implied">Implied (live mkt)</button><button data-v="realized">Realized</button></div></div>'
+    +'<label class="f">Tenor<select id="cadTenor">'+TENORS.map(t=>'<option'+(t===CAD.tenor?' selected':'')+'>'+t+'</option>').join('')+'</select></label>'
+    +'<button class="act primary" id="cadRefresh">Refresh now</button>'
+    +'<label class="f">Auto-refresh<select id="cadAuto">'+[[0,'Off'],[1,'Every 1 min'],[5,'Every 5 min'],[15,'Every 15 min']].map(([v,l])=>'<option value="'+v+'"'+(v==CAD.auto?' selected':'')+'>'+l+'</option>').join('')+'</select></label>'
+    +'<div class="meta" id="cadStatus" style="margin:14px 0 0"></div></div>';
+  if(!S_){h+='<div class="empty">Building the board… (first build pulls 3y of history per cross for realized ρ; later refreshes reuse it)</div></section>';el.innerHTML=h;cadWire();renderCadStatus();return;}
+  const T=CAD.tenor;
+  h+='<div class="scroll"><table><thead><tr><th></th><th></th><th class="grp sep" colspan="3">ρ (base ccy, quote ccy vs USD)</th><th class="grp sep" colspan="6">'+T+' surface (model)</th><th class="grp sep" colspan="3">Dephased: per '+per.toLocaleString()+' USD/vol of cross vega</th><th class="sep"></th></tr>'
+    +'<tr><th>Cross</th><th>Spot</th><th class="sep">Implied</th><th>Realized</th><th>Used</th><th class="sep">ATM</th><th>mkt ATM</th><th>25 RR</th><th>10 RR</th><th>25 BF</th><th>10 BF</th>'
+    +'<th class="sep">→ other-leg vol</th><th>→ USDCAD vol</th><th>→ ρ (+0.01)</th><th class="sep">Flags</th></tr></thead><tbody>';
+  S_.crosses.forEach(c=>{const r=cadRow(c,T);
+    if(!r||r.error){h+='<tr><td class="lab">'+c.cross+'</td><td colspan="14" class="err" style="text-align:left">'+(c.error||(r&&r.error)||'no data')+'</td></tr>';return;}
+    h+='<tr><td class="lab">'+c.cross+'</td><td>'+fx(c.spot,c.spot>20?3:5)+'</td><td class="sep">'+sgn(r.rho_y_impl,3)+'</td><td>'+sgn(r.rho_y_real,3)+'</td><td class="hl">'+sgn(r.rho_y_used,3)+'</td>'
+      +'<td class="sep hl">'+fx(r.atm)+'</td><td>'+fx(r.mkt.atm)+'</td><td>'+sgn(r.rr25,3)+'</td><td>'+sgn(r.rr10,3)+'</td><td>'+fx(r.bf25)+'</td><td>'+fx(r.bf10)+'</td>'
+      +'<td class="sep">'+money(per*r.d_other)+' <span style="color:var(--text-muted)">'+c.other_leg+'</span></td><td>'+money(per*r.d_cad)+'</td><td>'+money(per*r.d_rho01)+'</td>'
+      +'<td class="sep '+(r.flags.length?'warn':'')+'" style="text-align:left">'+(r.flags.length?'⚠ '+r.flags.join('; '):'✓')+'</td></tr>';});
+  h+='</tbody></table></div><div class="note">ρ is corr(base ccy vs USD, quote ccy vs USD), e.g. for CADJPY corr(CAD, JPY vs USD). Implied comes from the live market cross ATM and the two leg ATMs; '
+    +'with "Implied" the model ATM equals the market ATM by construction. RR/BF are the model (copula RR, vol-of-vol wings, broker flies). '
+    +'Dephased: each '+per.toLocaleString()+' USD/vol of cross vega is equivalent to the shown vega in the other leg\'s vol and in USDCAD vol, plus the shown USD per +0.01 ρ.</div></section>';
+  // book
+  h+='<section class="card" id="cadBook"><h2>CAD book — dephased vega</h2><div class="meta">Enter positions as base-ccy notional of ATM options (positive = bought, negative = sold) and a tenor. '
+    +'Positions stay in this page only (not saved), and are cleared when you lock.</div><div class="scroll"><table><thead><tr><th>Cross</th><th>Notional (base ccy)</th><th>Tenor</th>'
+    +'<th class="sep">Cross vega (non-dephased, USD/vol)</th><th class="sep">→ other-leg vol</th><th>→ USDCAD vol</th><th>→ ρ (+0.01)</th></tr></thead><tbody>';
+  const agg={},rhoAgg={};let sumX=0;
+  S_.crosses.forEach(c=>{const p=CAD.pos[c.cross]||{n:0,t:T},r=cadRow(c,p.t);
+    const V=r&&!r.error?(p.n||0)*r.vega_unit:null;
+    if(V!=null&&V!==0){agg[c.other_leg]=(agg[c.other_leg]||0)+V*r.d_other;agg['USDCAD']=(agg['USDCAD']||0)+V*r.d_cad;rhoAgg[c.cross]=(rhoAgg[c.cross]||0)+V*r.d_rho01;sumX+=V;}
+    h+='<tr><td class="lab">'+c.cross+'</td><td><input class="num wide" style="width:130px" data-cadpos="'+c.cross+'" value="'+(p.n?Math.round(p.n).toLocaleString():'')+'" placeholder="0"> <span style="color:var(--text-muted)">'+c.base+'</span></td>'
+      +'<td><select data-cadten="'+c.cross+'">'+TENORS.map(t=>'<option'+(t===p.t?' selected':'')+'>'+t+'</option>').join('')+'</select></td>'
+      +'<td class="sep">'+money(V)+'</td><td class="sep">'+(V?money(V*r.d_other)+' <span style="color:var(--text-muted)">'+c.other_leg+'</span>':'—')+'</td><td>'+(V?money(V*r.d_cad):'—')+'</td><td>'+(V?money(V*r.d_rho01):'—')+'</td></tr>';});
+  h+='</tbody></table></div>';
+  const legs=['USDCAD'].concat(S_.crosses.map(c=>c.other_leg));
+  h+='<div class="an-top" style="margin-top:10px;align-items:start"><table class="kv"><tr class="h"><td colspan="2">Dephased book vega by risk factor</td></tr>'
+    +legs.map(l=>'<tr><td>'+l+' vol</td><td class="'+(l==='USDCAD'?'hl':'')+'">'+money(agg[l]||0)+' USD/vol</td></tr>').join('')
+    +S_.crosses.map(c=>'<tr><td>ρ('+c.base+', '+c.quote+')</td><td>'+money(rhoAgg[c.cross]||0)+' USD per +0.01</td></tr>').join('')
+    +'</table><table class="kv"><tr class="h"><td colspan="2">For comparison (non-dephased)</td></tr>'
+    +'<tr><td>Sum of cross vegas</td><td>'+money(sumX)+' USD/vol</td></tr>'
+    +'<tr><td colspan="2" style="color:var(--text-muted);white-space:normal">Adding cross vegas across different crosses has no risk meaning (each is to a different vol). Dephased, they land on common factors — USDCAD vol in particular is shared by every cross, so it nets across the book.</td></tr></table></div></section>';
+  // per-cross surfaces
+  h+='<section class="card" id="cadSurf"><h2>CAD crosses — surfaces by tenor</h2><div class="controls" style="margin-bottom:6px"><div class="seg" id="cadShow">'
+    +[['all','All']].concat(S_.crosses.map(c=>[c.cross,c.cross])).map(([v,l])=>'<button data-v="'+v+'">'+l+'</button>').join('')+'</div></div>';
+  S_.crosses.filter(c=>CAD.show==='all'||CAD.show===c.cross).forEach(c=>{
+    h+='<div class="meta" style="margin-top:10px"><b style="color:var(--text-primary)">'+c.cross+'</b> from '+c.legs.join(' & ')+' · spot '+fx(c.spot,c.spot>20?3:5)+' · sources '+c.sources.filter(Boolean).join('/')+'</div>';
+    if(c.error){h+='<div class="empty err">'+c.error+'</div>';return;}
+    h+='<div class="scroll"><table><thead><tr><th>Tenor</th><th class="sep">ρ impl</th><th>ρ real</th><th class="sep">ATM</th><th>25 RR</th><th>10 RR</th><th>25 BF</th><th>10 BF</th>'
+      +'<th class="sep">mkt ATM</th><th>mkt 25 RR</th><th>mkt 25 BF</th><th class="sep">σ '+c.other_leg+'</th><th>σ USDCAD</th>'
+      +'<th class="sep">→ '+c.other_leg+' vol</th><th>→ USDCAD vol</th><th>→ ρ (+0.01)</th></tr></thead><tbody>';
+    c.rows.forEach(r=>{if(r.error){h+='<tr><td class="lab">'+r.tenor+'</td><td colspan="15" class="err" style="text-align:left">'+r.error+'</td></tr>';return;}
+      h+='<tr><td class="lab">'+r.tenor+'</td><td class="sep">'+sgn(r.rho_y_impl,3)+'</td><td>'+sgn(r.rho_y_real,3)+'</td><td class="sep hl">'+fx(r.atm)+'</td><td>'+sgn(r.rr25,3)+'</td><td>'+sgn(r.rr10,3)+'</td><td>'+fx(r.bf25)+'</td><td>'+fx(r.bf10)+'</td>'
+        +'<td class="sep">'+fx(r.mkt.atm)+'</td><td>'+sgn(r.mkt.rr25,3)+'</td><td>'+fx(r.mkt.bf25)+'</td><td class="sep">'+fx(r.sig_other)+'</td><td>'+fx(r.sig_cad)+'</td>'
+        +'<td class="sep">'+money(per*r.d_other)+'</td><td>'+money(per*r.d_cad)+'</td><td>'+money(per*r.d_rho01)+'</td></tr>';});
+    h+='</tbody></table></div>';});
+  h+='<div class="note">Dephased columns are per '+per.toLocaleString()+' USD/vol of cross vega at that tenor (∂σ<sub>X</sub>/∂σ<sub>leg</sub> × 10,000, and ∂σ<sub>X</sub>/∂ρ per +0.01 × 10,000).</div></section>';
+  el.innerHTML=h;cadWire();renderCadStatus();wrapExportButtons();
+}
+function cadWire(){
+  $('cadLockBtn').onclick=cadLock;$('cadRefresh').onclick=cadRefresh;
+  document.querySelectorAll('#cadRho button').forEach(b=>{b.classList.toggle('on',CAD.rho_src===b.dataset.v);b.onclick=()=>{CAD.rho_src=b.dataset.v;document.querySelectorAll('#cadRho button').forEach(x=>x.classList.toggle('on',x===b));cadRefresh();};});
+  $('cadTenor').onchange=e=>{CAD.tenor=e.target.value;renderCad();};
+  $('cadAuto').onchange=e=>cadSetAuto(+e.target.value);
+  document.querySelectorAll('#cadShow button').forEach(b=>{b.classList.toggle('on',CAD.show===b.dataset.v);b.onclick=()=>{CAD.show=b.dataset.v;renderCad();};});
+  document.querySelectorAll('input[data-cadpos]').forEach(i=>i.onchange=()=>{const v=parseCell(i.value),k=i.dataset.cadpos;
+    CAD.pos[k]=Object.assign({t:CAD.tenor},CAD.pos[k]||{},{n:(v==null||Number.isNaN(v))?0:v});renderCad();});
+  document.querySelectorAll('select[data-cadten]').forEach(sl=>sl.onchange=()=>{const k=sl.dataset.cadten;CAD.pos[k]=Object.assign({n:0},CAD.pos[k]||{},{t:sl.value});renderCad();});
+}
+
 async function init(){
   load();
   const st=await api('/api/status').catch(()=>({bbg:false,pairs:['EURUSD','USDCAD'],error:'server unreachable'}));
@@ -2991,6 +3598,8 @@ async function init(){
   $('btnPull').onclick=()=>refreshMarket();
   $('btnCorr').onclick=loadCorr;$('btnBuild').onclick=build;$('btnAll').onclick=loadAll;
   initExportUI();updateAsof();
+  document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
+  if(S.tab==='cad')showTab('cad');
   if(S.legs.A&&S.legs.A.pair===S.pairA)renderLeg('A');else loadLeg('A');
   if(S.legs.B&&S.legs.B.pair===S.pairB)renderLeg('B');else loadLeg('B');
   if(S.corr&&S.corr.vol_vol)renderCorr();else loadCorr();
@@ -3483,6 +4092,93 @@ def selftest():
         check(f'{mode:6} residual daily P&L sd: formula = Monte Carlo', abs(np.std(pn) / hb['resid_sd'] - 1) < 0.02,
               f"(USD {hb['resid_sd']:,.0f} vs {np.std(pn):,.0f}; unhedged {hb['unhedged_sd']:,.0f})")
 
+    print('\n15) Vol / correlation ladders (dephased vs non-dephased, full repricing)')
+    Tl = 0.25
+    bk = ladder_book_setup('EURUSD', 'USDCAD', 1.085, 1.37, 0.07533, 0.05933, -0.39, Tl, 10e6, 'buy', 'corr')
+    n0 = ladder_node(bk, bk['sa0'], bk['sb0'], bk['rq0'])
+    vX = n0['inst']['X']['vega']
+    check('base node: P&L 0; corr hedge flat both leg vols in dephased terms (non-dephased vegas are large)',
+          abs(n0['pnl']) < 1e-9 and abs(n0['deph']['vega_A']) < 1e-6 * abs(vX) and abs(n0['deph']['vega_B']) < 1e-6 * abs(vX),
+          f"(non-dephased X/A/B {vX:,.0f} / {n0['inst']['A']['vega']:,.0f} / {n0['inst']['B']['vega']:,.0f}; "
+          f"dephased A/B {n0['deph']['vega_A']:.1e} / {n0['deph']['vega_B']:.1e}; rho {n0['deph']['vega_rho']:,.0f} per +0.01)")
+    h = 1e-4
+    P = lambda sa_, sb_, rq_: ladder_node(bk, sa_, sb_, rq_)['pnl']
+    fd_rho = (P(bk['sa0'], bk['sb0'], bk['rq0'] + h) - P(bk['sa0'], bk['sb0'], bk['rq0'] - h)) / (2 * h) * 0.01
+    fd_A = (P(bk['sa0'] + h, bk['sb0'], bk['rq0']) - P(bk['sa0'] - h, bk['sb0'], bk['rq0'])) / (2 * h) * 0.01
+    nB = ladder_node(bk, bk['sa0'], bk['sb0'] + 0.01, bk['rq0'])          # off-base node: leg vegas no longer zero
+    fd_B = (P(bk['sa0'], bk['sb0'] + 0.01 + h, bk['rq0']) - P(bk['sa0'], bk['sb0'] + 0.01 - h, bk['rq0'])) / (2 * h) * 0.01
+    check('dephased rho vega = finite difference of repriced P&L', abs(fd_rho - n0['deph']['vega_rho']) < 1e-4 * abs(n0['deph']['vega_rho']),
+          f"({fd_rho:,.2f} vs {n0['deph']['vega_rho']:,.2f} per +0.01)")
+    check('dephased leg vegas = finite differences (cross moving through the triangle)',
+          abs(fd_A - n0['deph']['vega_A']) < 1e-3 * abs(vX) and abs(fd_B - nB['deph']['vega_B']) < 1e-4 * abs(nB['deph']['vega_B']),
+          f"(USDCAD +1 vol node: {fd_B:,.1f} vs {nB['deph']['vega_B']:,.1f})")
+    dA_, dB_, dR_ = 0.001, -0.001, 0.01
+    taylor = n0['deph']['vega_A'] * dA_ * 100 + n0['deph']['vega_B'] * dB_ * 100 + n0['deph']['vega_rho'] * dR_ / 0.01
+    full = P(bk['sa0'] + dA_, bk['sb0'] + dB_, bk['rq0'] + dR_)
+    check('combined small bump: P&L = sum of dephased vegas x bumps (to second order)', abs(full - taylor) < 0.03 * abs(taylor),
+          f'(full {full:,.1f} vs Taylor {taylor:,.1f})')
+
+    def spot_pnl(node_sig, a, b):                        # book P&L under (EUR, CAD) vs USD shocks at fixed vols
+        sig = {'X': node_sig[0], 'A': node_sig[1], 'B': node_sig[2]}
+        tot = 0.0
+        for k, d in bk['inst'].items():
+            r = {'X': a - b, 'A': a, 'B': -b}[k]
+            S1 = d['S'] * math.exp(r)
+            o1 = _atm_opt(S1, d['K'], sig[k], Tl)
+            tot += d['N'] * ((o1['v'] - d['v0']) - d['hedge'] * (S1 - d['S'])) * d['upq']
+        return tot
+    for lab, node in (('base', n0), ('USDCAD +1 vol', nB)):
+        sigs = (node['sx'], node['sa'], node['sb'])
+        e = 1e-4
+        g = lambda a, b: spot_pnl(sigs, a, b)
+        base_p = g(0, 0)
+        dEUR = (g(e, 0) - g(-e, 0)) / (2 * e)
+        dCAD = (g(0, e) - g(0, -e)) / (2 * e)
+        m11 = (g(e, 0) + g(-e, 0) - 2 * base_p) / e ** 2 * 0.01
+        m22 = (g(0, e) + g(0, -e) - 2 * base_p) / e ** 2 * 0.01
+        m12 = (g(e, e) - g(e, -e) - g(-e, e) + g(-e, -e)) / (4 * e * e) * 0.01
+        D = node['deph']
+        scale = abs(node['inst']['X']['g1'])
+        ok = (abs(dEUR - D['delta_base']) < 1e-3 * scale and abs(dCAD - D['delta_quote']) < 1e-3 * scale
+              and abs(m11 - D['g_base']) < 2e-3 * scale and abs(m22 - D['g_quote']) < 2e-3 * scale and abs(m12 - D['g_cross']) < 2e-3 * scale)
+        check(f'dephased delta & gamma matrix = joint spot-shock repricing ({lab})', ok,
+              f"(EUR/CAD delta {D['delta_base']:,.0f}/{D['delta_quote']:,.0f} vs {dEUR:,.0f}/{dCAD:,.0f}; "
+              f"gamma EUR/CAD/cross {D['g_base']:,.0f}/{D['g_quote']:,.0f}/{D['g_cross']:,.0f} vs {m11:,.0f}/{m22:,.0f}/{m12:,.0f})")
+    lr = ladder(bk, 'rho', [-0.2, -0.1, 0, 0.1, 0.2])
+    pn = [x['pnl'] for x in lr]
+    check('long cross gamma: P&L rises monotonically with rho as quoted (= rho_Y falls)', all(x < y for x, y in zip(pn, pn[1:])),
+          f"({[round(x) for x in pn]})")
+    lA = ladder(bk, 'A', [-2, -1, 0, 1, 2])
+    check('leg-vol ladder: dephased EURUSD vega 0 at base, sign flips across it (gamma-of-vega)',
+          lA[0]['deph']['vega_A'] * lA[-1]['deph']['vega_A'] < 0 and abs(lA[2]['deph']['vega_A']) < 1e-6 * abs(vX),
+          f"({[round(x['deph']['vega_A']) for x in lA]})")
+    bk1 = ladder_book_setup('EURUSD', 'USDCAD', 1.085, 1.37, 0.07533, 0.05933, -0.39, Tl, 10e6, 'buy', 'cash')
+    n1 = ladder_node(bk1, bk1['sa0'], bk1['sb0'], bk1['rq0'])
+    check('1:1 hedge leaves dephased leg vega (shown, not hidden)', abs(n1['deph']['vega_A']) > 0.1 * abs(vX),
+          f"(EURUSD-vol {n1['deph']['vega_A']:,.0f}, USDCAD-vol {n1['deph']['vega_B']:,.0f} USD/vol)")
+
+    print('\n16) CAD tab password machinery (throwaway password; the real one is never in the code)')
+    global CAD_TAB_PASSWORD
+    real = CAD_TAB_PASSWORD
+    try:
+        CAD_TAB_PASSWORD = hash_password('test-only-pw', iterations=2000)
+        ok1 = check_password('test-only-pw') and not check_password('test-only-pW') and not check_password('')
+        _AUTH_FAILS.update(n=0, until=0.0)
+        codes = [auth_login('nope')[0] for _ in range(5)]
+        locked = auth_login('test-only-pw')[0]
+        _AUTH_FAILS.update(n=0, until=0.0)
+        code, tok = auth_login('test-only-pw')
+        ok_cookie = auth_ok(f'foo=1; cv_cad={tok}') == tok and auth_ok('cv_cad=forged') is None
+        auth_logout(tok)
+        check('hash verifies only the right password; 5 misses lock out; sessions via cookie; logout revokes',
+              ok1 and codes == [401, 401, 401, 401, 429] and locked == 429 and code == 200 and ok_cookie and auth_ok(f'cv_cad={tok}') is None,
+              f'(miss codes {codes}, during lockout {locked})')
+        check('stored entry is a salted PBKDF2 hash (no plaintext)', set(real) == {'algo', 'iter', 'salt', 'hash'} and len(real['hash']) == 64
+              and real['iter'] >= 300000, f"(iter {real['iter']})")
+    finally:
+        CAD_TAB_PASSWORD = real
+        _AUTH_FAILS.update(n=0, until=0.0)
+
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)
 
@@ -3495,7 +4191,14 @@ def main():
     ap.add_argument('--port', type=int, default=8090)
     ap.add_argument('--no-browser', action='store_true')
     ap.add_argument('--selftest', action='store_true', help='run the numerical checks and exit')
+    ap.add_argument('--hash-password', action='store_true', help='print a CAD_TAB_PASSWORD entry for a new password')
     args = ap.parse_args()
+    if args.hash_password:
+        pw = getpass.getpass('New CAD-tab password: ')
+        if pw != getpass.getpass('Repeat: '):
+            raise SystemExit('Passwords differ')
+        print('CAD_TAB_PASSWORD = ' + repr(hash_password(pw)))
+        return
     if args.selftest:
         raise SystemExit(0 if selftest() else 1)
     srv = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
