@@ -1124,6 +1124,168 @@ def synthetic_history(pair_a, pair_b, tenor, years=3, seed=None):
 
 
 # ======================================================================
+# Confidence band on the model cross vol (correlation uncertainty)
+# ----------------------------------------------------------------------
+# The model's realized rho for a tenor is the trailing W-day estimate. How wrong is it as a forecast
+# of the correlation over the option's life (h days)? Work in Fisher z = atanh(rho), and on history
+# measure e = z(realized over the next h days) - z(trailing W days) for every day.
+# Model those errors as  true correlation = stationary OU latent z (variance V, speed k / bday)  plus
+# estimation noise c/(n-3) on any n-day realized estimate:
+#   Var(e) = c/(W-3) + c/(h-3) + Var(avg_W) + Var(avg_h) - 2 Cov(avg_W, avg_h)        (adjacent windows)
+#   Var(avg_L) = 2V (kL - 1 + e^-kL) / (kL)^2 ;  Cov = V (1-e^-kW)(1-e^-kh) / (k^2 W h)
+# Fitted (c, V, k) across all tenors at once, so long tenors with few independent windows borrow
+# strength from short ones. Two bands:
+#   fair value  = true correlation over the life (drops the c/(h-3) sampling noise of the life window —
+#                 noise no one can forecast and implied vol shouldn't price)
+#   realized    = what the realized correlation number will print (full Var(e)); backtestable.
+# Each rho band maps through sX^2 = sA^2 + sB^2 - 2 rho_Y sA sB with today's leg ATMs.
+# ======================================================================
+CI_HISTORY_YEARS = 10
+CI_LEVELS = {L: float(ndtri(0.5 + L / 2)) for L in (0.68, 0.80, 0.90, 0.95, 0.99)}     # two-sided normal quantiles
+
+
+def _ou_avg_var(L, V, k):
+    x = k * L
+    return V if x < 1e-8 else 2 * V * (x - 1 + math.exp(-x)) / (x * x)
+
+
+def _ou_adj_cov(W, h, V, k):
+    return V if k * max(W, h) < 1e-8 else V * (1 - math.exp(-k * W)) * (1 - math.exp(-k * h)) / (k * k * W * h)
+
+
+def corr_err_var(W, h, c, V, k, part='realized'):
+    """Variance (Fisher z) of trailing-W realized as a forecast of the h-day life. part: 'realized' |
+    'fair' (true correlation over the life: no life-window sampling noise) | 'noise_life'."""
+    drift = _ou_avg_var(W, V, k) + _ou_avg_var(h, V, k) - 2 * _ou_adj_cov(W, h, V, k)
+    est, life = c / max(W - 3, 1), c / max(h - 3, 1)
+    return {'realized': est + life + drift, 'fair': est + drift, 'noise_life': life}[part]
+
+
+def corr_forecast_errors(ra, rb, tenors=None):
+    """ra, rb: aligned daily log returns (any orientation; z errors are taken on rho_Y if ra, rb are
+    the USD-value returns of the two currencies). Per tenor: e = z(next h days) - z(trailing W)."""
+    out = {}
+    for t in tenors or TENORS:
+        W, h = CORR_WINDOW_BDAYS[t], max(TENOR_BDAYS[t], 5)
+        tr = rolling_corr(ra, rb, W)
+        fa = rolling_corr(ra, rb, h)
+        fw = np.full_like(tr, np.nan)
+        if len(tr) > h:
+            fw[:len(tr) - h] = fa[h:]
+        with np.errstate(invalid='ignore'):
+            ok = np.isfinite(tr) & np.isfinite(fw) & (np.abs(tr) < 0.999) & (np.abs(fw) < 0.999)
+        e = np.arctanh(fw[ok]) - np.arctanh(tr[ok])
+        n = len(e)
+        out[t] = {'W': W, 'h': h, 'n': n, 'n_eff': n / max(W, h), 'err': e,
+                  'sd_emp': float(np.std(e, ddof=1)) if n > 2 else None, 'mean_emp': float(e.mean()) if n else None}
+    return out
+
+
+def fit_corr_err_model(errs):
+    """Least squares in log-variance across tenors, weighted by sqrt(independent windows)."""
+    pts = [(v['W'], v['h'], v['sd_emp'] ** 2, v['n_eff']) for v in errs.values() if v['sd_emp'] and v['n_eff'] >= 2]
+    if len(pts) < 3:
+        return None
+
+    def res(p):
+        c, lv, lhl = p
+        V, k = math.exp(lv), math.log(2) / math.exp(lhl)
+        return [math.sqrt(ne) * (math.log(corr_err_var(W, h, c, V, k)) - math.log(v)) for W, h, v, ne in pts]
+    best = None
+    for hl0 in (42, 126, 504):
+        for v0 in (0.005, 0.03):
+            r = least_squares(res, [1.0, math.log(v0), math.log(hl0)],
+                              bounds=([0.5, math.log(1e-6), math.log(10)], [4.0, math.log(2.0), math.log(2520)]))
+            if best is None or r.cost < best.cost:
+                best = r
+    c, lv, lhl = best.x
+    return {'c': float(c), 'V': float(math.exp(lv)), 'half_life_bd': float(math.exp(lhl)),
+            'k': math.log(2) / float(math.exp(lhl)), 'rmse_log_var': float(math.sqrt(np.mean(np.square(best.fun) / [p[3] for p in pts]))),
+            'n_tenors': len(pts)}
+
+
+def corr_band(rho_y_center, sd_z, level):
+    """(lo, hi) of rho_Y for a two-sided band at `level`."""
+    q = CI_LEVELS.get(level) or float(ndtri(0.5 + level / 2))
+    z = math.atanh(max(min(rho_y_center, 0.999), -0.999))
+    return math.tanh(z - q * sd_z), math.tanh(z + q * sd_z)
+
+
+def cross_vol_band(sa, sb, rho_y_center, sd_z, level):
+    """Cross ATM band (lo, mid, hi) from the rho_Y band. sX falls as rho_Y rises, so the vol band's
+    upper edge comes from the rho band's lower edge."""
+    rl, rh = corr_band(rho_y_center, sd_z, level)
+    return triangle_cross(sa, sb, rh), triangle_cross(sa, sb, rho_y_center), triangle_cross(sa, sb, rl)
+
+
+def cross_vol_pct(sa, sb, rho_y_center, sd_z, sx):
+    """Percentile (0-100) of a cross vol in the band's distribution."""
+    ry = implied_rho_y(sa, sb, sx)
+    if not -1 < ry < 1:
+        return 100.0 if ry <= -1 else 0.0
+    z0 = math.atanh(max(min(rho_y_center, 0.999), -0.999))
+    return float(100 * (1 - ndtr((math.atanh(ry) - z0) / sd_z)))
+
+
+def spot_history(a, b, years):
+    """Aligned daily closes of the two legs (spot dates only). BBG, else SYNTHETIC."""
+    if BB.available():
+        try:
+            end = date.today()
+            ta, tb = f'{a} Curncy', f'{b} Curncy'
+            h = BB.hist([ta, tb], 'PX_LAST', end - timedelta(days=int(365.25 * years) + 10), end)
+            dates = sorted(d for d in set(h.get(ta, {})) & set(h.get(tb, {})) if h[ta][d] > 0 and h[tb][d] > 0)
+            if len(dates) < 300:
+                raise RuntimeError(f'only {len(dates)} common spot dates')
+            return (dates, [h[ta][d] for d in dates], [h[tb][d] for d in dates], 'BBG',
+                    f'BDH {dates[0]} -> {dates[-1]}, {len(dates)} spot days')
+        except Exception as e:
+            log(f'BBG spot history {a}/{b} failed: {e}')
+            note = f'Bloomberg history unavailable ({e}); SYNTHETIC data.'
+    else:
+        note = 'SYNTHETIC history (no Bloomberg) — illustrates the tool, not the market.'
+    d, sa_, sb_, *_ = synthetic_history(a, b, '1M', years=years)
+    return d, list(sa_), list(sb_), 'SYNTHETIC', note
+
+
+_CI_CACHE = {}
+
+
+def get_corr_ci(a, b, years=CI_HISTORY_YEARS):
+    """Error model for the confidence band, per tenor. Cached per pair per day (history-only)."""
+    a, b = a.upper(), b.upper()
+    key = (a, b, years, date.today(), BB.available())
+    if key in _CI_CACHE:
+        return _CI_CACHE[key]
+    dates, pa_, pb_, src, note = spot_history(a, b, years)
+    sA, sB = leg_info(a)[1], leg_info(b)[1]
+    ra = sA * np.diff(np.log(np.asarray(pa_, float)))          # USD value of each currency -> rho_Y
+    rb = sB * np.diff(np.log(np.asarray(pb_, float)))
+    errs = corr_forecast_errors(ra, rb)
+    fit = fit_corr_err_model(errs)
+    by = {}
+    for t, v in errs.items():
+        row = {k: v[k] for k in ('W', 'h', 'n', 'n_eff', 'sd_emp', 'mean_emp')}
+        if fit:
+            sr = math.sqrt(corr_err_var(v['W'], v['h'], fit['c'], fit['V'], fit['k'], 'realized'))
+            sf = math.sqrt(corr_err_var(v['W'], v['h'], fit['c'], fit['V'], fit['k'], 'fair'))
+        else:                                                   # too little history: sampling noise only
+            sr = math.sqrt(1 / max(v['W'] - 3, 1) + 1 / max(v['h'] - 3, 1))
+            sf = math.sqrt(1 / max(v['W'] - 3, 1))
+        row.update(sd_realized=sr, sd_fair=sf)
+        e = v['err']
+        row['cover_realized'] = {str(L): float(np.mean(np.abs(e) <= q * sr) * 100) for L, q in CI_LEVELS.items()} if len(e) else None
+        step = max(1, len(e) // 1500)                            # thin the (overlapping) sample for the histogram
+        row['err'] = [round(float(x), 4) for x in e[::step]]
+        by[t] = row
+    out = {'pair_a': a, 'pair_b': b, 'source': src, 'note': note, 'years': years, 'n_obs': len(dates),
+           'from': str(dates[0]), 'to': str(dates[-1]), 'fit': fit, 'by_tenor': by,
+           'levels': [str(L) for L in CI_LEVELS]}
+    _CI_CACHE[key] = out
+    return out
+
+
+# ======================================================================
 # 21-day correlation monitor: rolling implied vs realized, MAs, daily moves, noise, diagnostics
 # ======================================================================
 def sma(x, k):
@@ -1958,8 +2120,7 @@ class CadBoard:
     def _pool_map(self, jobs):
         try:
             if self._pool is None:
-                from concurrent.futures import ProcessPoolExecutor
-                self._pool = ProcessPoolExecutor(max_workers=max(1, min(len(jobs), (os.cpu_count() or 2))))
+                self._pool = shared_pool()
             futs = [self._pool.submit(_cad_build_worker, j) for j in jobs]
             out = []
             for f in futs:
@@ -1969,7 +2130,7 @@ class CadBoard:
             return out
         except Exception as e:                                 # no process pool available: build serially
             log(f'process pool unavailable ({e}); building serially')
-            self._pool = None
+            self._pool = _POOL['ex'] = None
             out = []
             for j in jobs:
                 out.append(_cad_build_worker(j))
@@ -2131,6 +2292,41 @@ def run_build(body):
             'wings': wings}
 
 
+_POOL = {'ex': None}
+
+
+def shared_pool():
+    """One process pool for parallel surface builds (confidence-band builds, CAD board)."""
+    if _POOL['ex'] is None:
+        from concurrent.futures import ProcessPoolExecutor
+        _POOL['ex'] = ProcessPoolExecutor(max_workers=max(2, min(8, os.cpu_count() or 2)))
+    return _POOL['ex']
+
+
+def _band_worker(body):
+    try:
+        res = run_build(body)
+        keep = ('tenor', 'atm', 'rr25', 'rr10', 'bf25b', 'bf10b', 'bf25s', 'bf10s', 'rho_quoted', 'curve')
+        return {'rows': [{k: r[k] for k in keep} for r in res['rows']], 'errors': res['errors']}
+    except Exception as e:
+        return {'fatal': f'{type(e).__name__}: {e}'}
+
+
+def run_build_band(body):
+    """The same build at the band's low / centre / high rho (quoted, per tenor), in parallel."""
+    t0 = time.time()
+    bands = body.pop('rho_bands', {}) or {}
+    names = [k for k in ('lo', 'mid', 'hi') if bands.get(k)]
+    jobs = [dict(body, rho=bands[k]) for k in names]
+    try:
+        out = list(shared_pool().map(_band_worker, jobs))
+    except Exception as e:                                     # no process pool here: serial
+        log(f'process pool unavailable ({e}); band builds run serially')
+        _POOL['ex'] = None
+        out = [_band_worker(j) for j in jobs]
+    return {'builds': dict(zip(names, out)), 'secs': round(time.time() - t0, 2)}
+
+
 # ######################################################################
 #                                 HTTP
 # ######################################################################
@@ -2177,6 +2373,8 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == '/api/corr_monitor':
                 self._send(200, get_corr_monitor(q['a'], q['b'], q.get('tenor', '1M'), int(q.get('window', 21)),
                                                  int(q.get('ma', 5)), float(q.get('years', 1))))
+            elif u.path == '/api/corr_ci':
+                self._send(200, get_corr_ci(q['a'], q['b'], float(q.get('years', CI_HISTORY_YEARS))))
             elif u.path == '/api/corr_history':
                 self._send(200, get_corr_history(q['a'], q['b'], q.get('tenor', '3M'), float(q.get('years', 3))))
             else:
@@ -2209,6 +2407,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 started = CAD_BOARD.start(body.get('rho_src', 'implied'))
                 self._send(200, {'started': started, **CAD_BOARD.status()})
+                return
+            if path == '/api/build_band':
+                self._send(200, run_build_band(body))
                 return
             if path == '/api/build':
                 res = run_build(body)
@@ -2361,8 +2562,9 @@ table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
 <section class="grid2"><div class="card" id="cardA"></div><div class="card" id="cardB"></div></section>
 <section class="card" id="cardC"></section>
 <section class="card" id="results"><h2>Cross surface</h2><div class="empty">Generate to build the cross surface.</div></section>
+<section class="card" id="cardCI"></section>
 <section class="card" id="cardTri"></section>
-<section class="card" id="cardLad"></section>
+<!-- ladder card removed for now; to restore: <section class="card" id="cardLad"></section> (code still below) -->
 <section class="card" id="cardMon"></section>
 <section class="card" id="cardAn"></section>
 </main>
@@ -2374,7 +2576,7 @@ const LS='crossvol_state_v9';
 let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
        legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
 const $=id=>document.getElementById(id);
-function save(){try{localStorage.setItem(LS,JSON.stringify({...S,result:null,hist:null,monData:null}));}catch(e){}}
+function save(){try{localStorage.setItem(LS,JSON.stringify({...S,result:null,hist:null,monData:null,ciData:null,band:null,bandBusy:false,lastBody:null,_ciP:null,_bandP:null}));}catch(e){}}
 function load(){try{const r=localStorage.getItem(LS);if(r)Object.assign(S,JSON.parse(r));}catch(e){}}
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 function status(msg,cls){const el=$('status');el.className='status '+(cls||'');el.textContent=msg||'';}
@@ -2614,7 +2816,7 @@ function renderCorr(){
   el.querySelectorAll('input.ovr').forEach(inp=>inp.onchange=()=>{const v=inp.value.trim();
     S.ov[inp.dataset.kind][inp.dataset.t]=v===''?null:parseFloat(v);save();renderCorr();});
   $('hlOv').onchange=e=>{const v=e.target.value.trim();S.hl_ov=v===''?null:parseFloat(v);save();renderCorr();};
-  renderTri();
+  renderTri();renderCI();
   document.querySelectorAll('#rhoSrc button').forEach(b=>{b.classList.toggle('on',S.rho_src===b.dataset.v);
     b.onclick=()=>{S.rho_src=b.dataset.v;save();renderCorr();};});
   if(S.mkt)el.insertAdjacentHTML('beforeend','<div class="note">Implied ρ backs out the variance formula from the market '+S.mkt.cross
@@ -2642,11 +2844,11 @@ async function build(){
   const body={legA:legBody(S.legs.A),legB:legBody(S.legs.B),rho:pick('rho'),rho_sig:pick('rs'),sig_rho:pick('sr'),rho_half_life:usedHL(),
     usd_rate:parseFloat($('usdRate').value)||0,fly_conv:S.fly_conv,wings:S.wings,atm_anchor:S.atm_anchor,delta_mode:S.delta_mode};
   status('Building '+crossName(S.pairA,S.pairB)+'…');$('btnBuild').disabled=true;
-  try{S.result=await api('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  try{S.result=await api('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});S.lastBody=body;S.resultSig=Date.now();S.band=null;
     const R=S.result;if(!R.rows.find(r=>r.tenor===S.selTenor)&&R.rows.length)S.selTenor=R.rows[Math.min(4,R.rows.length-1)].tenor;
     const ne=Object.keys(R.errors).length;
     status('Built '+R.cross+' — '+R.rows.length+' tenors in '+R.secs+'s'+(ne?' · errors on '+Object.keys(R.errors).join(', '):''),ne?'warn':'');
-    renderResults();}
+    renderResults();S._ciP=ciAfterBuild();}
   catch(e){status('Build failed: '+e.message,'err');}
   $('btnBuild').disabled=false;
 }
@@ -2724,7 +2926,7 @@ function drawSmile(){
   const kp=labs.map(l=>r.pillars[l][0]),pad=0.45*(kp[4]-kp[0]),lo=kp[0]-pad,hi=kp[4]+pad;
   const main=R.wings==='vov'?clip(r.curve,lo,hi):clip(r.curve_cop,lo,hi),alt=R.wings==='vov'?clip(r.curve_cop,lo,hi):clip(r.curve,lo,hi);
   const nMain=R.wings==='vov'?'Vol-of-vol':'Copula',nAlt=R.wings==='vov'?'Gaussian copula':'Vol-of-vol';
-  const tr=[{x:main.K,y:main.V,mode:'lines',name:nMain,line:{color:css('--s1'),width:2},hovertemplate:'K %{x:.5f}<br>%{y:.3f}<extra>'+nMain+'</extra>'},
+  const tr=[...smileBandTraces(r.tenor,main.K),{x:main.K,y:main.V,mode:'lines',name:nMain,line:{color:css('--s1'),width:2},hovertemplate:'K %{x:.5f}<br>%{y:.3f}<extra>'+nMain+'</extra>'},
     {x:alt.K,y:alt.V,mode:'lines',name:nAlt,line:{color:css('--s2'),width:2},hovertemplate:'K %{x:.5f}<br>%{y:.3f}<extra>'+nAlt+'</extra>'},
     {x:kp,y:labs.map(l=>r.pillars[l][1]),mode:'markers+text',text:labs,textposition:'top center',cliponaxis:false,textfont:{color:css('--text-secondary'),size:10},
      name:'Pillars',marker:{color:css('--s1'),size:9,line:{color:css('--surface-1'),width:2}},hovertemplate:'%{text} K %{x:.5f}<br>%{y:.3f}<extra></extra>'},
@@ -3252,8 +3454,8 @@ function loadScriptOnce(name){
     s.onload=()=>res(!!window[name]);s.onerror=()=>{s.remove();res(false);};document.head.appendChild(s);})),Promise.resolve(false));
 }
 function allSectionDefs(){const c=crossNm(),A=S.legs.A,B=S.legs.B;
-  return [['cardA','Leg A'+(A?' — '+A.pair:'')],['cardB','Leg B'+(B?' — '+B.pair:'')],['cardC','Correlation inputs'],['results','Cross surface'],
-    ['cardTri','Triangle & gamma hedge'],['cardLad','Vol & correlation ladders'],['cardMon','Correlation monitor'],['cardAn','Correlation analytics']].map(([id,l])=>({id,label:l,cross:c}))
+  return [['cardA','Leg A'+(A?' — '+A.pair:'')],['cardB','Leg B'+(B?' — '+B.pair:'')],['cardC','Correlation inputs'],['results','Cross surface'],['cardCI','Confidence band & outliers'],
+    ['cardTri','Triangle & gamma hedge'],['cardMon','Correlation monitor'],['cardAn','Correlation analytics']].map(([id,l])=>({id,label:l,cross:c}))
     .concat([['cadOverview','CAD crosses — overview'],['cadBook','CAD book — dephased vega'],['cadSurf','CAD crosses — surfaces']].map(([id,l])=>({id,label:l,cross:'CAD'})));}
 function sectionDefs(){return allSectionDefs().filter(d=>{const e=$(d.id);return e&&e.offsetParent!==null;});}   // sections on the visible tab
 function wrapExportButtons(){
@@ -3270,7 +3472,7 @@ function redrawCharts(){
   try{if(S.monData)drawMon();}catch(e){}
   try{if(S.hist)drawAnCharts();}catch(e){}
   try{if($('chTri'))triUpdate();}catch(e){}
-  try{const bk=ladderBook();if(bk)drawLadders(bk);}catch(e){}
+  try{if(S.ciData)drawCI();}catch(e){}
 }
 function freezeInputs(root){                  // copy live values into attributes so the clone shows them
   root.querySelectorAll('input').forEach(i=>{if(i.type==='checkbox'||i.type==='radio'){if(i.checked)i.setAttribute('checked','');else i.removeAttribute('checked');}
@@ -3366,7 +3568,148 @@ function openExportPanel(){
   $('expGo').onclick=()=>{p.style.display='none';exportSections(cur(),S.expFmt||'pdf',{light:S.expLight});};
 }
 
-// ===================== Vol / correlation ladders (mirrors ladder_book_setup / ladder_node) =====================
+// ===================== Confidence band & outliers (mirrors get_corr_ci / cross_vol_band / cross_vol_pct) =====================
+const CIQ={'0.68':0.9944578832097535,'0.8':1.2815515655446004,'0.9':1.6448536269514722,'0.95':1.959963984540054,'0.99':2.5758293035489004};   // = CI_LEVELS
+const CI_LAB={'0.68':'68%','0.8':'80%','0.9':'90%','0.95':'95%','0.99':'99%'};
+function ciCfg(){S.ci=S.ci||{};const d={level:'0.9',center:'realized',band:'fair',tenor:'3M'};for(const k in d)if(S.ci[k]===undefined)S.ci[k]=d[k];return S.ci;}   // in place: handlers keep a live reference
+function ciKey(){return S.pairA+'|'+S.pairB;}
+async function loadCI(force){const k=ciKey();if(!force&&S.ciData&&S.ciData._k===k&&!S.ciData.error)return S.ciData;
+  try{const d=await api('/api/corr_ci?a='+S.pairA+'&b='+S.pairB);d._k=k;S.ciData=d;}catch(e){S.ciData={error:e.message,_k:k};}
+  return S.ciData;}
+function clampR(y){return Math.max(Math.min(y,0.999),-0.999);}
+function ciRows(){
+  const C=ciCfg(),D=S.ciData;if(!D||D.error||D._k!==ciKey()||!S.legs.A||!S.legs.B)return null;
+  const sg=orient(S.legs.A.pair)*orient(S.legs.B.pair),q=CIQ[C.level],R=S.result&&S.result.cross===crossNm()?S.result:null;
+  return TENORS.map(t=>{const d=D.by_tenor[t],ra=S.legs.A.rows[t],rb=S.legs.B.rows[t];
+    if(!d||!ra||!rb||!(+ra.atm>0)||!(+rb.atm>0))return {tenor:t,skip:'no leg ATMs'};
+    const cq=C.center==='used'?used('rho',t):realized('rho',t);if(cq==null||!isFinite(cq))return {tenor:t,skip:'no ρ for the centre'};
+    const a=+ra.atm,b=+rb.atm,cy=sg*cq,sd=C.band==='fair'?d.sd_fair:d.sd_realized,z0=Math.atanh(clampR(cy));
+    const ylo=Math.tanh(z0-q*sd),yhi=Math.tanh(z0+q*sd),tri=y=>Math.sqrt(Math.max(a*a+b*b-2*y*a*b,0));
+    const r={tenor:t,a,b,sg,cq,cy,sd,z0,ylo,yhi,vlo:tri(yhi),vmid:tri(cy),vhi:tri(ylo),d};
+    const rr=R&&R.rows.find(x=>x.tenor===t);r.model=rr?rr.atm:null;r.res=rr||null;
+    const m=S.mkt&&S.mkt.rows&&S.mkt.rows[t];r.mq=m||{};r.mkt=m&&m.atm!=null&&isFinite(m.atm)?+m.atm:null;
+    if(r.mkt!=null){const ym=(a*a+b*b-r.mkt*r.mkt)/(2*a*b);r.mkt_ry=ym;
+      r.pct=ym<=-1?100:ym>=1?0:100*(1-ncdfJ((Math.atanh(ym)-z0)/sd));
+      if(d.err&&d.err.length&&Math.abs(ym)<1){const zm=Math.atanh(ym);let k=0;d.err.forEach(e=>{if(z0+e>=zm)k++;});r.pct_hist=100*k/d.err.length;}
+      r.out=r.mkt>r.vhi?'above':r.mkt<r.vlo?'below':'';}
+    if(r.model!=null)r.model_pct=(()=>{const ym=(a*a+b*b-r.model*r.model)/(2*a*b);return Math.abs(ym)<1?100*(1-ncdfJ((Math.atanh(ym)-z0)/sd)):null;})();
+    return r;});
+}
+// ---- wing bands: the same build at the band's rho edges (server, parallel) ----
+function bandBody(rows){const B=S.lastBody;if(!B)return null;const lo={},mid={},hi={};
+  rows.forEach(r=>{if(r.skip||!(r.tenor in (B.rho||{})))return;lo[r.tenor]=r.sg*r.yhi;mid[r.tenor]=r.cq;hi[r.tenor]=r.sg*r.ylo;});
+  if(!Object.keys(mid).length)return null;return {...B,rho_bands:{lo,mid,hi}};}
+let _bandTimer=null,_bandSeq=0;
+function bandSig(body){return body?JSON.stringify([body.rho_bands,S.resultSig]):null;}
+function scheduleBand(delay){clearTimeout(_bandTimer);_bandTimer=setTimeout(()=>{S._bandP=computeBand();},delay==null?350:delay);}
+async function computeBand(){
+  const rows=ciRows();if(!rows||!S.result)return;const body=bandBody(rows),sig=bandSig(body);if(!body)return;
+  if(S.band&&S.band.sig===sig&&!S.band.error)return;
+  const seq=++_bandSeq;S.bandBusy=true;renderCIStatus();
+  try{const res=await api('/api/build_band',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(seq!==_bandSeq)return;S.band={sig,...res};}
+  catch(e){if(seq!==_bandSeq)return;S.band={sig,error:e.message};}
+  S.bandBusy=false;renderCI();try{drawSmile();}catch(e){}
+}
+function bandFresh(){const rows=ciRows();if(!rows||!S.band||S.band.error)return null;const sig=bandSig(bandBody(rows));return S.band.sig===sig?S.band:null;}
+function wingBand(t,key){const B=bandFresh();if(!B)return null;const v=[];
+  ['lo','mid','hi'].forEach(n=>{const b=B.builds[n];if(!b||b.fatal)return;const r=b.rows.find(x=>x.tenor===t);if(r&&r[key]!=null&&isFinite(r[key]))v.push(r[key]);});
+  return v.length>=2?[Math.min(...v),Math.max(...v)]:null;}
+async function ciAfterBuild(){await loadCI();renderCI();scheduleBand(0);}
+function renderCIStatus(){const el=$('ciBandSt');if(!el)return;const B=S.band;
+  el.textContent=S.bandBusy?'RR / fly band: building the surface at the band edges…':(B&&B.error?'RR / fly band failed: '+B.error:(bandFresh()?'RR / fly band: 3 builds in '+B.secs+'s':'RR / fly band: pending'));}
+function renderCI(){
+  const el=$('cardCI');if(!el)return;const C=ciCfg(),D=S.ciData,c=crossNm();
+  let h='<h2>Confidence band &amp; outliers — '+c+(D&&D.source?' <span class="badge '+(D.source==='BBG'?'BBG':'PLACEHOLDER')+'">'+D.source+' history</span>':'')
+    +'<span style="flex:1"></span>'
+    +'<div class="seg" id="ciBand" title="Fair value: the true correlation over the option\'s life. Realized: the number the realized correlation will print (adds the window\'s own sampling noise)."><button data-v="fair">Fair value</button><button data-v="realized">Realized outcome</button></div>'
+    +'<div class="seg" id="ciLevel">'+Object.keys(CIQ).map(k=>'<button data-v="'+k+'">'+CI_LAB[k]+'</button>').join('')+'</div>'
+    +'<div class="seg" id="ciCenter" title="Centre the band on the trailing realized ρ (the forecast), or on the ρ the build is using"><button data-v="realized">Centre: realized ρ</button><button data-v="used">Centre: ρ in use</button></div></h2>';
+  if(!D||D._k!==ciKey()){el.innerHTML=h+'<div class="empty">Generate the cross surface to get its confidence band.</div>';wireCI();return;}
+  if(D.error){el.innerHTML=h+'<div class="note err">Band history: '+D.error+'</div>';wireCI();return;}
+  const rows=ciRows();if(!rows){el.innerHTML=h+'<div class="empty">loading…</div>';wireCI();return;}
+  const F=D.fit,bk=!S.result||S.result.fly_conv==='broker';
+  h+='<div class="meta"><span>'+D.note+'</span>'+(F?'<span>error model (all tenors): estimation noise ×'+f(F.c,2)+' · true-ρ vol '+f(Math.sqrt(F.V),3)+' (z) · half-life '+f(F.half_life_bd/252,2)+'y · fit rms '+f(F.rmse_log_var,2)+' (log var)</span>'
+    :'<span class="warn">too little history to fit: sampling noise only</span>')+'<span id="ciBandSt"></span></div>';
+  // outlier summary
+  const outs=[];rows.forEach(r=>{if(r.skip)return;if(r.out)outs.push(r.tenor+' ATM '+(r.out==='above'?'above':'below'));
+    [['rr25','25RR','rr25'],['rr10','10RR','rr10'],['bf25',bk?'25BF':'25BF sm',bk?'bf25b':'bf25s'],['bf10',bk?'10BF':'10BF sm',bk?'bf10b':'bf10s']].forEach(([mk,lab,key])=>{
+      const m=r.mq[mk],w=wingBand(r.tenor,key);if(m!=null&&w&&(m<w[0]||m>w[1]))outs.push(r.tenor+' '+lab+' '+(m>w[1]?'above':'below'));});});
+  const nm=rows.filter(r=>!r.skip&&r.mkt!=null).length,nw=rows.filter(r=>!r.skip&&['rr25','rr10','bf25','bf10'].some(k=>r.mq[k]!=null)).length;
+  h+='<div class="note '+(outs.length?'warn':'')+'" id="ciSummary" style="margin-top:6px">'+(nm?(outs.length?'<b>'+outs.length+' market quote'+(outs.length>1?'s':'')+' outside the '+CI_LAB[C.level]+' band:</b> '+outs.join(' · ')
+    :'All '+nm+' market ATMs'+(bandFresh()&&nw?' and RR / flies':'')+' are inside the '+CI_LAB[C.level]+' band.'+(nw?'':' (no market RR / fly quotes to check)')):'No market cross quotes loaded — band shown for the model only.')+'</div>';
+  const wcell=(r,mk,key)=>{const w=wingBand(r.tenor,key),m=r.mq[mk];const o=m!=null&&w&&(m<w[0]||m>w[1]);
+    return '<td class="sep">'+(w?sgn(w[0],2)+' … '+sgn(w[1],2):(S.bandBusy?'…':'—'))+'</td><td class="'+(o?'err':'')+'"'+(o?' title="outside the band"':'')+'>'+(m==null?'—':sgn(m,2)+(o?' ⚑':''))+'</td>';};
+  h+='<div class="scroll"><table id="ciTable"><thead><tr><th></th><th class="grp sep" colspan="5">ρ_Y over the option\'s life</th><th class="grp sep" colspan="7">ATM vol</th>'
+    +'<th class="grp sep" colspan="2">25 RR</th><th class="grp sep" colspan="2">10 RR</th><th class="grp sep" colspan="2">25 BF '+(bk?'brk':'sm')+'</th><th class="grp sep" colspan="2">10 BF '+(bk?'brk':'sm')+'</th><th class="sep"></th></tr>'
+    +'<tr><th>Tenor</th><th class="sep">Centre</th><th>Band</th><th>sd (z)</th><th title="independent windows in the history">n eff</th><th title="share of history where realized ρ over the life landed inside the REALIZED band at this level">Backtest</th>'
+    +'<th class="sep">Low</th><th>Mid</th><th>High</th><th>Model</th><th>Mkt</th><th title="market ATM percentile in the band distribution">Pct</th><th title="percentile among historical realized outcomes">Hist pct</th>'
+    +'<th class="sep">Band</th><th>Mkt</th>'.repeat(4)+'<th class="sep">Flag</th></tr></thead><tbody>';
+  rows.forEach(r=>{if(r.skip){h+='<tr><td class="lab">'+r.tenor+'</td><td colspan="21" class="sep" style="text-align:left;color:var(--text-muted)">'+r.skip+'</td></tr>';return;}
+    const d=r.d,cov=d.cover_realized&&d.cover_realized[C.level];
+    const flag=r.out?(r.out==='above'?'⚑ mkt rich vs ρ':'⚑ mkt cheap vs ρ'):'';
+    h+='<tr data-t="'+r.tenor+'"><td class="lab">'+r.tenor+'</td><td class="sep">'+sgn(r.cy,3)+'</td><td>'+sgn(r.ylo,2)+' … '+sgn(r.yhi,2)+'</td><td>'+f(r.sd,3)+'</td>'
+      +'<td class="'+(d.n_eff<5?'warn':'')+'" title="'+(d.n_eff<5?'few independent windows: this tenor leans on the fitted model':'')+'">'+f(d.n_eff,1)+'</td><td>'+(cov==null?'—':f(cov,0)+'%')+'</td>'
+      +'<td class="sep">'+f(r.vlo,3)+'</td><td>'+f(r.vmid,3)+'</td><td>'+f(r.vhi,3)+'</td><td class="hl">'+f(r.model,3)+'</td>'
+      +'<td class="'+(r.out?'err':'')+'">'+f(r.mkt,3)+(r.out?' ⚑':'')+'</td><td class="'+(r.out?'err':'')+'">'+(r.pct==null?'—':f(r.pct,0))+'</td><td>'+(r.pct_hist==null?'—':f(r.pct_hist,0))+'</td>'
+      +wcell(r,'rr25','rr25')+wcell(r,'rr10','rr10')+wcell(r,'bf25',bk?'bf25b':'bf25s')+wcell(r,'bf10',bk?'bf10b':'bf10s')
+      +'<td class="sep '+(r.out?'err':'')+'" style="text-align:left">'+flag+'</td></tr>';});
+  h+='</tbody></table></div>';
+  const tOpts=rows.filter(r=>!r.skip).map(r=>'<option'+(r.tenor===C.tenor?' selected':'')+'>'+r.tenor+'</option>').join('');
+  h+='<div class="charts" style="margin-top:12px;grid-template-columns:1fr 1fr">'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">ATM band by tenor</b> ('+CI_LAB[C.level]+', '+(C.band==='fair'?'fair value':'realized outcome')+')</div><div id="chCIFan" class="chart"></div></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Distribution</b> <select id="ciTenor">'+tOpts+'</select> <span id="ciDistTxt"></span></div><div id="chCIDist" class="chart"></div></div></div>';
+  h+='<div class="note">How it works: the build\'s realized ρ is a trailing estimate. On '+(D.years|0)+' years of history the tool measures how far trailing ρ has missed the ρ over the following option life '
+    +'(Fisher z, every tenor), and fits one error model across tenors: estimation noise + a mean-reverting true correlation. Long tenors with few independent windows (n eff &lt; 5) lean on that fit. '
+    +'<b>Fair value</b> = where the true correlation over the life should be; it leaves out the life window\'s own sampling noise, so it is the right yardstick for an implied vol. '
+    +'<b>Realized outcome</b> adds that noise; it is what the realized number will print, and the Backtest column checks that band against history. '
+    +'The ρ band maps through σX² = σA² + σB² − 2ρσAσB with today\'s leg ATMs (higher ρ_Y → lower cross vol). RR / fly bands come from rebuilding the whole surface at the band\'s two ρ edges and its centre. '
+    +'A ⚑ marks a market quote outside the band. ATM above the band means implied ρ is below the forecast range, so the cross is rich vs the legs (long correlation would sell it); below means cheap. '
+    +'Correlation is the only uncertainty in this band; leg vols are taken as given.</div>';
+  el.innerHTML=h;wireCI();renderCIStatus();drawCI();
+  if(S.result&&!bandFresh()&&!S.bandBusy)scheduleBand();
+}
+function wireCI(){const C=ciCfg();
+  [['ciBand','band'],['ciLevel','level'],['ciCenter','center']].forEach(([id,k])=>document.querySelectorAll('#'+id+' button').forEach(b=>{
+    b.classList.toggle('on',C[k]===b.dataset.v);b.onclick=()=>{C[k]=b.dataset.v;save();renderCI();try{drawSmile();}catch(e){}};}));
+  const ts=$('ciTenor');if(ts)ts.onchange=e=>{C.tenor=e.target.value;save();drawCI();};}
+function drawCI(){
+  if(typeof Plotly==='undefined'||!$('chCIFan'))return;const rows=(ciRows()||[]).filter(r=>!r.skip);if(!rows.length)return;
+  const x=rows.map(r=>r.tenor),bad=css('--critical');
+  const fan=[{x,y:rows.map(r=>r.vhi),mode:'lines',line:{width:0},showlegend:false,hoverinfo:'skip'},
+    {x,y:rows.map(r=>r.vlo),mode:'lines',line:{width:0},fill:'tonexty',fillcolor:'rgba(57,135,229,0.18)',name:CI_LAB[ciCfg().level]+' band',hoverinfo:'skip'},
+    {x,y:rows.map(r=>r.vmid),mode:'lines',name:'Band centre',line:{color:css('--s1'),width:1.5,dash:'dash'},hovertemplate:'%{x} centre %{y:.3f}<extra></extra>'},
+    {x,y:rows.map(r=>r.model),mode:'lines+markers',name:'Model',line:{color:css('--s3'),width:2},marker:{size:6},hovertemplate:'%{x} model %{y:.3f}<extra></extra>'},
+    {x:rows.filter(r=>r.mkt!=null).map(r=>r.tenor),y:rows.filter(r=>r.mkt!=null).map(r=>r.mkt),mode:'markers',name:'Market',
+     marker:{size:9,symbol:'diamond',color:rows.filter(r=>r.mkt!=null).map(r=>r.out?bad:css('--s2')),line:{color:css('--surface-1'),width:1}},
+     text:rows.filter(r=>r.mkt!=null).map(r=>'pct '+f(r.pct,0)+(r.out?' · OUTSIDE':'')),hovertemplate:'%{x} mkt %{y:.3f}<br>%{text}<extra></extra>'}];
+  const L=baseLayout('cross ATM vol');L.hovermode='closest';L.xaxis.type='category';L.margin.r=16;
+  Plotly.react('chCIFan',fan,L,CFG);
+  const C=ciCfg(),r=rows.find(q=>q.tenor===C.tenor)||rows[Math.min(4,rows.length-1)];if(!r)return;
+  const {a,b,z0,sd}=r,lo=Math.abs(a-b)+1e-6,hi=a+b-1e-6,span=Math.max(r.vhi-r.vlo,0.2);
+  const s0=Math.max(lo,r.vlo-1.6*span),s1=Math.min(hi,r.vhi+1.6*span),xs=[],ys=[];
+  for(let i=0;i<=240;i++){const s=s0+(s1-s0)*i/240,rho=(a*a+b*b-s*s)/(2*a*b);if(Math.abs(rho)>=1)continue;
+    const z=Math.atanh(rho),dz=s/(a*b)/(1-rho*rho),u=(z-z0)/sd;xs.push(s);ys.push(Math.exp(-0.5*u*u)/Math.sqrt(2*Math.PI)/sd*dz);}
+  const hv=(r.d.err||[]).map(e=>{const y=Math.tanh(z0+e);return Math.sqrt(Math.max(a*a+b*b-2*y*a*b,0));}).filter(v=>v>=s0&&v<=s1);
+  const tr=[{x:hv,type:'histogram',histnorm:'probability density',nbinsx:40,name:'History: realized outcomes',marker:{color:css('--ref'),opacity:0.35},hovertemplate:'%{x}<extra>history</extra>'},
+    {x:xs,y:ys,mode:'lines',name:C.band==='fair'?'Fair-value density':'Realized-outcome density',line:{color:css('--s1'),width:2},hovertemplate:'%{x:.3f}<extra></extra>'}];
+  const vline=(v,col,dash,w)=>({type:'line',x0:v,x1:v,yref:'paper',y0:0,y1:1,line:{color:col,width:w||1.5,dash:dash||'solid'}});
+  const L2=baseLayout('density');L2.hovermode='closest';L2.xaxis.title={text:r.tenor+' cross ATM vol'};L2.margin.r=16;L2.barmode='overlay';
+  L2.shapes=[vline(r.vlo,css('--s1'),'dot'),vline(r.vhi,css('--s1'),'dot')];L2.annotations=[];
+  const ann=(v,txt,col,y)=>L2.annotations.push({x:v,y:y,yref:'paper',text:txt,showarrow:false,font:{color:col,size:10},xanchor:'left',xshift:3});
+  if(r.model!=null){L2.shapes.push(vline(r.model,css('--s3'),'solid',2));ann(r.model,'model',css('--s3'),0.98);}
+  if(r.mkt!=null){const col=r.out?bad:css('--s2');L2.shapes.push(vline(r.mkt,col,'solid',2));ann(r.mkt,'mkt '+f(r.pct,0)+'th pct',col,0.9);}
+  Plotly.react('chCIDist',tr,L2,CFG);
+  const t=$('ciDistTxt');if(t)t.textContent='band '+f(r.vlo,3)+' – '+f(r.vhi,3)+(r.mkt!=null?' · mkt '+f(r.mkt,3)+' at the '+f(r.pct,0)+'th pct'+(r.pct_hist!=null?' ('+f(r.pct_hist,0)+'th of history)':''):'');
+}
+function interp(xs,ys,x){if(x<=xs[0])return ys[0];if(x>=xs[xs.length-1])return ys[ys.length-1];let i=1;while(xs[i]<x)i++;const w=(x-xs[i-1])/(xs[i]-xs[i-1]);return ys[i-1]+w*(ys[i]-ys[i-1]);}
+function smileBandTraces(t,K){const B=bandFresh();if(!B)return [];const cs=['lo','mid','hi'].map(n=>B.builds[n]).filter(b=>b&&!b.fatal)
+    .map(b=>b.rows.find(x=>x.tenor===t)).filter(Boolean).map(r=>{const k=[],v=[];r.curve.K.forEach((kk,i)=>{if(r.curve.vol[i]!=null){k.push(kk);v.push(r.curve.vol[i]);}});return {k,v};}).filter(c=>c.k.length>2);
+  if(cs.length<2)return [];const up=K.map(x=>Math.max(...cs.map(c=>interp(c.k,c.v,x)))),dn=K.map(x=>Math.min(...cs.map(c=>interp(c.k,c.v,x))));
+  return [{x:K,y:up,mode:'lines',line:{width:0},showlegend:false,hoverinfo:'skip'},
+    {x:K,y:dn,mode:'lines',line:{width:0},fill:'tonexty',fillcolor:'rgba(57,135,229,0.16)',name:CI_LAB[ciCfg().level]+' ρ band',hoverinfo:'skip'}];}
+
+// ===================== Vol / correlation ladders (mirrors ladder_book_setup / ladder_node) — card currently not on the page =====================
 function ncdfJ(x){                       // double-precision normal CDF: series for |x|<5, continued fraction beyond
   if(x<-5||x>5){const t=Math.abs(x);let f=0;for(let k=60;k>=1;k--)f=k/(t+f);const tail=npdfJ(t)/(t+f);return x>0?1-tail:tail;}
   let term=x,sum=x;for(let k=1;k<200;k++){term*=x*x/(2*k+1);sum+=term;if(Math.abs(term)<1e-17*Math.abs(sum))break;}
@@ -3603,7 +3946,7 @@ async function init(){
   if(S.legs.A&&S.legs.A.pair===S.pairA)renderLeg('A');else loadLeg('A');
   if(S.legs.B&&S.legs.B.pair===S.pairB)renderLeg('B');else loadLeg('B');
   if(S.corr&&S.corr.vol_vol)renderCorr();else loadCorr();
-  loadMkt();renderMonitor();renderAnalytics();renderTri();
+  loadMkt();renderMonitor();renderAnalytics();renderTri();renderCI();
 }
 init();
 </script></body></html>"""
@@ -4178,6 +4521,57 @@ def selftest():
     finally:
         CAD_TAB_PASSWORD = real
         _AUTH_FAILS.update(n=0, until=0.0)
+
+    print('\n17) Confidence band (correlation forecast error model, known-truth simulation, band builds)')
+    V0, k0 = 0.03, math.log(2) / 126
+    worst = 0
+    for L in (21, 63, 252):
+        i = np.arange(L)
+        K = V0 * np.exp(-k0 * np.abs(i[:, None] - i[None, :]))
+        worst = max(worst, abs(K.mean() / _ou_avg_var(L, V0, k0) - 1))
+        j = np.arange(L, 2 * L)
+        worst = max(worst, abs((V0 * np.exp(-k0 * np.abs(i[:, None] - j[None, :]))).mean() / _ou_adj_cov(L, L, V0, k0) - 1))
+    check('OU window-average variance / adjacent covariance = discrete double sums', worst < 0.02, f'(worst rel {worst:.1e})')
+    rng = np.random.default_rng(11)
+    N, kz, Vz, mu = 252 * 30, math.log(2) / 126, 0.12 ** 2, math.atanh(0.4)
+    z = np.empty(N)
+    z[0] = mu
+    eps = math.sqrt(2 * kz * Vz) * rng.standard_normal(N)
+    for i in range(1, N):
+        z[i] = z[i - 1] + kz * (mu - z[i - 1]) + eps[i]
+    rr = np.tanh(z)
+    g1, g2 = rng.standard_normal(N), rng.standard_normal(N)
+    ra_, rb_ = 0.006 * g1, 0.006 * (rr * g1 + np.sqrt(1 - rr ** 2) * g2)
+    E = corr_forecast_errors(ra_, rb_)
+    fit = fit_corr_err_model(E)
+    check('fit recovers the true correlation process (half-life only loosely identified)', abs(math.sqrt(fit['V']) / 0.12 - 1) < 0.3 and 50 < fit['half_life_bd'] < 320,
+          f"(true-rho vol {math.sqrt(fit['V']):.3f} vs 0.120, half-life {fit['half_life_bd']:.0f} vs 126 bd, noise x{fit['c']:.2f})")
+    cz = np.concatenate([[0], np.cumsum(z)])
+    covs, bt = [], []
+    for t in ('3M', '6M', '1Y'):
+        W, h = CORR_WINDOW_BDAYS[t], TENOR_BDAYS[t]
+        tr = rolling_corr(ra_, rb_, W)
+        ii = np.arange(W, N - h)
+        e = (cz[ii + h] - cz[ii]) / h - np.arctanh(tr[ii])
+        covs.append(float(np.mean(np.abs(e) <= 1.644854 * math.sqrt(corr_err_var(W, h, fit['c'], fit['V'], fit['k'], 'fair')))) * 100)
+        bt.append(float(np.mean(np.abs(E[t]['err']) <= 1.644854 * math.sqrt(corr_err_var(W, h, fit['c'], fit['V'], fit['k'], 'realized')))) * 100)
+    check('90% fair-value band covers the TRUE life correlation ~90% (3M, 6M, 1Y)', all(84 <= c_ <= 96 for c_ in covs), '(' + ', '.join(f'{c_:.1f}%' for c_ in covs) + ')')
+    check('90% realized band covers realized outcomes ~90% (backtest)', all(84 <= c_ <= 96 for c_ in bt), '(' + ', '.join(f'{c_:.1f}%' for c_ in bt) + ')')
+    sa_, sb_, cy, sdz = 7.5, 5.9, 0.45, 0.18
+    lo, mid, hi = cross_vol_band(sa_, sb_, cy, sdz, 0.90)
+    check('band maps through the triangle: edges at the 5th / 50th / 95th percentile',
+          lo < mid < hi and abs(cross_vol_pct(sa_, sb_, cy, sdz, hi) - 95) < 1e-9 and abs(cross_vol_pct(sa_, sb_, cy, sdz, lo) - 5) < 1e-9
+          and abs(cross_vol_pct(sa_, sb_, cy, sdz, mid) - 50) < 1e-9 and all(abs(v - float(ndtri(0.5 + L / 2))) < 1e-15 for L, v in CI_LEVELS.items()), f'({lo:.3f} / {mid:.3f} / {hi:.3f})')
+    La, Lb = placeholder_surface('EURUSD'), placeholder_surface('USDCAD')
+    ry_lo, ry_hi = corr_band(cy, sdz, 0.90)
+    body = {'legA': La, 'legB': Lb, 'rho_sig': {'3M': 0.6}, 'sig_rho': {'3M': 0.2}, 'rho_half_life': 0.5,
+            'rho_bands': {'lo': {'3M': -ry_hi}, 'mid': {'3M': -cy}, 'hi': {'3M': -ry_lo}}}
+    B = run_build_band(body)
+    a3, b3 = La['rows']['3M']['atm'], Lb['rows']['3M']['atm']
+    got = [B['builds'][n]['rows'][0]['atm'] for n in ('lo', 'mid', 'hi')]
+    want = cross_vol_band(a3, b3, cy, sdz, 0.90)
+    check('band builds (parallel): ATM of each rebuilt surface = analytic band edge',
+          max(abs(g - w_) for g, w_ in zip(got, want)) < 1e-3, f"({', '.join(f'{g:.4f}' for g in got)} in {B['secs']}s)")
 
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)
