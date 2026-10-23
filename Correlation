@@ -1721,6 +1721,9 @@ class BBG:
                 if m == 'store':
                     STORE.want(e)
                     raise
+                miss = [t for t, _ in e.refs]                       # prefer_store: pull only what's missing
+                STORE.put_ref(miss, fields, self._ref_live(miss, fields))
+                return STORE.get_ref(tickers, fields)
         out = self._ref_live(tickers, fields)
         STORE.put_ref(tickers, fields, out)
         return out
@@ -1734,6 +1737,9 @@ class BBG:
                 if m == 'store':
                     STORE.want(e)
                     raise
+                miss = [h[0] for h in e.hists]
+                STORE.put_hist(miss, field, start, end, self._hist_live(miss, field, start, end))
+                return STORE.get_hist(tickers, field, start, end)
         out = self._hist_live(tickers, field, start, end)
         STORE.put_hist(tickers, field, start, end, out)
         return out
@@ -1787,6 +1793,7 @@ class MarketStore:
         self.hist = {}           # (ticker, field) -> {'s': {date: value}, 'start': date, 'end': date}
         self.wanted_ref, self.wanted_hist, self.wanted_combos = {}, {}, set()
         self.site_combos = set()      # every (leg A, leg B) anyone has looked at: kept complete by the refresh
+        self.complete = set()         # bundles fully loaded once; later refreshes only top them up
         self.wanted_cad = False
         self.version, self.updated, self.last_put = 0, None, 0.0
 
@@ -1801,7 +1808,7 @@ class MarketStore:
             for tk in tickers:                                   # remember "asked, nothing there" too
                 e = self.ref.setdefault(tk, {'asked': set(), 'vals': {}})
                 e['asked'] |= set(fields)
-                e['ts'] = ts
+                e['ts'], e['t'] = ts, time.time()
                 for f in fields:
                     if f in (out.get(tk) or {}):
                         e['vals'][f] = out[tk][f]
@@ -1830,6 +1837,7 @@ class MarketStore:
             for tk in tickers:
                 e = self.hist.setdefault((tk, field), {'s': {}, 'start': start, 'end': end})
                 e['s'].update(out.get(tk) or {})
+                e['t'] = time.time()
                 e['start'], e['end'] = min(e['start'], start), max(e['end'], end)
                 w = self.wanted_hist.get((tk, field))
                 if w is not None and e['start'] <= w:
@@ -1860,12 +1868,17 @@ class MarketStore:
         with self.lock:
             self.site_combos.add((a, b))
 
-    def snapshot_keys(self):
+    def snapshot_keys(self, recheck_empty_secs=20 * 3600):
+        """What a refresh should re-pull. Tickers that came back empty (wrong-way crosses, exotic
+        tenors that don't exist) are re-checked at most once a day instead of every refresh."""
+        now = time.time()
         with self.lock:
-            refs = {tk: set(e['asked']) for tk, e in self.ref.items()}
+            refs = {tk: set(e['asked']) for tk, e in self.ref.items()
+                    if e['vals'] or now - e.get('t', 0) > recheck_empty_secs}
             for tk, f in self.wanted_ref.items():
                 refs[tk] = refs.get(tk, set()) | f
-            hists = {k: (e['start'], e['end']) for k, e in self.hist.items()}
+            hists = {k: (e['start'], e['end']) for k, e in self.hist.items()
+                     if e['s'] or now - e.get('t', 0) > recheck_empty_secs}
             for k, st in self.wanted_hist.items():
                 hists[k] = (min(st, hists[k][0]), None) if k in hists else (st, None)
             combos, cad = set(self.wanted_combos) | set(self.site_combos), self.wanted_cad
@@ -2474,8 +2487,42 @@ class CadBoard:
 CAD_BOARD = CadBoard()
 
 
-# ---------- shared refresh (hourly by default) ----------
-REFRESH = {'mins': 180, 'window': (6 * 60, 20 * 60), 'weekdays_only': True, 'next': None, 'next_dt': None,
+# ---------- shared universe: what the site keeps loaded for everyone ----------
+# 'default' = every leg surface + the crosses below; 'all' = every combination of the legs (120 crosses:
+# check your Bloomberg data limits first); 'used' = only what someone has opened; or a custom list.
+DEFAULT_UNIVERSE_CROSSES = [
+    'EURGBP', 'EURAUD', 'EURNZD', 'EURCAD', 'EURJPY', 'EURCHF', 'GBPAUD', 'GBPNZD', 'GBPCAD', 'GBPJPY', 'GBPCHF',
+    'AUDNZD', 'AUDCAD', 'AUDJPY', 'AUDCHF', 'NZDCAD', 'NZDJPY', 'NZDCHF', 'CADJPY', 'CADCHF', 'CHFJPY',
+    'EURSEK', 'EURNOK', 'NOKSEK', 'EURMXN', 'CADMXN', 'MXNJPY', 'EURZAR', 'ZARJPY', 'EURILS']
+UNIVERSE = {'mode': 'used', 'crosses': list(DEFAULT_UNIVERSE_CROSSES)}
+
+
+def leg_for_ccy(ccy):
+    return next((p for p in LEG_PAIRS if leg_info(p)[0] == ccy), None)
+
+
+def cross_to_legs(cross):
+    """'EURJPY' -> ('EURUSD', 'USDJPY'); None if a currency has no USD leg here."""
+    cross = cross.strip().upper()
+    if len(cross) != 6:
+        return None
+    a, b = leg_for_ccy(cross[:3]), leg_for_ccy(cross[3:])
+    return (a, b) if a and b and a != b else None
+
+
+def universe_combos():
+    if UNIVERSE['mode'] == 'used':
+        return set()
+    out = {(p, None) for p in LEG_PAIRS}
+    if UNIVERSE['mode'] == 'all':
+        out |= {(LEG_PAIRS[i], LEG_PAIRS[j]) for i in range(len(LEG_PAIRS)) for j in range(i + 1, len(LEG_PAIRS))}
+    else:
+        out |= {cross_to_legs(c) for c in UNIVERSE['crosses'] if cross_to_legs(c)}
+    return out
+
+
+# ---------- shared refresh (every 3 hours by default) ----------
+REFRESH = {'mins': 180, 'window': (6 * 60, 20 * 60), 'weekdays_only': True, 'next': None, 'next_dt': None, 'progress': '',
            'running': False, 'last': None, 'last_secs': None, 'last_error': '', 'last_counts': '',
            'lock': threading.Lock()}
 
@@ -2502,13 +2549,19 @@ def _fmt_next(dt):
 
 
 def prefetch_combo(a, b):
-    """Everything the main tab needs for a pair of legs, pulled live into the store."""
-    for fn, args in ((get_surface, (a,)), (get_surface, (b,)), (get_cross_market, (a, b)), (get_corr, (a, b)),
-                     (get_corr_ci, (a, b)), (get_corr_monitor, (a, b)), (get_corr_history, (a, b, '3M', 3))):
+    """Everything the main tab needs for a pair of legs (default settings) into the store.
+    Run in prefer_store mode: only pieces the store doesn't have are pulled. True if all went through."""
+    jobs = [(get_surface, (a,))] if b is None else [
+        (get_surface, (a,)), (get_surface, (b,)), (get_cross_market, (a, b)), (get_corr, (a, b)),
+        (get_corr_ci, (a, b)), (get_corr_monitor, (a, b)), (get_corr_history, (a, b, '3M', 3))]
+    ok = True
+    for fn, args in jobs:
         try:
             fn(*args)
         except Exception as e:
+            ok = False
             log(f'prefetch {fn.__name__}{args} failed: {e}')
+    return ok
 
 
 def refresh_shared(reason='scheduled'):
@@ -2537,17 +2590,20 @@ def refresh_shared(reason='scheduled'):
             for (f, s0), tks in hg.items():
                 for i in range(0, len(tks), 50):
                     BB.hist(tks[i:i + 50], f, s0, today)
-        # every pair in use gets its complete bundle (surface, band, monitor, analytics at the default
-        # settings): already-stored pieces were just topped up above, so only gaps are pulled here
+        # the universe + every pair in use gets its complete bundle (surface, band, monitor, analytics at the
+        # default settings). Bundles loaded before were just topped up above and are skipped here.
+        targets = combos | universe_combos()
+        with STORE.lock:
+            todo = sorted(targets - STORE.complete, key=lambda c: (c[1] is not None, str(c)))
+        n_new = 0
         with data_mode_ctx('prefer_store'):
-            for a, b in sorted(combos, key=str):
-                if b is None:
-                    try:
-                        get_surface(a)
-                    except Exception as e:
-                        log(f'prefetch {a} failed: {e}')
-                else:
-                    prefetch_combo(a, b)
+            for i, (a, b) in enumerate(todo):
+                REFRESH['progress'] = f'{i + 1}/{len(todo)}'
+                if prefetch_combo(a, b):
+                    n_new += 1
+                    with STORE.lock:
+                        STORE.complete.add((a, b))
+        REFRESH['progress'] = ''
         with STORE.lock:
             STORE.wanted_combos -= combos
         _CI_CACHE.clear()
@@ -2557,7 +2613,8 @@ def refresh_shared(reason='scheduled'):
             CAD_BOARD.start(sorted(srcs), mode='live', wait=True)
             with STORE.lock:
                 STORE.wanted_cad = False
-        counts = (f'{len(refs)} quote tickers, {len(hists)} histories' + (f', {len(combos)} pair bundles checked' if combos else '')
+        counts = (f'{len(refs)} quote tickers, {len(hists)} histories topped up' + (f', {n_new} new pair bundles loaded' if n_new else '')
+                  + f', {len(targets)} pairs/legs kept loaded'
                   + (f', CAD board ({"/".join(sorted(srcs))})' if srcs else ''))
         log(f'shared refresh ({reason}): {counts} in {time.time() - t0:.1f}s')
     except Exception as e:
@@ -2571,7 +2628,8 @@ def refresh_shared(reason='scheduled'):
 
 
 def refresh_info():
-    out = {k: REFRESH[k] for k in ('mins', 'next', 'running', 'last', 'last_secs', 'last_error', 'last_counts')}
+    out = {k: REFRESH[k] for k in ('mins', 'next', 'running', 'last', 'last_secs', 'last_error', 'last_counts', 'progress')}
+    out['universe'] = UNIVERSE['mode'] if UNIVERSE['mode'] in ('used', 'all') else f"{len(universe_combos()) - len(LEG_PAIRS)} crosses + {len(LEG_PAIRS)} legs"
     w = REFRESH['window']
     out['window'] = None if w is None else '%02d:%02d-%02d:%02d' % (w[0] // 60, w[0] % 60, w[1] // 60, w[1] % 60)
     out['weekdays_only'] = REFRESH['weekdays_only']
@@ -2712,6 +2770,9 @@ def viewer_may_pull():
     return VIEWERS_CAN_PULL or not BB.available()
 
 
+_RESULTS, _BUILDS, _RESULT_LOCK = __import__('collections').OrderedDict(), __import__('collections').OrderedDict(), threading.Lock()
+
+
 def serve_data(role, name, fn, *args, prefer_store=False):
     """Run a data function in the caller's data mode. Viewers: shared store only (no Bloomberg).
     You: live, or store-first for your page's automatic reloads."""
@@ -2723,9 +2784,21 @@ def serve_data(role, name, fn, *args, prefer_store=False):
         STORE.note_combo(args[0], None)
     elif len(args) >= 2:
         STORE.note_combo(args[0], args[1])
+    key = (name, args, STORE.version)
+    if mode != 'live':                       # results from the shared data are the same for everyone until it changes
+        with _RESULT_LOCK:
+            if key in _RESULTS:
+                _RESULTS.move_to_end(key)
+                return 200, _RESULTS[key]
     try:
         with data_mode_ctx(mode):
-            return 200, fn(*args)
+            out = fn(*args)
+        if mode != 'live' and STORE.version == key[2]:
+            with _RESULT_LOCK:
+                _RESULTS[key] = out
+                while len(_RESULTS) > 400:
+                    _RESULTS.popitem(last=False)
+        return 200, out
     except NotInStore as e:
         STORE.want_combo(args[0], None if name == 'surface' else args[1])
         what = args[0] if name == 'surface' else f'{args[0]}/{args[1]} {name.replace("_", " ")}' + (f' {args[2]}' if len(args) > 2 and isinstance(args[2], str) else '')
@@ -2925,6 +2998,21 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, out, headers={'X-Data-Version': str(STORE.version)} if (role == 'host' and not pref) else None)
 
     def _build(self, fn, body):
+        # builds are pure functions of their inputs: identical requests (same marks, same rho) share one result
+        key = (fn.__name__, hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest())
+        with _RESULT_LOCK:
+            if key in _BUILDS:
+                _BUILDS.move_to_end(key)
+                return _BUILDS[key]
+        res = self._build_run(fn, body)
+        if res is not None:
+            with _RESULT_LOCK:
+                _BUILDS[key] = res
+                while len(_BUILDS) > 120:
+                    _BUILDS.popitem(last=False)
+        return res
+
+    def _build_run(self, fn, body):
         if not BUILD_SLOTS.acquire(timeout=90):
             self._send(503, {'error': 'server busy building other surfaces — try again in a moment'})
             return
@@ -4379,9 +4467,9 @@ const SHARED_POLL_MS=60000;
 function renderShared(sh){const t=$('sharedTag'),b=$('btnShared');if(!t||!sh)return;const r=sh.refresh||{};
   if(!S.bbgUp){t.style.display='none';b.style.display='none';return;}       // Bloomberg offline: nothing to share
   t.style.display='';
-  t.textContent=(r.running?'Refreshing shared data…':(sh.updated?'Shared data '+sh.updated.slice(11,16):'Shared data: none yet'))+(r.mins?' · next '+(r.next||'—'):' · auto-refresh off');
+  t.textContent=(r.running?'Refreshing shared data…'+(r.progress?' '+r.progress:''):(sh.updated?'Shared data '+sh.updated.slice(11,16):'Shared data: none yet'))+(r.mins?' · next '+(r.next||'—'):' · auto-refresh off');
   t.title=(r.last?'Last refresh '+r.last+' ('+r.last_secs+'s): '+(r.last_error||r.last_counts):'No scheduled refresh yet')
-    +(sh.n_wanted?' · '+sh.n_wanted+' item(s) queued for the next refresh':'')+(r.mins?' · every '+r.mins+' min'+(r.window?' '+r.window:'')+(r.weekdays_only?' weekdays':''):'');
+    +(sh.n_wanted?' · '+sh.n_wanted+' item(s) queued for the next refresh':'')+(r.universe?' · keeps loaded: '+r.universe:'')+(r.mins?' · every '+r.mins+' min'+(r.window?' '+r.window:'')+(r.weekdays_only?' weekdays':''):'');
   if(S.role==='host'){b.style.display='';b.disabled=!!r.running;b.textContent=r.running?'Refreshing…':'Refresh now';}}
 let _autoBusy=false,_syncAgain=null,_syncDone=Promise.resolve();
 async function pollShared(){let st;try{st=await api('/api/status');}catch(e){return;}
@@ -5358,12 +5446,20 @@ def selftest():
         with data_mode_ctx('store'):
             ok_after = len(BB.hist(['H1'], 'PX_LAST', d0 - timedelta(days=30), d1)['H1']) == 71
         check('refresh: re-pulls every stored quote, the queued longer history, and queued pair bundles; then serves it',
-              ('ref', ('A1', 'B1')) in new and d0 - timedelta(days=30) in hist_starts and ('combo', 'ZZZUSD') in new and ok_after
+              ('ref', ('A1',)) in new and d0 - timedelta(days=30) in hist_starts and ('combo', 'ZZZUSD') in new and ok_after
               and not STORE.wanted_hist and not STORE.wanted_combos and REFRESH['last_error'] == '', f"({REFRESH['last_counts']})")
         n_c = len(calls)
         refresh_shared('selftest')
         inc = [c_[1] for c_ in calls[n_c:] if c_[0] == 'hist']
         check('refresh tops up history incrementally (last 10 days, not the whole range)', inc and min(inc) >= d1 - timedelta(days=10), f'(from {min(inc) if inc else None})')
+        n_c = len(calls)
+        with data_mode_ctx('prefer_store'):
+            BB.ref(['A1', 'A9', 'B1'], ['PX_MID'])                  # A1, B1 stored; A9 new
+        check('store-first requests pull only the missing tickers', calls[n_c:] == [('ref', ('A9',))], str(calls[n_c:]))
+        refs_now, _, _, _ = STORE.snapshot_keys()
+        STORE.ref['B1']['t'] -= 86400
+        refs_day, _, _, _ = STORE.snapshot_keys()
+        check('tickers that came back empty are re-checked once a day, not every refresh', 'B1' not in refs_now and 'A1' in refs_now and 'B1' in refs_day)
         STORE.__init__()
         globals()['VIEWERS_CAN_PULL'] = False
         n_c = len(calls)
@@ -5374,6 +5470,23 @@ def selftest():
         BB.available, BBG._ref_live, BBG._hist_live = real[:3]
         globals()['VIEWERS_CAN_PULL'] = real[3]
         STORE.__init__()
+    real_u = dict(UNIVERSE)
+    try:
+        UNIVERSE['mode'] = 'default'
+        ud = universe_combos()
+        UNIVERSE['mode'] = 'all'
+        ua = universe_combos()
+        UNIVERSE.update(mode='custom', crosses=['EURJPY', 'nokSEK'])
+        uc = universe_combos()
+        UNIVERSE['mode'] = 'used'
+        uu = universe_combos()
+    finally:
+        UNIVERSE.clear()
+        UNIVERSE.update(real_u)
+    check('universe: default = every leg + 30 crosses; all = every combination; custom list; used = nothing preloaded',
+          len(ud) == len(LEG_PAIRS) + 30 and ('GBPUSD', 'USDJPY') in ud and len(ua) == len(LEG_PAIRS) + len(LEG_PAIRS) * (len(LEG_PAIRS) - 1) // 2
+          and {('EURUSD', 'USDJPY'), ('USDNOK', 'USDSEK')} <= uc and len(uc) == len(LEG_PAIRS) + 2 and uu == set()
+          and all(cross_ccys(*cross_to_legs(c_)) == (c_[:3], c_[3:]) for c_ in DEFAULT_UNIVERSE_CROSSES), f'({len(ud) - len(LEG_PAIRS)} / {len(ua) - len(LEG_PAIRS)} crosses)')
     nx = lambda y, mo, d, h, mi, **k: next_refresh_after(datetime(y, mo, d, h, mi), **k)
     W = (6 * 60, 20 * 60)
     check('refresh schedule: on the grid (hourly / 3-hourly), inside the window, weekdays',
@@ -5423,6 +5536,10 @@ def main():
     ap.add_argument('--refresh-mins', type=int, default=180, help='shared Bloomberg refresh interval in minutes, on a grid from midnight (180 = 06:00, 09:00, 12:00, 15:00, 18:00 in the default window; 0 = off)')
     ap.add_argument('--refresh-window', default='06:00-20:00', help='local hours the refresh runs, e.g. 07:00-18:00, or "all"')
     ap.add_argument('--refresh-weekends', action='store_true', help='also refresh on Saturday / Sunday')
+    ap.add_argument('--universe', default=None,
+                    help='pairs the shared site keeps loaded: default (16 legs + 30 main crosses; the --lan default), all (every '
+                         'combination, 120 crosses: check your Bloomberg limits), used (only what people open; local default), '
+                         'or a list like EURJPY,GBPJPY,AUDNZD')
     args = ap.parse_args()
     if args.hash_password:
         label = 'CAD-tab' if args.hash_password == 'cad' else 'network sign-in'
@@ -5444,6 +5561,14 @@ def main():
         except (ValueError, IndexError):
             raise SystemExit('--refresh-window must look like 06:00-20:00 (or "all")')
     bind = args.host or ('0.0.0.0' if args.lan else '127.0.0.1')
+    uv = (args.universe or ('default' if (args.lan or args.host) else 'used')).strip()
+    if uv.lower() in ('default', 'all', 'used'):
+        UNIVERSE['mode'] = uv.lower()
+    else:
+        bad = [c for c in uv.split(',') if not cross_to_legs(c)]
+        if bad:
+            raise SystemExit(f'--universe: unknown cross(es) {bad} (each currency needs a USD leg in LEG_PAIRS)')
+        UNIVERSE.update(mode='custom', crosses=[c.strip().upper() for c in uv.split(',')])
     SERVER['lan'] = not is_loopback(bind)
     VIEWERS_CAN_PULL = bool(args.viewers_can_pull)
     names = local_addresses() | {h.lower() for h in args.allow_host} if SERVER['lan'] else {'localhost', '127.0.0.1', '::1'}
@@ -5478,6 +5603,14 @@ def main():
         ri = refresh_info()
         log(f"Shared Bloomberg refresh every {REFRESH['mins']} min ({'all day' if ri['window'] is None else ri['window']}"
             f"{', weekdays' if REFRESH['weekdays_only'] else ''}); next {ri['next'] or 'none'}")
+    if UNIVERSE['mode'] != 'used':
+        nc = len(universe_combos()) - len(LEG_PAIRS)
+        if BB.available():
+            log(f'Shared universe: {len(LEG_PAIRS)} legs + {nc} crosses ({UNIVERSE["mode"]}). Loading it in the background now; '
+                'colleagues can start straight away, pairs fill in as they load.')
+            threading.Thread(target=refresh_shared, args=('startup',), daemon=True).start()
+        else:
+            log(f'Shared universe ({UNIVERSE["mode"]}, {nc} crosses) loads when Bloomberg is connected.')
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
