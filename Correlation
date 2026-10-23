@@ -1749,7 +1749,7 @@ class BBG:
 # A viewer asking for something the store doesn't have gets a clear message, and it is queued:
 # the next refresh pulls the whole bundle for that pair (legs, cross quotes, histories).
 # The refresh re-pulls everything the site has used (incrementally for histories) and rebuilds the
-# CAD board; open pages see the new version and reload their sections.
+# CAD board; open pages see the new version and reload their sections. Default: every 3 hours.
 # ######################################################################
 class NotInStore(Exception):
     def __init__(self, refs=(), hists=()):
@@ -1786,6 +1786,7 @@ class MarketStore:
         self.ref = {}            # ticker -> {'asked': set(fields), 'vals': {field: value}}
         self.hist = {}           # (ticker, field) -> {'s': {date: value}, 'start': date, 'end': date}
         self.wanted_ref, self.wanted_hist, self.wanted_combos = {}, {}, set()
+        self.site_combos = set()      # every (leg A, leg B) anyone has looked at: kept complete by the refresh
         self.wanted_cad = False
         self.version, self.updated, self.last_put = 0, None, 0.0
 
@@ -1855,6 +1856,10 @@ class MarketStore:
         with self.lock:
             self.wanted_combos.add((a, b))
 
+    def note_combo(self, a, b=None):
+        with self.lock:
+            self.site_combos.add((a, b))
+
     def snapshot_keys(self):
         with self.lock:
             refs = {tk: set(e['asked']) for tk, e in self.ref.items()}
@@ -1863,7 +1868,7 @@ class MarketStore:
             hists = {k: (e['start'], e['end']) for k, e in self.hist.items()}
             for k, st in self.wanted_hist.items():
                 hists[k] = (min(st, hists[k][0]), None) if k in hists else (st, None)
-            combos, cad = set(self.wanted_combos), self.wanted_cad
+            combos, cad = set(self.wanted_combos) | set(self.site_combos), self.wanted_cad
             return refs, hists, combos, cad
 
     def stats(self):
@@ -2470,7 +2475,7 @@ CAD_BOARD = CadBoard()
 
 
 # ---------- shared refresh (hourly by default) ----------
-REFRESH = {'mins': 60, 'window': (6 * 60, 20 * 60), 'weekdays_only': True, 'next': None, 'next_dt': None,
+REFRESH = {'mins': 180, 'window': (6 * 60, 20 * 60), 'weekdays_only': True, 'next': None, 'next_dt': None,
            'running': False, 'last': None, 'last_secs': None, 'last_error': '', 'last_counts': '',
            'lock': threading.Lock()}
 
@@ -2532,6 +2537,9 @@ def refresh_shared(reason='scheduled'):
             for (f, s0), tks in hg.items():
                 for i in range(0, len(tks), 50):
                     BB.hist(tks[i:i + 50], f, s0, today)
+        # every pair in use gets its complete bundle (surface, band, monitor, analytics at the default
+        # settings): already-stored pieces were just topped up above, so only gaps are pulled here
+        with data_mode_ctx('prefer_store'):
             for a, b in sorted(combos, key=str):
                 if b is None:
                     try:
@@ -2549,7 +2557,7 @@ def refresh_shared(reason='scheduled'):
             CAD_BOARD.start(sorted(srcs), mode='live', wait=True)
             with STORE.lock:
                 STORE.wanted_cad = False
-        counts = (f'{len(refs)} quote tickers, {len(hists)} histories' + (f', {len(combos)} new pair bundles' if combos else '')
+        counts = (f'{len(refs)} quote tickers, {len(hists)} histories' + (f', {len(combos)} pair bundles checked' if combos else '')
                   + (f', CAD board ({"/".join(sorted(srcs))})' if srcs else ''))
         log(f'shared refresh ({reason}): {counts} in {time.time() - t0:.1f}s')
     except Exception as e:
@@ -2711,6 +2719,10 @@ def serve_data(role, name, fn, *args, prefer_store=False):
         mode = 'prefer_store' if prefer_store else 'live'
     else:
         mode = 'live' if viewer_may_pull() else 'store'
+    if name == 'surface':
+        STORE.note_combo(args[0], None)
+    elif len(args) >= 2:
+        STORE.note_combo(args[0], args[1])
     try:
         with data_mode_ctx(mode):
             return 200, fn(*args)
@@ -3221,7 +3233,7 @@ const LS='crossvol_state_v9';
 let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
        legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
 const $=id=>document.getElementById(id);
-function save(){try{localStorage.setItem(LS,JSON.stringify({...S,role:undefined,loadErr:undefined,result:null,hist:null,monData:null,ciData:null,band:null,bandBusy:false,lastBody:null,_ciP:null,_bandP:null}));}catch(e){}}
+function save(){try{localStorage.setItem(LS,JSON.stringify({...S,role:undefined,loadErr:undefined,result:null,hist:null,monData:null,ciData:null,band:null,bandBusy:false,lastBody:null,_ciP:null,_bandP:null,_syncP:undefined,sharedSite:undefined,dataVer:undefined,bbgUp:undefined}));}catch(e){}}
 function load(){try{const r=localStorage.getItem(LS);if(r)Object.assign(S,JSON.parse(r));}catch(e){}}
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 function status(msg,cls){const el=$('status');el.className='status '+(cls||'');el.textContent=msg||'';}
@@ -3310,7 +3322,7 @@ function legGrid(which){
   const set=(r,c,v)=>{const t=TENORS[r];L.rows[t]=L.rows[t]||{};L.rows[t][GRID_KEYS[c]]=v;};
   const orig=(r,c)=>{const o=L._orig&&L._orig[TENORS[r]];return o?o[GRID_KEYS[c]]:undefined;};
   const snap=()=>{G.undo.push(JSON.stringify(L.rows));if(G.undo.length>60)G.undo.shift();};
-  const show=v=>(v===null||v===undefined||(typeof v==='number'&&!isFinite(v)))?'':String(v);
+  const show=v=>(v===null||v===undefined||(typeof v==='number'&&!isFinite(v)))?'':(typeof v==='number'?String(+v.toPrecision(12)):String(v));   // drop binary float residue (7.6439999999 -> 7.644)
   const paint=(force)=>{for(let r=0;r<nR;r++)for(let c=0;c<nC;c++){const el=cell(r,c);if(!el)continue;
       if(force||document.activeElement!==el)el.value=show(get(r,c));
       const o=orig(r,c),v=get(r,c);el.classList.toggle('dirty',o!==undefined&&!(o===v||(o==null&&v==null)||(o!=null&&v!=null&&Math.abs(o-v)<1e-12)));
@@ -3393,7 +3405,7 @@ function legGrid(which){
   paint(true);
 }
 function gridTSV(which){const L=S.legs[which];const out=[['Tenor'].concat(FIELDS.map(x=>x[1])).join('\t')];
-  TENORS.forEach(t=>{const r=L.rows[t]||{};out.push([t].concat(GRID_KEYS.map(k=>r[k]==null?'':r[k])).join('\t'));});return out.join('\n');}
+  TENORS.forEach(t=>{const r=L.rows[t]||{};out.push([t].concat(GRID_KEYS.map(k=>r[k]==null?'':(typeof r[k]==='number'?+r[k].toPrecision(12):r[k]))).join('\t'));});return out.join('\n');}
 function renderLeg(which){
   const L=S.legs[which],el=$('card'+which),pair=which==='A'?S.pairA:S.pairB;
   if(!L){const er=(S.loadErr||{})[which];el.innerHTML='<h2>'+pair+'</h2><div class="empty'+(er?' warn':'')+'">'+(er||'loading…')+'</div>';return;}
@@ -4079,7 +4091,9 @@ async function refreshMarket(opts){          // legs (fresh Bloomberg pull) + ma
 function updateAsof(){const el=$('asof');if(!el)return;el.textContent=S.asof?'Data refreshed '+new Date(S.asof).toLocaleTimeString():'';}
 let _loadingAll=false;
 async function loadAll(){
-  if(_loadingAll)return;_loadingAll=true;const btn=$('btnAll');btn.disabled=true;const t0=performance.now(),probs=[];
+  if(_loadingAll)return;_loadingAll=true;const btn=$('btnAll');btn.disabled=true;
+  if(_autoBusy)await _syncDone;                // let a fill from the shared data finish first
+  const t0=performance.now(),probs=[];
   const step=(i,txt)=>status('Load all '+i+'/6 · '+txt+'…');
   try{
     step(1,'Bloomberg legs + implied ρ');
@@ -4369,7 +4383,7 @@ function renderShared(sh){const t=$('sharedTag'),b=$('btnShared');if(!t||!sh)ret
   t.title=(r.last?'Last refresh '+r.last+' ('+r.last_secs+'s): '+(r.last_error||r.last_counts):'No scheduled refresh yet')
     +(sh.n_wanted?' · '+sh.n_wanted+' item(s) queued for the next refresh':'')+(r.mins?' · every '+r.mins+' min'+(r.window?' '+r.window:'')+(r.weekdays_only?' weekdays':''):'');
   if(S.role==='host'){b.style.display='';b.disabled=!!r.running;b.textContent=r.running?'Refreshing…':'Refresh now';}}
-let _autoBusy=false;
+let _autoBusy=false,_syncAgain=null,_syncDone=Promise.resolve();
 async function pollShared(){let st;try{st=await api('/api/status');}catch(e){return;}
   S.bbgUp=!!st.bbg;const sh=st.shared;renderShared(sh);if(!sh)return;
   if(S.dataVer==null){S.dataVer=sh.version;return;}
@@ -4377,21 +4391,28 @@ async function pollShared(){let st;try{st=await api('/api/status');}catch(e){ret
 async function autoRefresh(sh){
   if(_autoBusy||_loadingAll)return;
   const ae=document.activeElement;if(ae&&ae.tagName==='INPUT'&&ae.closest('#tabMain')){setTimeout(()=>autoRefresh(sh),20000);return;}   // not while someone is typing
-  _autoBusy=true;API_STORE=true;const target=sh.version;
+  await syncAll(sh,'Auto-refreshed with the shared data from '+(sh.updated||'').slice(11,16));}
+async function syncAll(sh,label){
+  // Fill EVERY section from the shared data — legs, quotes, correlation, surface + band, triangle, monitor,
+  // analytics, CAD board — whether or not this page had loaded it. Never pulls Bloomberg for a viewer;
+  // your own page reads the store first and only pulls what's missing.
+  if(_autoBusy){_syncAgain={sh,label};return _syncDone;}          // busy: run again (with the latest pair) when this one ends
+  _autoBusy=true;API_STORE=true;const target=sh&&sh.version;let fin;_syncDone=new Promise(r=>fin=r);
   const n=(S.legs.A?legEdits(S.legs.A).length:0)+(S.legs.B?legEdits(S.legs.B).length:0);
   try{
-    if(S.legs.A&&S.legs.B)await refreshMarket({choice:'keep'});
-    else await Promise.all([S.legs.A?null:loadLeg('A'),S.legs.B?null:loadLeg('B'),loadMkt()]);   // a pair that wasn't in the shared data before
-    if(S.corr||(S.loadErr||{}).corr)await loadCorr();
-    if(S.result){S.ciData=null;await build();if(S._ciP)await S._ciP;}
-    renderTri();
-    if(S.monData)await loadMon();
-    if(S.hist)await loadHist();
+    if(S.legs.A&&S.legs.B&&S.legs.A.pair===S.pairA&&S.legs.B.pair===S.pairB)await refreshMarket({choice:'keep'});
+    else await Promise.all([loadLeg('A'),loadLeg('B'),loadMkt()]);
+    await loadCorr();
+    const surf=(async()=>{if(S.legs.A&&S.legs.B&&S.corr){S.ciData=null;await build();if(S._ciP)await S._ciP;}renderTri();})();
+    await Promise.all([surf,loadMon(),loadHist()]);
     if(S.tab==='cad'){if(CAD.snap)await cadLoadSnap();else await cadEnter();}
-    S.dataVer=target;
-    status('Auto-refreshed with the shared data from '+(sh.updated||'').slice(11,16)+(n?' · kept your '+n+' edit'+(n>1?'s':''):''));
-  }catch(e){status('Auto-refresh: '+e.message,'err');}
-  finally{API_STORE=false;_autoBusy=false;}}
+    if(target!=null)S.dataVer=target;
+    const miss=[!S.result&&'surface',!S.monData&&'monitor',!S.hist&&'analytics'].filter(Boolean);
+    status((label||'Loaded from the shared data')+(n?' · kept your '+n+' edit'+(n>1?'s':''):'')
+      +(miss.length?' · not available yet: '+miss.join(', ')+' (see each card)':''),miss.length?'warn':'');
+  }catch(e){status('Shared data: '+e.message,'err');}
+  finally{API_STORE=false;_autoBusy=false;
+    if(_syncAgain){const a=_syncAgain;_syncAgain=null;syncAll(a.sh,a.label).then(fin);}else fin();}}
 async function refreshSharedNow(){
   try{await api('/api/refresh_shared',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){status('Refresh: '+e.message,'err');return;}
   status('Refreshing the shared Bloomberg data…');
@@ -4636,7 +4657,9 @@ async function init(){
     const so=$('btnSignOut');so.style.display='';so.onclick=async()=>{try{await fetch('/api/app_logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}location.reload();};}
   else if(st.lan){const t=$('roleTag');t.style.display='';t.textContent='Sharing on the network (host)';t.title='Colleagues sign in with the network password and see the data you load.';}
   ['pairA','pairB'].forEach(id=>{$(id).innerHTML=st.pairs.map(p=>'<option>'+p+'</option>').join('');$(id).value=S[id];
-    $(id).onchange=async e=>{S[id]=e.target.value;S.ov={rho:{},rs:{},sr:{}};updateCross();save();S.hist=null;S.mkt=null;S.monData=null;renderAnalytics();renderMonitor();await Promise.all([loadLeg(id==='pairA'?'A':'B'),loadCorr(),loadMkt()]);renderCorr();};});
+    $(id).onchange=async e=>{S[id]=e.target.value;S.ov={rho:{},rs:{},sr:{}};updateCross();save();S.hist=null;S.mkt=null;S.monData=null;renderAnalytics();renderMonitor();
+      if(S.sharedSite){S.result=null;await syncAll(null,'Loaded '+crossNm()+' from the shared data');return;}
+      await Promise.all([loadLeg(id==='pairA'?'A':'B'),loadCorr(),loadMkt()]);renderCorr();};});
   $('usdRate').value=S.usd_rate;$('usdRate').onchange=e=>{S.usd_rate=parseFloat(e.target.value)||0;save();};
   segInit();updateCross();
   $('btnPull').onclick=()=>refreshMarket();
@@ -4644,10 +4667,15 @@ async function init(){
   initExportUI();updateAsof();
   document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
   if(S.tab==='cad')showTab('cad');
+  S.sharedSite=!!(st.lan||st.role==='viewer');
+  if(S.sharedSite){                      // shared site: every section fills itself from the shared data on open
+    if(S.legs.A)renderLeg('A');if(S.legs.B)renderLeg('B');renderCorr();renderMonitor();renderAnalytics();renderTri();renderCI();
+    S._syncP=syncAll(st.shared,'Loaded from the shared data'+(st.shared&&st.shared.updated?' ('+st.shared.updated.slice(11,16)+')':''));
+  }else{
   if(S.legs.A&&S.legs.A.pair===S.pairA)renderLeg('A');else loadLeg('A');
   if(S.legs.B&&S.legs.B.pair===S.pairB)renderLeg('B');else loadLeg('B');
   if(S.corr&&S.corr.vol_vol)renderCorr();else loadCorr();
-  loadMkt();renderMonitor();renderAnalytics();renderTri();renderCI();
+  loadMkt();renderMonitor();renderAnalytics();renderTri();renderCI();}
   $('btnShared').onclick=refreshSharedNow;
   renderShared(st.shared);if(st.shared)S.dataVer=st.shared.version;
   setInterval(pollShared,SHARED_POLL_MS);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pollShared();});
@@ -5348,12 +5376,14 @@ def selftest():
         STORE.__init__()
     nx = lambda y, mo, d, h, mi, **k: next_refresh_after(datetime(y, mo, d, h, mi), **k)
     W = (6 * 60, 20 * 60)
-    check('hourly schedule: on the hour, inside the window, weekdays',
+    check('refresh schedule: on the grid (hourly / 3-hourly), inside the window, weekdays',
           nx(2026, 10, 22, 16, 14, mins=60, window=W, weekdays_only=True) == datetime(2026, 10, 22, 17, 0)
           and nx(2026, 10, 22, 20, 30, mins=60, window=W, weekdays_only=True) == datetime(2026, 10, 23, 6, 0)
           and nx(2026, 10, 23, 20, 5, mins=60, window=W, weekdays_only=True) == datetime(2026, 10, 26, 6, 0)
           and nx(2026, 10, 24, 23, 59, mins=60) == datetime(2026, 10, 25, 0, 0) and nx(2026, 10, 22, 9, 0, mins=0) is None
-          and nx(2026, 10, 22, 9, 0, mins=60, window=W) == datetime(2026, 10, 22, 10, 0))
+          and nx(2026, 10, 22, 9, 0, mins=60, window=W) == datetime(2026, 10, 22, 10, 0)
+          and nx(2026, 10, 22, 9, 30, mins=180, window=W, weekdays_only=True) == datetime(2026, 10, 22, 12, 0)
+          and nx(2026, 10, 22, 18, 5, mins=180, window=W, weekdays_only=True) == datetime(2026, 10, 23, 6, 0))
     check('loopback detection (host role)', all(is_loopback(x) for x in ('127.0.0.1', '::1', '::ffff:127.0.0.1'))
           and not any(is_loopback(x) for x in ('10.1.2.3', '192.168.0.9', 'fe80::1', 'junk')))
     check('Host header parsing', [host_of(x) for x in ('Box:8090', '[::1]:8090', '10.0.0.5', 'EVIL.com:8090', None)]
@@ -5390,7 +5420,7 @@ def main():
     ap.add_argument('--allow-host', action='append', default=[], help='extra hostname/IP colleagues use to reach you (repeatable)')
     ap.add_argument('--viewers-can-pull', action='store_true', help='let signed-in viewers trigger Bloomberg pulls on your session')
     ap.add_argument('--insecure-http', action='store_true', help='allow --lan without HTTPS (passwords would cross the network in clear)')
-    ap.add_argument('--refresh-mins', type=int, default=60, help='shared Bloomberg refresh interval in minutes, on the clock (0 = off)')
+    ap.add_argument('--refresh-mins', type=int, default=180, help='shared Bloomberg refresh interval in minutes, on a grid from midnight (180 = 06:00, 09:00, 12:00, 15:00, 18:00 in the default window; 0 = off)')
     ap.add_argument('--refresh-window', default='06:00-20:00', help='local hours the refresh runs, e.g. 07:00-18:00, or "all"')
     ap.add_argument('--refresh-weekends', action='store_true', help='also refresh on Saturday / Sunday')
     args = ap.parse_args()
