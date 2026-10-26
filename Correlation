@@ -683,8 +683,9 @@ def rr25_on(smile, F, T, pa, dfb):
     return vc - vp
 
 
-def cross_sabr(F, T, atm, nu_x, rr25_target, pa, dfb):
-    """Cross SABR: nu = propagated vol-of-vol, alpha so DNS ATM = atm, rho so 25 RR = target."""
+def cross_sabr(F, T, atm, nu_x, rr25_target, pa, dfb, rho_fixed=None):
+    """Cross SABR: nu = propagated vol-of-vol, alpha so DNS ATM = atm, rho so 25 RR = target
+    (or rho given directly with rho_fixed)."""
     k_atm = (-0.5 if pa else 0.5) * atm * atm * T
     Katm = F * math.exp(k_atm)
 
@@ -702,6 +703,12 @@ def cross_sabr(F, T, atm, nu_x, rr25_target, pa, dfb):
         return rr25_on(make(r)[1], F, T, pa, dfb) - rr25_target
 
     note = ''
+    if rho_fixed is not None:
+        r = float(min(max(rho_fixed, -0.98), 0.98))
+        if r != rho_fixed:
+            note = 'correlation skew pushed the cross SABR rho to its limit'
+        a, sm = make(r)
+        return {'alpha': a, 'rho': r, 'nu': nu_x, 'smile': sm, 'note': note}
     lo, hi = -0.95, 0.95
     for _ in range(6):
         try:
@@ -723,8 +730,17 @@ def cross_sabr(F, T, atm, nu_x, rr25_target, pa, dfb):
 # ======================================================================
 # One tenor of the cross
 # ======================================================================
+def skew_rho_shift(sa, sb, sx, nu_x, beta):
+    """Correlation skew -> cross SABR rho. If rho_Y moves with the cross, d rho_Y = beta d lnX, then
+    d sigma_X = (d sigma_X / d rho_Y) d rho_Y = -(sa sb / sx) beta d lnX: an extra spot-vol covariance of
+    -sa sb beta (per unit time). In SABR the spot-vol covariance is rho nu sigma_X, so
+        rho_SABR = rho_SABR(no skew) - sa sb beta / (sx nu_x).
+    beta: change in rho_Y per unit log move of the cross (0.02 per 1% -> beta = 2)."""
+    return -sa * sb * beta / (sx * nu_x)
+
+
 def build_cross_tenor(legA, legB, rho_y, atm_anchor='formula', cross_pa=None, cross_dtype=None,
-                      rho_sig=0.6, sig_rho=0.0, wings='vov', nk=41, span=5.0):
+                      rho_sig=0.6, sig_rho=0.0, wings='vov', nk=41, span=5.0, skew=None):
     """legA = leg holding the cross BASE ccy, legB = leg holding the QUOTE ccy.
     Always computes both wing models; `wings` picks which one is the output surface."""
     t0 = time.time()
@@ -776,10 +792,41 @@ def build_cross_tenor(legA, legB, rho_y, atm_anchor='formula', cross_pa=None, cr
     sabr_a = fit_sabr(legA['F'], T, [legA['pillars'][l][0] for l in labs], [legA['pillars'][l][1] for l in labs])
     sabr_b = fit_sabr(legB['F'], T, [legB['pillars'][l][0] for l in labs], [legB['pillars'][l][1] for l in labs])
     vov = propagate_vov(legA['atm'], legB['atm'], rho_y, sabr_a['nu'], sabr_b['nu'], rho_sig, sig_rho)
-    xs = cross_sabr(F, T, piv_cop['atm'], vov['nu_x'], piv_cop['rr25'], pa, dfb)
-    if xs['note']:
-        notes.append(xs['note'])
+    xs0 = cross_sabr(F, T, piv_cop['atm'], vov['nu_x'], piv_cop['rr25'], pa, dfb)     # no correlation skew
+    if xs0['note']:
+        notes.append(xs0['note'])
+    # ---- correlation skew (risk reversals): skew = {'mode': 'implied'|'value', 'beta', 'rr_mkt', 'beta_ref': [..]}
+    sk = skew or {}
+    sa_, sb_, sx_, nu_ = legA['atm'], legB['atm'], piv_cop['atm'], vov['nu_x']
+    unit = sa_ * sb_ / (sx_ * nu_) if nu_ > 1e-8 else float('inf')          # SABR rho per unit beta (magnitude)
+    rr_mkt = sk.get('rr_mkt')
+    beta_impl = None
+    xs_m = None
+    if rr_mkt is not None and math.isfinite(unit):
+        xs_m = cross_sabr(F, T, piv_cop['atm'], nu_, rr_mkt, pa, dfb)
+        if not xs_m['note']:
+            beta_impl = -(xs_m['rho'] - xs0['rho']) / unit
+    mode = sk.get('mode', 'value')
+    if mode == 'implied' and beta_impl is not None:
+        xs, beta_used = xs_m, beta_impl
+    else:
+        if mode == 'implied':
+            notes.append('no usable market 25 RR: correlation skew from the fallback')
+        beta_used = float(sk.get('beta') or 0.0)
+        xs = xs0 if beta_used == 0 or not math.isfinite(unit) else \
+            cross_sabr(F, T, piv_cop['atm'], nu_, None, pa, dfb, rho_fixed=xs0['rho'] + skew_rho_shift(sa_, sb_, sx_, nu_, beta_used))
+        if xs['note']:
+            notes.append(xs['note'])
+    rr_ref = []
+    for b in sk.get('beta_ref') or []:
+        if b is None or not math.isfinite(b) or not math.isfinite(unit):
+            rr_ref.append(None)
+            continue
+        x_ = cross_sabr(F, T, piv_cop['atm'], nu_, None, pa, dfb, rho_fixed=xs0['rho'] + skew_rho_shift(sa_, sb_, sx_, nu_, b))
+        rr_ref.append(rr25_on(x_['smile'], F, T, pa, dfb))
     piv_vov = smile_pillars(xs['smile'], F, T, pa, dfb)
+    skew_out = {'beta_used': beta_used, 'beta_impl': beta_impl, 'rr_mkt': rr_mkt, 'rr25_beta0': rr25_on(xs0['smile'], F, T, pa, dfb),
+                'rr_ref': rr_ref, 'sabr_rho0': xs0['rho'], 'mode': 'implied' if (mode == 'implied' and beta_impl is not None) else 'value'}
 
     final, smile_final = (piv_vov, xs['smile']) if wings == 'vov' else (piv_cop, smile_cop)
     return {'tenor_T': T, 'cross': cross, 'S': S, 'F': F, 'pa': pa, 'dtype': dtype, 'wings': wings,
@@ -788,7 +835,7 @@ def build_cross_tenor(legA, legB, rho_y, atm_anchor='formula', cross_pa=None, cr
             'smile_obj': smile_final, 'smile_copula': smile_cop, 'smile_vov': xs['smile'],
             'curve_k': ks[ok].tolist(),
             'sabr_legs': [sabr_a, sabr_b], 'vov': vov, 'rho_sig': rho_sig, 'sig_rho': sig_rho,
-            'sabr_cross': {k: xs[k] for k in ('alpha', 'rho', 'nu')},
+            'sabr_cross': {k: xs[k] for k in ('alpha', 'rho', 'nu')}, 'skew': skew_out,
             'notes': notes,
             'diag': {'fwd_err': pr.fwd_err, 'mean_err_A': MA.mean_err, 'mean_err_B': MB.mean_err,
                      'arb_leg_A': MA.arb_points, 'arb_leg_B': MB.arb_points,
@@ -800,8 +847,10 @@ def build_cross_tenor(legA, legB, rho_y, atm_anchor='formula', cross_pa=None, cr
 # ======================================================================
 def build_surface(legA_in, legB_in, rho_quoted_by_tenor, usd_rate=0.04, fly_conv='broker',
                   atm_anchor='formula', delta_mode='auto', tenors=None, today=None,
-                  rho_sig_by_tenor=None, sig_rho_by_tenor=None, wings='vov', rho_half_life=0.5):
+                  rho_sig_by_tenor=None, sig_rho_by_tenor=None, wings='vov', rho_half_life=0.5, skew_by_tenor=None):
     """
+    skew_by_tenor       = {tenor: {'mode': 'implied' | 'value', 'beta': d rho_Y / d lnX, 'rr_mkt': cross 25 RR
+                           (vol pts), 'beta_ref': [betas to also price the 25 RR at]}}   (default: no skew)
     legX_in = {'pair': 'EURUSD', 'spot': 1.08, 'fwd_scale': 10000,
                'rows': {tenor: {'fwd_pts', 'atm', 'rr25', 'rr10', 'bf25', 'bf10'}}}
                (vols / RR / BF in VOL POINTS, fwd pts in pips — as on screen)
@@ -847,8 +896,11 @@ def build_surface(legA_in, legB_in, rho_quoted_by_tenor, usd_rate=0.04, fly_conv
             sr = sig_rho_by_tenor.get(t)
             sr = 0.0 if sr is None else float(sr)
             sr_eff = sr * ou_factor(T, rho_half_life)
+            sk = dict((skew_by_tenor or {}).get(t) or {})
+            if sk.get('rr_mkt') is not None:
+                sk['rr_mkt'] = float(sk['rr_mkt']) / 100.0
             res = build_cross_tenor(legs[0], legs[1], sA * sB * rq, atm_anchor, cross_dtype=dt,
-                                    rho_sig=0.6 if rs is None else float(rs), sig_rho=sr_eff, wings=wings)
+                                    rho_sig=0.6 if rs is None else float(rs), sig_rho=sr_eff, wings=wings, skew=sk)
             res['sig_rho_inst'] = sr
             if rs is None:
                 res['notes'].append('vol-vol corr defaulted to 0.6')
@@ -1126,7 +1178,15 @@ def synthetic_history(pair_a, pair_b, tenor, years=3, seed=None):
     spot_b = pb_[0] * np.exp(sB * np.concatenate([[0], np.cumsum(yb[1:])]))
     smooth = np.convolve(rho, np.ones(42) / 42, mode='full')[:nd]
     smooth[:42] = rho[:42]
-    imp = np.clip(smooth - 0.06 + 0.03 * rng.standard_normal(nd), -0.97, 0.97)
+    # correlation skew: implied rho_Y reprices with the cross (beta ~1.5, i.e. +0.015 per +1% in the cross)
+    lx = sA * np.log(spot_a) - sB * np.log(spot_b)
+    if leg_info(pair_a)[0] != cross_ccys(pair_a, pair_b)[0]:
+        lx = -lx
+    ema = np.empty(nd)
+    ema[0] = lx[0]
+    for i in range(1, nd):
+        ema[i] = ema[i - 1] + (2 / 22) * (lx[i] - ema[i - 1])
+    imp = np.clip(smooth - 0.06 + 1.5 * (lx - ema) + 0.03 * rng.standard_normal(nd), -0.97, 0.97)
     vx = np.sqrt(np.maximum(va ** 2 + vb ** 2 - 2 * imp * va * vb, 0.01))
     d0 = date.today() - timedelta(days=int(nd * 365 / 252))
     dates = [d0 + timedelta(days=int(i * 365 / 252)) for i in range(nd)]
@@ -1295,6 +1355,115 @@ def get_corr_ci(a, b, years=CI_HISTORY_YEARS):
            'levels': [str(L) for L in CI_LEVELS]}
     _CI_CACHE[key] = out
     return out
+
+
+# ======================================================================
+# Correlation skew (risk reversals): how correlation moves with the cross
+# ----------------------------------------------------------------------
+# beta = d rho_Y / d lnX  (rho_Y per unit log move of the cross; shown as rho per +1% = beta/100).
+#   implied    : backed out of the market cross 25 RR (build: model RR = market)
+#   historical : daily regression of the change in IMPLIED rho_Y (from the cross and leg ATM vols)
+#                on the cross's log return, 3y; Newey-West standard error. This is how correlation has
+#                actually repriced with spot, the quantity a sticky RR is paying for.
+#   realized   : the same slope from REALIZED correlation (21-day blocks of spot data, 10y) for crosses
+#                with no vol history; much noisier.
+# ======================================================================
+def ols_nw(x, y, lags=5):
+    """Slope of y on x (with intercept) and its Newey-West (Bartlett) standard error."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    n = len(x)
+    if n < 20 or np.var(x) <= 0:
+        return None, None
+    xc, yc = x - x.mean(), y - y.mean()
+    b = float(np.sum(xc * yc) / np.sum(xc * xc))
+    u = (yc - b * xc) * xc
+    s_ = float(np.sum(u * u))
+    for L in range(1, min(lags, n - 1) + 1):
+        s_ += 2 * (1 - L / (lags + 1)) * float(np.sum(u[L:] * u[:-L]))
+    return b, math.sqrt(max(s_, 0.0)) / float(np.sum(xc * xc))
+
+
+def skew_beta_implied_hist(lnx, rho, recent=126, clip=0.15):
+    """Daily d rho_impl on d lnX. Days with a missing vol are skipped; jumps over `clip` (bad prints)
+    are dropped."""
+    lnx, rho = np.asarray(lnx, float), np.asarray(rho, float)
+    ok = np.isfinite(lnx[1:]) & np.isfinite(lnx[:-1]) & np.isfinite(rho[1:]) & np.isfinite(rho[:-1])
+    dx, dr = np.diff(lnx)[ok], np.diff(rho)[ok]
+    keep = np.abs(dr) < clip
+    dx, dr = dx[keep], dr[keep]
+    b, se = ols_nw(dx, dr)
+    br, ser = ols_nw(dx[-recent:], dr[-recent:]) if len(dx) > recent else (None, None)
+    step = max(1, len(dx) // 400)
+    return {'beta': b, 'se': se, 't': (b / se) if b is not None and se else None, 'n': int(len(dx)),
+            'beta_recent': br, 'se_recent': ser,
+            'scatter': {'dx': [round(float(v) * 100, 4) for v in dx[-800::step]], 'dr': [round(float(v), 5) for v in dr[-800::step]]}}
+
+
+def skew_beta_realized(ra, rb, block=21):
+    """Change in realized rho_Y between consecutive blocks vs the cross return over the block."""
+    nb = len(ra) // block
+    if nb < 12:
+        return {'beta': None, 'se': None, 'n': nb}
+    ra, rb = np.asarray(ra[-nb * block:], float), np.asarray(rb[-nb * block:], float)
+    rh = np.array([corr_est(ra[i * block:(i + 1) * block], rb[i * block:(i + 1) * block]) for i in range(nb)])
+    rx = np.array([np.sum(ra[i * block:(i + 1) * block] - rb[i * block:(i + 1) * block]) for i in range(nb)])
+    b, se = ols_nw(rx[1:], np.diff(rh), lags=1) if nb >= 21 else (None, None)
+    return {'beta': b, 'se': se, 't': (b / se) if b is not None and se else None, 'n': int(nb - 1), 'block': block}
+
+
+def get_corr_skew(a, b):
+    """Historical correlation skew per tenor for legs a, b (any order)."""
+    a, b = a.upper(), b.upper()
+    base, quote = cross_ccys(a, b)
+    la, lb = (a, b) if leg_info(a)[0] == base else (b, a)          # la holds the base ccy
+    sA, sB = leg_info(la)[1], leg_info(lb)[1]
+    src, note, by = 'SYNTHETIC', 'SYNTHETIC history (no Bloomberg) — illustrates the tool, not the market.', {}
+    done = False
+    if BB.available():
+        try:
+            end = date.today()
+            start = end - timedelta(days=365 * CORR_HISTORY_YEARS + 10)          # same window as the correlation inputs
+            xn = [base + quote, quote + base]
+            tks = [f'{la} Curncy', f'{lb} Curncy'] + [f'{p}V{t} Curncy' for p in (la, lb) for t in TENORS] \
+                + [f'{x}V{t} Curncy' for x in xn for t in TENORS]
+            h = BB.hist(tks, 'PX_LAST', start, end)
+            pa_, pb_ = h.get(f'{la} Curncy', {}), h.get(f'{lb} Curncy', {})
+            dates = sorted(d for d in set(pa_) & set(pb_) if pa_[d] > 0 and pb_[d] > 0)
+            if len(dates) < 60:
+                raise RuntimeError(f'only {len(dates)} common spot dates')
+            ya = np.log([pa_[d] for d in dates]) * sA
+            yb = np.log([pb_[d] for d in dates]) * sB
+            lnx = ya - yb
+            g = lambda s_, d: s_[d] if s_.get(d) and s_[d] > 0 else float('nan')
+            for t in TENORS:
+                vx_d = next((h[f'{x}V{t} Curncy'] for x in xn if h.get(f'{x}V{t} Curncy')), {})
+                if not vx_d:
+                    by[t] = {'beta': None, 'n': 0, 'why': f'no {base + quote}V{t} history'}
+                    continue
+                va = np.array([g(h.get(f'{la}V{t} Curncy', {}), d) for d in dates])
+                vb = np.array([g(h.get(f'{lb}V{t} Curncy', {}), d) for d in dates])
+                vx = np.array([g(vx_d, d) for d in dates])
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    rho = implied_rho_y(va, vb, vx)
+                rho = np.where(np.abs(rho) < 1, rho, np.nan)
+                by[t] = skew_beta_implied_hist(lnx, rho)
+            src, note, done = 'BBG', f'BDH {dates[0]} -> {dates[-1]}, {len(dates)} spot days', True
+        except NotInStore:
+            raise
+        except Exception as e:
+            log(f'BBG corr skew failed: {e}')
+            note = f'Bloomberg history unavailable ({e}); showing SYNTHETIC data.'
+    if not done:
+        for t in TENORS:
+            d_, pa_, pb_, va, vb, vx = synthetic_history(la, lb, t, CORR_HISTORY_YEARS)
+            lnx = sA * np.log(pa_) - sB * np.log(pb_)
+            with np.errstate(invalid='ignore'):
+                by[t] = skew_beta_implied_hist(lnx, implied_rho_y(np.asarray(va), np.asarray(vb), np.asarray(vx)))
+    d_, spa, spb, *_ = spot_history(la, lb, CI_HISTORY_YEARS)
+    ra = sA * np.diff(np.log(np.asarray(spa, float)))
+    rb = sB * np.diff(np.log(np.asarray(spb, float)))
+    return {'cross': base + quote, 'source': src, 'note': note, 'by_tenor': by, 'realized': skew_beta_realized(ra, rb),
+            'unit': 'beta = d rho_Y / d ln(cross); rho per +1% = beta / 100'}
 
 
 # ======================================================================
@@ -2305,9 +2474,10 @@ def auth_logout(tok):
 
 def _cad_build_worker(args):
     """Runs in a worker process: one cross surface."""
-    legA, legB, rho, rs, sr, hl = args
+    legA, legB, rho, rs, sr, hl = args[:6]
+    skew = args[6] if len(args) > 6 else None
     try:
-        return build_surface(legA, legB, rho, rho_sig_by_tenor=rs, sig_rho_by_tenor=sr, rho_half_life=hl)
+        return build_surface(legA, legB, rho, rho_sig_by_tenor=rs, sig_rho_by_tenor=sr, rho_half_life=hl, skew_by_tenor=skew)
     except Exception as e:
         return {'fatal': f'{type(e).__name__}: {e}'}
 
@@ -2419,8 +2589,20 @@ class CadBoard:
                 cv = C.get('corr_vol') or {}
                 sr = {t: cv.get('value') for t in TENORS if cv.get('value') is not None}
                 hl = cv.get('half_life') or DEFAULT_RHO_HALF_LIFE
+                try:                                                   # correlation skew: implied from the cross RR, history as fallback
+                    SK = get_corr_skew(a, b)
+                except NotInStore:
+                    raise
+                except Exception as e:
+                    SK = {'by_tenor': {}}
+                    log(f'CAD skew {a}/{b}: {e}')
+                skew = {}
+                for t in TENORS:
+                    hb = (SK['by_tenor'].get(t) or {}).get('beta')
+                    rr = ((M.get('rows') or {}).get(t) or {}).get('rr25')
+                    skew[t] = {'mode': 'implied', 'beta': hb or 0.0, **({'rr_mkt': rr} if rr is not None else {})}
                 prep.append({'a': a, 'b': b, 'La': La, 'Lb': Lb, 'M': M, 'C': C, 'sg': sg,
-                             'imp': imp_q, 'real': real_q, 'used': used_q, 'job': (La, Lb, used_q, rs, sr, hl)})
+                             'imp': imp_q, 'real': real_q, 'used': used_q, 'job': (La, Lb, used_q, rs, sr, hl, skew)})
             with self.lock:
                 self.progress['stage'] = 'building surfaces'
             built = self._pool_map([p['job'] for p in prep])
@@ -2478,6 +2660,7 @@ class CadBoard:
                          'sig_other': (Lb if other == b else La)['rows'][t]['atm'], 'sig_cad': (La if cad_leg == a else Lb)['rows'][t]['atm'],
                          'd_other': d_other, 'd_cad': d_cad, 'd_rho01': d_rhoY01,
                          'vega_unit': atm_vega_usd(SX, sx, T, Y[quote]) * 0.01,     # USD per vol pt per 1 unit base notional
+                         'skew_beta': r['skew']['beta_used'], 'skew_mode': r['skew']['mode'], 'rr25_beta0': pts(r['skew']['rr25_beta0']),
                          'flags': list(r['notes'])})
         return {'cross': base + quote, 'legs': [a, b], 'other_leg': other, 'cad_leg': cad_leg, 'spot': SX,
                 'base': base, 'quote': quote, 'sources': [La['source'], Lb['source'], M.get('source')],
@@ -2553,7 +2736,7 @@ def prefetch_combo(a, b):
     Run in prefer_store mode: only pieces the store doesn't have are pulled. True if all went through."""
     jobs = [(get_surface, (a,))] if b is None else [
         (get_surface, (a,)), (get_surface, (b,)), (get_cross_market, (a, b)), (get_corr, (a, b)),
-        (get_corr_ci, (a, b)), (get_corr_monitor, (a, b)), (get_corr_history, (a, b, '3M', 3))]
+        (get_corr_ci, (a, b)), (get_corr_monitor, (a, b)), (get_corr_history, (a, b, '3M', 3)), (get_corr_skew, (a, b))]
     ok = True
     for fn, args in jobs:
         try:
@@ -2666,7 +2849,7 @@ def run_build(body):
                       fly_conv=body.get('fly_conv', 'broker'), atm_anchor=body.get('atm_anchor', 'formula'),
                       delta_mode=body.get('delta_mode', 'auto'), tenors=tenors,
                       rho_sig_by_tenor=rs, sig_rho_by_tenor=sr, wings=wings,
-                      rho_half_life=float(body.get('rho_half_life') or 0) or None)
+                      rho_half_life=float(body.get('rho_half_life') or 0) or None, skew_by_tenor=body.get('skew'))
     sA, sB = leg_info(s['leg_base'])[1], leg_info(s['leg_quote'])[1]
     pts = lambda x: None if x is None or not math.isfinite(x) else round(x * 100, 4)
     piv = lambda v: {k: pts(v[k]) for k in ('atm', 'rr25', 'rr10', 'bf25s', 'bf10s', 'bf25b', 'bf10b')}
@@ -2699,6 +2882,10 @@ def run_build(body):
                          'bf25_in': pts(l['bf25_in']), 'bf10_in': pts(l['bf10_in']),
                          'bs25': pts(l['bs25']), 'bs10': pts(l['bs10'])} for l in r['legs']],
                'flags': flags, 'secs': round(d['secs'], 2)}
+        sk = r['skew']
+        row['skew'] = {'mode': sk['mode'], 'beta_used': sk['beta_used'], 'beta_impl': sk['beta_impl'],
+                       'rr_mkt': pts(sk['rr_mkt']), 'rr25_beta0': pts(sk['rr25_beta0']), 'rr_ref': [pts(x) for x in sk['rr_ref']],
+                       'sabr_rho0': sk['sabr_rho0']}
         rows.append(row)
     return {'cross': s['cross'], 'leg_base': s['leg_base'], 'leg_quote': s['leg_quote'],
             'sign_note': s['sign_note'], 'rows': rows, 'errors': s['errors'],
@@ -3048,6 +3235,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._data('corr', get_corr, q['a'].upper(), q['b'].upper())
             elif u.path == '/api/cross_market':
                 self._data('cross_market', get_cross_market, q['a'].upper(), q['b'].upper())
+            elif u.path == '/api/corr_skew':
+                self._data('corr_skew', get_corr_skew, q['a'].upper(), q['b'].upper())
             elif u.path == '/api/corr_ci':
                 self._data('corr_ci', get_corr_ci, q['a'].upper(), q['b'].upper(), float(q.get('years', CI_HISTORY_YEARS)))
             elif u.path == '/api/corr_monitor':
@@ -3307,6 +3496,7 @@ table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
 <section class="grid2"><div class="card" id="cardA"></div><div class="card" id="cardB"></div></section>
 <section class="card" id="cardC"></section>
 <section class="card" id="results"><h2>Cross surface</h2><div class="empty">Generate to build the cross surface.</div></section>
+<section class="card" id="cardRR"></section>
 <section class="card" id="cardCI"></section>
 <section class="card" id="cardTri"></section>
 <!-- ladder card removed for now; to restore: <section class="card" id="cardLad"></section> (code still below) -->
@@ -3319,9 +3509,9 @@ const TENORS=['1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y'];
 const FIELDS=[['fwd_pts','Fwd pts'],['atm','ATM'],['rr25','25 RR'],['rr10','10 RR'],['bf25','25 BF'],['bf10','10 BF']];
 const LS='crossvol_state_v9';
 let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
-       legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{}},hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
+       legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{},beta:{}},skew_src:'implied',hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
 const $=id=>document.getElementById(id);
-function save(){try{localStorage.setItem(LS,JSON.stringify({...S,role:undefined,loadErr:undefined,result:null,hist:null,monData:null,ciData:null,band:null,bandBusy:false,lastBody:null,_ciP:null,_bandP:null,_syncP:undefined,sharedSite:undefined,dataVer:undefined,bbgUp:undefined}));}catch(e){}}
+function save(){try{localStorage.setItem(LS,JSON.stringify({...S,role:undefined,loadErr:undefined,result:null,hist:null,monData:null,ciData:null,skewData:null,band:null,bandBusy:false,lastBody:null,_ciP:null,_bandP:null,_syncP:undefined,sharedSite:undefined,dataVer:undefined,bbgUp:undefined}));}catch(e){}}
 function load(){try{const r=localStorage.getItem(LS);if(r)Object.assign(S,JSON.parse(r));}catch(e){}}
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 function status(msg,cls){const el=$('status');el.className='status '+(cls||'');el.textContent=msg||'';}
@@ -3565,7 +3755,7 @@ function renderCorr(){
   el.querySelectorAll('input.ovr').forEach(inp=>inp.onchange=()=>{const v=inp.value.trim();
     S.ov[inp.dataset.kind][inp.dataset.t]=v===''?null:parseFloat(v);save();renderCorr();});
   $('hlOv').onchange=e=>{const v=e.target.value.trim();S.hl_ov=v===''?null:parseFloat(v);save();renderCorr();};
-  renderTri();renderCI();
+  renderTri();renderCI();renderRR();
   document.querySelectorAll('#rhoSrc button').forEach(b=>{b.classList.toggle('on',S.rho_src===b.dataset.v);
     b.onclick=()=>{S.rho_src=b.dataset.v;save();renderCorr();};});
   if(S.mkt)el.insertAdjacentHTML('beforeend','<div class="note">Implied ρ backs out the variance formula from the market '+S.mkt.cross
@@ -3589,11 +3779,12 @@ function updateCross(){const c=crossName(S.pairA,S.pairB);$('crossName').textCon
 
 async function build(){
   if(!S.legs.A||!S.legs.B){status('Legs not loaded','err');return;}
+  S.ov.beta=S.ov.beta||{};await loadSkew();
   const pick=k=>{const o={};TENORS.forEach(t=>{const v=used(k,t);if(v!==null)o[t]=v;});return o;};
   const legBody=L=>{const rows={};TENORS.forEach(t=>{const r=L.rows[t];if(r&&r.atm!==null&&isFinite(r.atm))rows[t]=r;});
     return {pair:L.pair,spot:+L.spot,fwd_scale:+L.fwd_scale,rows};};
   const body={legA:legBody(S.legs.A),legB:legBody(S.legs.B),rho:pick('rho'),rho_sig:pick('rs'),sig_rho:pick('sr'),rho_half_life:usedHL(),
-    usd_rate:parseFloat($('usdRate').value)||0,fly_conv:S.fly_conv,wings:S.wings,atm_anchor:S.atm_anchor,delta_mode:S.delta_mode};
+    usd_rate:parseFloat($('usdRate').value)||0,fly_conv:S.fly_conv,wings:S.wings,atm_anchor:S.atm_anchor,delta_mode:S.delta_mode,skew:skewBody()};
   status('Building '+crossName(S.pairA,S.pairB)+'…');$('btnBuild').disabled=true;
   try{S.result=await api('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});S.lastBody=body;S.resultSig=Date.now();S.band=null;
     const R=S.result;if(!R.rows.find(r=>r.tenor===S.selTenor)&&R.rows.length)S.selTenor=R.rows[Math.min(4,R.rows.length-1)].tenor;
@@ -3661,7 +3852,7 @@ function renderResults(){
   el.innerHTML=h;
   $('btnCsv').onclick=exportCsv;
   $('selTenor').onchange=e=>{S.selTenor=e.target.value;drawSmile();};
-  drawSmile();drawTerms();
+  drawSmile();drawTerms();renderRR();
 }
 
 function baseLayout(ytitle){return {paper_bgcolor:css('--surface-1'),plot_bgcolor:css('--surface-1'),margin:{l:48,r:56,t:8,b:36},
@@ -4207,7 +4398,7 @@ function loadScriptOnce(name){
     s.onload=()=>res(!!window[name]);s.onerror=()=>{s.remove();res(false);};document.head.appendChild(s);})),Promise.resolve(false));
 }
 function allSectionDefs(){const c=crossNm(),A=S.legs.A,B=S.legs.B;
-  return [['cardA','Leg A'+(A?' — '+A.pair:'')],['cardB','Leg B'+(B?' — '+B.pair:'')],['cardC','Correlation inputs'],['results','Cross surface'],['cardCI','Confidence band & outliers'],
+  return [['cardA','Leg A'+(A?' — '+A.pair:'')],['cardB','Leg B'+(B?' — '+B.pair:'')],['cardC','Correlation inputs'],['results','Cross surface'],['cardRR','Risk reversals & correlation skew'],['cardCI','Confidence band & outliers'],
     ['cardTri','Triangle & gamma hedge'],['cardMon','Correlation monitor'],['cardAn','Correlation analytics']].map(([id,l])=>({id,label:l,cross:c}))
     .concat([['cadOverview','CAD crosses — overview'],['cadBook','CAD book — dephased vega'],['cadSurf','CAD crosses — surfaces']].map(([id,l])=>({id,label:l,cross:'CAD'})));}
 function sectionDefs(){return allSectionDefs().filter(d=>{const e=$(d.id);return e&&e.offsetParent!==null;});}   // sections on the visible tab
@@ -4226,6 +4417,7 @@ function redrawCharts(){
   try{if(S.hist)drawAnCharts();}catch(e){}
   try{if($('chTri'))triUpdate();}catch(e){}
   try{if(S.ciData)drawCI();}catch(e){}
+  try{if(S.result)drawRR();}catch(e){}
 }
 function freezeInputs(root){                  // copy live values into attributes so the clone shows them
   root.querySelectorAll('input').forEach(i=>{if(i.type==='checkbox'||i.type==='radio'){if(i.checked)i.setAttribute('checked','');else i.removeAttribute('checked');}
@@ -4349,7 +4541,9 @@ function ciRows(){
     return r;});
 }
 // ---- wing bands: the same build at the band's rho edges (server, parallel) ----
-function bandBody(rows){const B=S.lastBody;if(!B)return null;const lo={},mid={},hi={};
+function bandBody(rows){const B0=S.lastBody;if(!B0)return null;const lo={},mid={},hi={};
+  const sk={};((S.result&&S.result.rows)||[]).forEach(r=>{if(r.skew)sk[r.tenor]={mode:'value',beta:r.skew.beta_used};});   // beta fixed, RR free to move with rho
+  const B={...B0,skew:sk};
   rows.forEach(r=>{if(r.skip||!(r.tenor in (B.rho||{})))return;lo[r.tenor]=r.sg*r.yhi;mid[r.tenor]=r.cq;hi[r.tenor]=r.sg*r.ylo;});
   if(!Object.keys(mid).length)return null;return {...B,rho_bands:{lo,mid,hi}};}
 let _bandTimer=null,_bandSeq=0;
@@ -4461,6 +4655,109 @@ function smileBandTraces(t,K){const B=bandFresh();if(!B)return [];const cs=['lo'
   if(cs.length<2)return [];const up=K.map(x=>Math.max(...cs.map(c=>interp(c.k,c.v,x)))),dn=K.map(x=>Math.min(...cs.map(c=>interp(c.k,c.v,x))));
   return [{x:K,y:up,mode:'lines',line:{width:0},showlegend:false,hoverinfo:'skip'},
     {x:K,y:dn,mode:'lines',line:{width:0},fill:'tonexty',fillcolor:'rgba(57,135,229,0.16)',name:CI_LAB[ciCfg().level]+' ρ band',hoverinfo:'skip'}];}
+
+// ===================== Risk reversals & correlation skew =====================
+// beta = d rho_Y / d ln(cross). On screen: rho per +1% in the cross = beta / 100.
+function skewKey(){return S.pairA+'|'+S.pairB;}
+async function loadSkew(force){const k=skewKey();if(!force&&S.skewData&&S.skewData._k===k&&!S.skewData.error)return S.skewData;
+  try{const d=await api('/api/corr_skew?a='+S.pairA+'&b='+S.pairB);d._k=k;S.skewData=d;}catch(e){S.skewData={error:e.message,_k:k};}
+  return S.skewData;}
+function skewHist(t){const D=S.skewData;if(!D||D.error||D._k!==skewKey())return null;const h=(D.by_tenor||{})[t];
+  if(h&&h.beta!=null&&h.se!=null)return {beta:h.beta,se:h.se,t:h.t,n:h.n,src:'implied ρ history'};
+  const r=D.realized;return r&&r.beta!=null&&r.se!=null?{beta:r.beta,se:r.se,t:r.t,n:r.n,src:'realized ρ (fallback)'}:null;}
+function skewSrc(){return S.skew_src||'implied';}
+function mktRR(t,k){const m=S.mkt&&S.mkt.rows&&S.mkt.rows[t];const v=m&&m[k||'rr25'];return v==null||!isFinite(v)?null:+v;}
+function skewBody(){const o={},src=skewSrc();
+  TENORS.forEach(t=>{const ov=S.ov.beta&&S.ov.beta[t],h=skewHist(t),rr=mktRR(t);const e={};
+    if(rr!=null)e.rr_mkt=rr;
+    if(h)e.beta_ref=[h.beta,h.beta-1.96*h.se,h.beta+1.96*h.se];
+    if(ov!=null&&ov!==''&&isFinite(ov)){e.mode='value';e.beta=100*ov;}
+    else if(src==='implied'){e.mode='implied';e.beta=h?h.beta:0;}           // falls back to history where the cross RR isn't quoted
+    else if(src==='historical'){e.mode='value';e.beta=h?h.beta:0;}
+    else{e.mode='value';e.beta=0;}
+    o[t]=e;});
+  return o;}
+function rrRows(){const R=S.result;if(!R||R.cross!==crossNm())return null;
+  return R.rows.map(r=>{const k=r.skew||{},h=skewHist(r.tenor),ref=k.rr_ref||[];
+    const fair=ref[0],lo=ref.length>2?Math.min(ref[1],ref[2]):null,hi=ref.length>2?Math.max(ref[1],ref[2]):null,mk=k.rr_mkt;
+    const prem=mk!=null&&fair!=null?mk-fair:null,out=mk!=null&&lo!=null&&(mk<lo||mk>hi);
+    return {tenor:r.tenor,mkt:mk,model:r.rr25,beta0:k.rr25_beta0,fair,lo,hi,prem,out,bimpl:k.beta_impl,bused:k.beta_used,mode:k.mode,h,
+      mkt10:mktRR(r.tenor,'rr10'),model10:r.rr10};});}
+function b1(x,d=3){return x==null||!isFinite(x)?'—':sgn(x/100,d);}      // beta -> rho per +1%
+function renderRR(){
+  const el=$('cardRR');if(!el)return;const c=crossNm(),src=skewSrc(),D=S.skewData;
+  let h='<h2>Risk reversals &amp; correlation skew — '+(c||'')+(D&&D.source?' <span class="badge '+(D.source==='BBG'?'BBG':'PLACEHOLDER')+'">'+D.source+' history</span>':'')
+    +'<span style="flex:1"></span><span style="font-weight:400;color:var(--text-secondary);font-size:11px">correlation skew used in the build</span>'
+    +'<div class="seg" id="rrSrc"><button data-v="implied" title="Back the skew out of the market cross 25 RR (model RR = market); history where there is no quote">Implied (mkt RR)</button>'
+    +'<button data-v="historical" title="Use how implied correlation has actually moved with the cross">Historical</button><button data-v="off" title="No correlation skew: the RR comes from the legs\' smiles through the copula only">Off</button></div></h2>';
+  const rows=rrRows();
+  if(!rows){el.innerHTML=h+'<div class="empty">Generate the cross surface to see its risk reversals.</div>';wireRR();return;}
+  if(D&&D.note)h+='<div class="meta"><span>'+D.note+'</span>'+(D.realized&&D.realized.beta!=null?'<span>realized-correlation estimate (10y, 21-day blocks): '+b1(D.realized.beta)+' ± '+f(D.realized.se/100*1.96,3)+' per +1% (noisy; used only where there is no vol history)</span>':'')+'</div>';
+  if(D&&D.error)h+='<div class="note err">Skew history: '+D.error+'</div>';
+  const base=c.slice(0,3),rich=rows.filter(r=>r.out);
+  const grp=d=>{const g=rich.filter(r=>(r.prem<0)===d);if(!g.length)return '';const pr=g.map(r=>r.prem);
+    return '<b>'+base+(d?' puts':' calls')+' rich vs history</b> at '+g.map(r=>r.tenor).join(', ')+' (by '+f(Math.min(...pr.map(Math.abs)),2)+(g.length>1?'–'+f(Math.max(...pr.map(Math.abs)),2):'')+' vol)';};
+  h+='<div class="note '+(rich.length?'warn':'')+'" id="rrSummary" style="margin-top:6px">'+(rows.some(r=>r.mkt!=null)?(rich.length?'Market 25 RR outside what the historical correlation skew supports (95%): '
+    +[grp(true),grp(false)].filter(Boolean).join(' · ')
+    :'All market 25 RRs are within what the historical correlation skew supports (95%).'):'No market cross RR quotes: the skew comes from history'+(src==='off'?' (off)':'')+'.')+'</div>';
+  h+='<div class="scroll"><table id="rrTable"><thead><tr><th></th><th class="grp sep" colspan="4">25 RR (vol pts)</th><th class="grp sep" colspan="3">25 RR at the historical skew</th>'
+    +'<th class="grp sep" colspan="5">Correlation skew: ρ_Y per +1% in '+c+'</th><th class="grp sep" colspan="2">10 RR</th><th class="sep"></th></tr>'
+    +'<tr><th>Tenor</th><th class="sep">Market</th><th>Model</th><th title="no correlation skew: legs\' smiles through the copula only">Copula only</th><th>Missing skew</th>'
+    +'<th class="sep">Fair</th><th>95% band</th><th title="market minus fair">Premium</th>'
+    +'<th class="sep">Implied</th><th>Historical ± 95%</th><th title="t-stat of the historical estimate">t</th><th>Used</th><th>Override</th>'
+    +'<th class="sep">Market</th><th>Model</th><th class="sep">Flag</th></tr></thead><tbody>';
+  rows.forEach(r=>{const ov=S.ov.beta&&S.ov.beta[r.tenor];
+    h+='<tr data-t="'+r.tenor+'"><td class="lab">'+r.tenor+'</td><td class="sep">'+sgn(r.mkt,3)+'</td><td class="hl">'+sgn(r.model,3)+'</td><td>'+sgn(r.beta0,3)+'</td>'
+      +'<td title="what the correlation skew adds on top of the copula">'+(r.model!=null&&r.beta0!=null?sgn(r.model-r.beta0,3):'—')+'</td>'
+      +'<td class="sep">'+sgn(r.fair,3)+'</td><td>'+(r.lo!=null?sgn(r.lo,2)+' … '+sgn(r.hi,2):'—')+'</td><td class="'+(r.out?'err':'')+'">'+sgn(r.prem,3)+(r.out?' ⚑':'')+'</td>'
+      +'<td class="sep">'+b1(r.bimpl)+'</td><td>'+(r.h?b1(r.h.beta)+' ± '+f(1.96*r.h.se/100,3):'—')+'</td><td class="'+(r.h&&Math.abs(r.h.t)<2?'warn':'')+'" title="'+(r.h?r.h.src+', n '+r.h.n:'')+'">'+(r.h?f(r.h.t,1):'—')+'</td>'
+      +'<td class="hl" title="'+(r.mode==='implied'?'implied from the market RR':'value')+'">'+b1(r.bused)+'</td>'
+      +'<td><input class="num ovr" data-kind="beta" data-t="'+r.tenor+'" value="'+(ov==null?'':ov)+'" placeholder="—"></td>'
+      +'<td class="sep">'+sgn(r.mkt10,3)+'</td><td>'+sgn(r.model10,3)+'</td>'
+      +'<td class="sep '+(r.out?'err':'')+'" style="text-align:left">'+(r.out?(r.prem<0?'⚑ '+base+' puts rich vs history':'⚑ '+base+' calls rich vs history'):'')+'</td></tr>';});
+  h+='</tbody></table></div>';
+  const tOpts=rows.map(r=>'<option'+(r.tenor===(S.rrTenor||'3M')?' selected':'')+'>'+r.tenor+'</option>').join('');
+  h+='<div class="charts" style="margin-top:12px"><div><div class="meta"><b style="color:var(--text-primary)">25 RR term structure</b></div><div id="chRRterm" class="chart"></div></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Correlation skew</b> (ρ_Y per +1%)</div><div id="chRRbeta" class="chart"></div></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">How implied ρ moved with '+c+'</b> <select id="rrTenor">'+tOpts+'</select></div><div id="chRRscat" class="chart"></div></div></div>';
+  h+='<div class="note">Why the copula RR is too flat: it holds correlation fixed, but correlation moves with spot, and the RR prices that. If ρ_Y rises by β·(cross % move), '
+    +'the cross vol moves with the cross by −σAσB·β/σX, which the cross SABR takes as extra spot-vol correlation (its smile, 10 RR and flies follow). '
+    +'<b>Implied</b> backs β out of the market 25 RR so the model matches the market, then uses it for the 10 RR and wings; where a tenor has no RR quote it falls back to history. '
+    +'<b>Historical</b> = slope of daily changes in implied ρ_Y (cross and leg ATMs) on the cross\'s % move over 3y (Newey-West error); <b>Fair</b> = the 25 RR at that slope, with a 95% band from its uncertainty. '
+    +'A ⚑ means the market RR is outside that band: the market prices more (or less) correlation skew than history supports. Override (ρ per +1%) beats the source for that tenor.</div>';
+  el.innerHTML=h;wireRR();drawRR();
+}
+function wireRR(){
+  document.querySelectorAll('#rrSrc button').forEach(b=>{b.classList.toggle('on',skewSrc()===b.dataset.v);
+    b.onclick=async()=>{S.skew_src=b.dataset.v;save();renderRR();if(S.result)await build();};});
+  document.querySelectorAll('#rrTable input.ovr').forEach(inp=>inp.onchange=async()=>{const v=inp.value.trim();S.ov.beta=S.ov.beta||{};
+    S.ov.beta[inp.dataset.t]=v===''?null:parseFloat(v);save();if(S.result)await build();});
+  const ts=$('rrTenor');if(ts)ts.onchange=e=>{S.rrTenor=e.target.value;save();drawRR();};}
+function drawRR(){
+  if(typeof Plotly==='undefined'||!$('chRRterm'))return;const rows=rrRows();if(!rows)return;const x=rows.map(r=>r.tenor);
+  const has=k=>rows.some(r=>r[k]!=null);
+  const tr=[];
+  if(has('lo'))tr.push({x,y:rows.map(r=>r.hi),mode:'lines',line:{width:0},showlegend:false,hoverinfo:'skip'},
+    {x,y:rows.map(r=>r.lo),mode:'lines',line:{width:0},fill:'tonexty',fillcolor:'rgba(25,158,112,0.16)',name:'Historical skew, 95%',hoverinfo:'skip'});
+  if(has('fair'))tr.push({x,y:rows.map(r=>r.fair),mode:'lines',name:'At historical skew',line:{color:css('--s3'),width:1.5,dash:'dash'}});
+  tr.push({x,y:rows.map(r=>r.beta0),mode:'lines',name:'Copula only',line:{color:css('--ref'),width:1.5,dash:'dot'}},
+    {x,y:rows.map(r=>r.model),mode:'lines+markers',name:'Model',line:{color:css('--s1'),width:2},marker:{size:5}});
+  if(has('mkt'))tr.push({x:rows.filter(r=>r.mkt!=null).map(r=>r.tenor),y:rows.filter(r=>r.mkt!=null).map(r=>r.mkt),mode:'markers',name:'Market',
+    marker:{size:9,symbol:'diamond',color:rows.filter(r=>r.mkt!=null).map(r=>r.out?css('--critical'):css('--s2'))}});
+  const L=baseLayout('25 RR (vol pts)');L.xaxis.type='category';L.hovermode='x unified';L.margin.r=16;Plotly.react('chRRterm',tr,L,CFG);
+  const hb=rows.filter(r=>r.h);
+  const tb=[{x:hb.map(r=>r.tenor),y:hb.map(r=>r.h.beta/100),mode:'markers',name:'Historical (95%)',marker:{color:css('--s3'),size:7},
+      error_y:{type:'data',array:hb.map(r=>1.96*r.h.se/100),color:css('--s3'),thickness:1.2,width:4}},
+    {x:rows.filter(r=>r.bimpl!=null).map(r=>r.tenor),y:rows.filter(r=>r.bimpl!=null).map(r=>r.bimpl/100),mode:'lines+markers',name:'Implied (market RR)',line:{color:css('--s2'),width:2}},
+    {x,y:rows.map(r=>r.bused/100),mode:'lines',name:'Used',line:{color:css('--s1'),width:1.5,dash:'dash'}}];
+  const L2=baseLayout('ρ_Y per +1%');L2.xaxis.type='category';L2.hovermode='x unified';L2.margin.r=16;Plotly.react('chRRbeta',tb,L2,CFG);
+  const t=S.rrTenor||'3M',D=S.skewData,sc=D&&!D.error&&D.by_tenor&&D.by_tenor[t]&&D.by_tenor[t].scatter,hh=skewHist(t);
+  if(sc&&sc.dx&&sc.dx.length){const xs=sc.dx,mx=Math.max(...xs.map(Math.abs))||1;
+    const ts=[{x:xs,y:sc.dr,mode:'markers',name:'Days',marker:{size:4,color:css('--s1'),opacity:0.45},hovertemplate:'%{x:.2f}% → Δρ %{y:.3f}<extra></extra>'}];
+    if(hh)ts.push({x:[-mx,mx],y:[-mx*hh.beta/100,mx*hh.beta/100],mode:'lines',name:'Slope '+b1(hh.beta)+' per 1%',line:{color:css('--s3'),width:2}});
+    const L3=baseLayout('daily Δ implied ρ_Y');L3.hovermode='closest';L3.xaxis.title={text:crossNm()+' daily move (%)'};L3.margin.r=16;Plotly.react('chRRscat',ts,L3,CFG);}
+  else $('chRRscat').innerHTML='<div class="empty">No implied-correlation history for '+t+'.</div>';
+}
 
 // ===================== Shared data: refresh indicator + automatic reload of every open page =====================
 const SHARED_POLL_MS=60000;
@@ -4745,7 +5042,7 @@ async function init(){
     const so=$('btnSignOut');so.style.display='';so.onclick=async()=>{try{await fetch('/api/app_logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}location.reload();};}
   else if(st.lan){const t=$('roleTag');t.style.display='';t.textContent='Sharing on the network (host)';t.title='Colleagues sign in with the network password and see the data you load.';}
   ['pairA','pairB'].forEach(id=>{$(id).innerHTML=st.pairs.map(p=>'<option>'+p+'</option>').join('');$(id).value=S[id];
-    $(id).onchange=async e=>{S[id]=e.target.value;S.ov={rho:{},rs:{},sr:{}};updateCross();save();S.hist=null;S.mkt=null;S.monData=null;renderAnalytics();renderMonitor();
+    $(id).onchange=async e=>{S[id]=e.target.value;S.ov={rho:{},rs:{},sr:{},beta:{}};updateCross();save();S.hist=null;S.mkt=null;S.monData=null;renderAnalytics();renderMonitor();
       if(S.sharedSite){S.result=null;await syncAll(null,'Loaded '+crossNm()+' from the shared data');return;}
       await Promise.all([loadLeg(id==='pairA'?'A':'B'),loadCorr(),loadMkt()]);renderCorr();};});
   $('usdRate').value=S.usd_rate;$('usdRate').onchange=e=>{S.usd_rate=parseFloat(e.target.value)||0;save();};
@@ -5510,6 +5807,46 @@ def selftest():
         ctx_.load_cert_chain(cp_, kp_)
         fp = cert_fingerprint(cp_)
         check('self-signed certificate covers every name/IP and loads into TLS', nm <= cert_names(cp_) and len(fp) == 95, f'(SHA-256 {fp[:23]}…)')
+
+    print('\n19) Risk reversals: correlation skew in the cross SABR, implied and historical skew')
+    La_, Lb_ = placeholder_surface('EURUSD'), placeholder_surface('USDCAD')
+    rho_ = {t: -0.40 for t in ('1M', '3M', '1Y')}
+    kw = dict(rho_sig_by_tenor={t: 0.6 for t in rho_}, sig_rho_by_tenor={t: 0.2 for t in rho_})
+    s0 = build_surface(La_, Lb_, rho_, **kw)
+    sp = build_surface(La_, Lb_, rho_, skew_by_tenor={t: {'mode': 'value', 'beta': 3.0} for t in rho_}, **kw)
+    sm = build_surface(La_, Lb_, rho_, skew_by_tenor={t: {'mode': 'value', 'beta': -3.0} for t in rho_}, **kw)
+    worst, sym = 0.0, 0.0
+    for a_, p_, m_ in zip(s0['tenors'], sp['tenors'], sm['tenors']):
+        sa_, sb_ = La_['rows'][a_['tenor']]['atm'] / 100, Lb_['rows'][a_['tenor']]['atm'] / 100
+        approx = -0.674 * sa_ * sb_ * 3.0 * math.sqrt(a_['tenor_T'])                    # half the local skew x 25d strike gap
+        worst = max(worst, abs((p_['res']['rr25'] - a_['res']['rr25']) / approx - 1))
+        sym = max(sym, abs((p_['res']['rr25'] - a_['res']['rr25']) + (m_['res']['rr25'] - a_['res']['rr25'])) / abs(approx))
+    check('skew moves the 25 RR the right way, by the local-vol rule of thumb (±15%), symmetric in beta',
+          worst < 0.15 and sym < 0.1 and all(abs(a_['res']['rr25'] - a_['skew']['rr25_beta0']) < 1e-12 for a_ in s0['tenors']),
+          f'(worst {worst * 100:.0f}% from the approximation)')
+    si = build_surface(La_, Lb_, rho_, skew_by_tenor={t: {'mode': 'implied', 'rr_mkt': -0.60} for t in rho_}, **kw)
+    sv = build_surface(La_, Lb_, rho_, skew_by_tenor={r['tenor']: {'mode': 'value', 'beta': r['skew']['beta_impl']} for r in si['tenors']}, **kw)
+    check('implied skew: model 25 RR = market; rebuilding with that beta gives the same smile',
+          all(abs(r['res']['rr25'] * 100 + 0.60) < 1e-6 for r in si['tenors'])
+          and all(abs(a_['res'][k] - b_['res'][k]) < 1e-6 for a_, b_ in zip(si['tenors'], sv['tenors']) for k in ('rr25', 'rr10', 'bf25b', 'bf10b')),
+          '(betas ' + ', '.join(f"{r['tenor']} {r['skew']['beta_impl'] / 100:+.4f}" for r in si['tenors']) + ' per 1%)')
+    sf = build_surface(La_, Lb_, rho_, skew_by_tenor={t: {'mode': 'implied', 'beta': 1.5} for t in rho_}, **kw)
+    check('implied with no market RR falls back to the given beta (history)', all(r['skew']['beta_used'] == 1.5 and r['skew']['mode'] == 'value' for r in sf['tenors']))
+    rng = np.random.default_rng(3)
+    n_, bt = 756, 2.5
+    lx = np.cumsum(0.006 * rng.standard_normal(n_))
+    em = np.zeros(n_)
+    for i in range(1, n_):
+        em[i] = em[i - 1] + (2 / 22) * (lx[i] - em[i - 1])
+    rh_ = 0.3 + np.cumsum(0.002 * rng.standard_normal(n_)) + bt * (lx - em) + 0.01 * rng.standard_normal(n_)
+    est = skew_beta_implied_hist(lx, rh_)
+    check('historical skew recovers a known slope (daily implied-rho changes on cross moves)', abs(est['beta'] - bt * (1 - 2 / 22)) < 2 * est['se'],
+          f"(true {bt * (1 - 2 / 22):.2f}, estimate {est['beta']:.2f} ± {est['se']:.2f})")
+    bs_ = []
+    for k_ in range(60):
+        g1, g2 = rng.standard_normal(2520), rng.standard_normal(2520)
+        bs_.append(skew_beta_realized(0.007 * g1, 0.006 * (0.4 * g1 + math.sqrt(1 - 0.16) * g2))['beta'])
+    check('realized-correlation skew is unbiased when there is no skew', abs(np.mean(bs_)) < 3 * np.std(bs_) / math.sqrt(len(bs_)), f'(mean {np.mean(bs_):+.2f}, sd {np.std(bs_):.2f})')
 
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)
