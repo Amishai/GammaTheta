@@ -1966,6 +1966,10 @@ class MarketStore:
         self.wanted_cad = False
         self.version, self.updated, self.last_put = 0, None, 0.0
 
+    def touch(self):
+        with self.lock:
+            self._bump()
+
     def _bump(self):
         self.version += 1
         self.updated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -2162,6 +2166,142 @@ def fwd_to_points(v, spot, scale, kind='auto'):
     d_pts = abs(math.log(f_pts / spot)) if f_pts > 0 else float('inf')
     d_out = abs(math.log(f_out / spot)) if f_out > 0 else float('inf')
     return (v - spot) * scale if d_out < d_pts else v
+
+
+# ======================================================================
+# Your marks: published overrides of the leg surfaces
+# ----------------------------------------------------------------------
+# Stored per cell on the server (and in crossvol_marks.json next to the script, so a restart keeps
+# them). Applied on top of Bloomberg every time a surface is served, so a Bloomberg refresh updates
+# only the cells you haven't marked. Implied correlation / skew are always calibrated on the
+# Bloomberg legs against the market cross, then your marks move the cross from there.
+# ======================================================================
+MARK_FIELDS = ('fwd_pts', 'atm', 'rr25', 'rr10', 'bf25', 'bf10')
+MARKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'crossvol_marks.json')
+MARKS = {}
+MARKS_LOCK = threading.Lock()
+
+
+def load_marks(path=None):
+    path = path or MARKS_FILE
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        with MARKS_LOCK:
+            MARKS.clear()
+            MARKS.update({k.upper(): v for k, v in data.items() if isinstance(v, dict)})
+        if MARKS:
+            log(f"Loaded your marks for {', '.join(sorted(MARKS))} from {os.path.basename(path)}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f'could not read marks file {path}: {e}')
+
+
+def save_marks(path=None):
+    path = path or MARKS_FILE
+    with MARKS_LOCK:
+        data = json.dumps(MARKS, indent=1, sort_keys=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as fh:
+        fh.write(data)
+    os.replace(tmp, path)
+
+
+def apply_marks(surf, mode='mine'):
+    """Surface with your marks on top (mode 'mine') or raw (mode 'bbg'). Always carries the raw
+    Bloomberg rows / spot (for calibration) and which cells are marked."""
+    pair = surf['pair'].upper()
+    out = dict(surf)
+    out['rows'] = {t: dict(r) for t, r in surf['rows'].items()}
+    out['bbg_rows'] = {t: dict(r) for t, r in surf['rows'].items()}
+    out['bbg_spot'] = surf['spot']
+    out['marked'], out['marked_spot'], out['marks_at'] = {}, None, None
+    with MARKS_LOCK:
+        m = json.loads(json.dumps(MARKS.get(pair))) if MARKS.get(pair) else None
+    out['has_marks'] = bool(m)
+    if mode == 'bbg' or not m:
+        return out
+    for t, cells in (m.get('cells') or {}).items():
+        if t not in out['rows']:
+            if 'atm' not in cells:
+                continue
+            out['rows'][t] = {k: 0.0 for k in MARK_FIELDS}
+        for k, c in cells.items():
+            if k in MARK_FIELDS:
+                out['rows'][t][k] = c['v']
+                out['marked'].setdefault(t, {})[k] = {'v': c['v'], 'bbg_then': c.get('bbg'),
+                                                      'bbg_now': (surf['rows'].get(t) or {}).get(k)}
+    if m.get('spot'):
+        out['spot'] = m['spot']['v']
+        out['marked_spot'] = {'v': m['spot']['v'], 'bbg_then': m['spot'].get('bbg'), 'bbg_now': surf['spot']}
+    out['marks_at'] = m.get('at')
+    out['source'] = surf['source'] + '+MARKS'
+    return out
+
+
+def publish_marks(pair, cells, spot=None, raw=None):
+    """Replace your marks for `pair` with `cells` {tenor: {field: value}} (+ optional spot). Records the
+    Bloomberg value at publish time next to each mark. Empty = back to Bloomberg."""
+    pair = pair.upper()
+    rows = (raw or {}).get('rows') or {}
+    rec = {}
+    for t, fl in (cells or {}).items():
+        for k, v in (fl or {}).items():
+            if k in MARK_FIELDS and v is not None and math.isfinite(float(v)):
+                rec.setdefault(t, {})[k] = {'v': float(v), 'bbg': (rows.get(t) or {}).get(k)}
+    sp = {'v': float(spot), 'bbg': (raw or {}).get('spot')} if spot is not None and math.isfinite(float(spot)) else None
+    with MARKS_LOCK:
+        if rec or sp:
+            MARKS[pair] = {'cells': rec, 'spot': sp, 'at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        else:
+            MARKS.pop(pair, None)
+    save_marks()
+    return sum(len(v) for v in rec.values()) + (1 if sp else 0)
+
+
+def marks_summary():
+    with MARKS_LOCK:
+        return {p: {'cells': sum(len(v) for v in (m.get('cells') or {}).values()) + (1 if m.get('spot') else 0), 'at': m.get('at')}
+                for p, m in MARKS.items()}
+
+
+def legs_differ(L1, L2):
+    if L1 is None or L2 is None:
+        return False
+    if abs(float(L1['spot']) - float(L2['spot'])) > 1e-12:
+        return True
+    for t in set(L1['rows']) | set(L2['rows']):
+        a, b = L1['rows'].get(t) or {}, L2['rows'].get(t) or {}
+        for k in MARK_FIELDS:
+            x, y = a.get(k), b.get(k)
+            if (x is None) != (y is None) or (x is not None and abs(float(x) - float(y)) > 1e-12):
+                return True
+    return False
+
+
+def build_calibrated(legA, legB, rho, legA_mkt=None, legB_mkt=None, skew_by_tenor=None, **kw):
+    """build_surface on your legs, with any IMPLIED correlation skew calibrated on the Bloomberg legs
+    against the market cross RR first, then held fixed (so your leg marks move the cross RR)."""
+    implied = skew_by_tenor and any((v or {}).get('mode') == 'implied' for v in skew_by_tenor.values())
+    if not (implied and (legs_differ(legA, legA_mkt) or legs_differ(legB, legB_mkt))):
+        return build_surface(legA, legB, rho, skew_by_tenor=skew_by_tenor, **kw)
+    cal = build_surface(legA_mkt or legA, legB_mkt or legB, rho, skew_by_tenor=skew_by_tenor, **kw)
+    bi = {r['tenor']: r['skew'] for r in cal['tenors']}
+    sk2 = {}
+    for t, v in skew_by_tenor.items():
+        c = bi.get(t)
+        if (v or {}).get('mode') == 'implied' and c and c['mode'] == 'implied':
+            sk2[t] = {**v, 'mode': 'value', 'beta': c['beta_impl'], 'rr_mkt': None}
+        else:
+            sk2[t] = v
+    s = build_surface(legA, legB, rho, skew_by_tenor=sk2, **kw)
+    for r in s['tenors']:
+        c = bi.get(r['tenor'])
+        if c and c['mode'] == 'implied' and (skew_by_tenor.get(r['tenor']) or {}).get('mode') == 'implied':
+            r['skew'].update(mode='implied', beta_impl=c['beta_impl'], rr_mkt=c['rr_mkt'], calibrated_on='bloomberg legs')
+    s['calibrated_on_bbg'] = True
+    return s
 
 
 def get_surface(pair):
@@ -2476,8 +2616,10 @@ def _cad_build_worker(args):
     """Runs in a worker process: one cross surface."""
     legA, legB, rho, rs, sr, hl = args[:6]
     skew = args[6] if len(args) > 6 else None
+    legA_mkt, legB_mkt = (args[7], args[8]) if len(args) > 8 else (None, None)
     try:
-        return build_surface(legA, legB, rho, rho_sig_by_tenor=rs, sig_rho_by_tenor=sr, rho_half_life=hl, skew_by_tenor=skew)
+        return build_calibrated(legA, legB, rho, legA_mkt=legA_mkt, legB_mkt=legB_mkt, rho_sig_by_tenor=rs, sig_rho_by_tenor=sr,
+                                rho_half_life=hl, skew_by_tenor=skew)
     except Exception as e:
         return {'fatal': f'{type(e).__name__}: {e}'}
 
@@ -2500,6 +2642,7 @@ class CadBoard:
                     'asof_by_src': {k: v['asof'] for k, v in self.snaps.items()}}
 
     def start(self, rho_src='implied', mode='live', wait=False):
+        """rho_src: 'implied' / 'realized', optionally with your marks choice as 'implied|bbg' ('|mine' default)."""
         """Build the board for one or more rho sources in `mode` (live / store). wait=True blocks
         (used by the shared refresh, which first waits for any build in progress)."""
         srcs = [rho_src] if isinstance(rho_src, str) else list(rho_src)
@@ -2517,8 +2660,9 @@ class CadBoard:
         def go():
             try:
                 for src in srcs:
+                    rs_, _, mk_ = src.partition('|')
                     with data_mode_ctx(mode):
-                        self._run(src)
+                        self._run(rs_, mk_ or 'mine')
             finally:
                 with self.lock:
                     self.building = False
@@ -2560,22 +2704,24 @@ class CadBoard:
                     self.progress['done'] += 1
             return out
 
-    def _run(self, rho_src):
+    def _run(self, rho_src, marks='mine'):
         t0 = time.time()
         try:
-            legs = {}
+            legs, raw = {}, {}
             for p in sorted({p for ab in CAD_CROSSES for p in ab}):
-                legs[p] = get_surface(p)
+                raw[p] = get_surface(p)
+                legs[p] = apply_marks(raw[p], marks)
             prep = []
             for a, b in CAD_CROSSES:
                 La, Lb = legs[a], legs[b]
+                Ra, Rb = raw[a], raw[b]                                # implied rho / skew calibrate on Bloomberg
                 M = get_cross_market(a, b)
                 C = self._corr(a, b)
                 sA, sB = leg_info(a)[1], leg_info(b)[1]
                 sg = sA * sB
                 imp_q, real_q, used_q = {}, {}, {}
                 for t in TENORS:
-                    ra, rb, mx = La['rows'].get(t), Lb['rows'].get(t), (M.get('rows') or {}).get(t)
+                    ra, rb, mx = Ra['rows'].get(t), Rb['rows'].get(t), (M.get('rows') or {}).get(t)
                     iq = None
                     if ra and rb and mx and mx.get('atm'):
                         v = sg * implied_rho_y(ra['atm'], rb['atm'], mx['atm'])
@@ -2602,17 +2748,18 @@ class CadBoard:
                     rr = ((M.get('rows') or {}).get(t) or {}).get('rr25')
                     skew[t] = {'mode': 'implied', 'beta': hb or 0.0, **({'rr_mkt': rr} if rr is not None else {})}
                 prep.append({'a': a, 'b': b, 'La': La, 'Lb': Lb, 'M': M, 'C': C, 'sg': sg,
-                             'imp': imp_q, 'real': real_q, 'used': used_q, 'job': (La, Lb, used_q, rs, sr, hl, skew)})
+                             'imp': imp_q, 'real': real_q, 'used': used_q, 'job': (La, Lb, used_q, rs, sr, hl, skew, Ra, Rb)})
             with self.lock:
                 self.progress['stage'] = 'building surfaces'
             built = self._pool_map([p['job'] for p in prep])
             crosses = [self._summarise(p, s, rho_src) for p, s in zip(prep, built)]
             snap = {'asof': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'secs': round(time.time() - t0, 1),
-                    'rho_src': rho_src, 'crosses': crosses, 'tenors': TENORS,
-                    'sources': sorted({legs[p]['source'] for p in legs}), 'data_version': STORE.version}
+                    'rho_src': rho_src, 'marks': marks, 'crosses': crosses, 'tenors': TENORS,
+                    'sources': sorted({legs[p]['source'] for p in legs}), 'data_version': STORE.version,
+                    'marked_legs': sorted(p for p in legs if legs[p].get('marked') or legs[p].get('marked_spot'))}
             with self.lock:
                 self.snapshot = snap
-                self.snaps[rho_src] = snap
+                self.snaps[f'{rho_src}|{marks}'] = snap
         except NotInStore as e:
             with STORE.lock:
                 STORE.wanted_cad = True
@@ -2845,11 +2992,13 @@ def run_build(body):
     legA, legB = body['legA'], body['legB']
     tenors = [t for t in TENORS if t in rho and t in legA['rows'] and t in legB['rows']]
     wings = body.get('wings', 'vov')
-    s = build_surface(legA, legB, rho, usd_rate=float(body.get('usd_rate', 4.0)) / 100,
+    s = build_calibrated(legA, legB, rho, legA_mkt=body.get('legA_mkt'), legB_mkt=body.get('legB_mkt'),
+                      usd_rate=float(body.get('usd_rate', 4.0)) / 100,
                       fly_conv=body.get('fly_conv', 'broker'), atm_anchor=body.get('atm_anchor', 'formula'),
                       delta_mode=body.get('delta_mode', 'auto'), tenors=tenors,
                       rho_sig_by_tenor=rs, sig_rho_by_tenor=sr, wings=wings,
                       rho_half_life=float(body.get('rho_half_life') or 0) or None, skew_by_tenor=body.get('skew'))
+    # (implied rho is computed by the page from the Bloomberg leg ATMs; implied skew is calibrated above)
     sA, sB = leg_info(s['leg_base'])[1], leg_info(s['leg_quote'])[1]
     pts = lambda x: None if x is None or not math.isfinite(x) else round(x * 100, 4)
     piv = lambda v: {k: pts(v[k]) for k in ('atm', 'rr25', 'rr10', 'bf25s', 'bf10s', 'bf25b', 'bf10b')}
@@ -2883,7 +3032,7 @@ def run_build(body):
                          'bs25': pts(l['bs25']), 'bs10': pts(l['bs10'])} for l in r['legs']],
                'flags': flags, 'secs': round(d['secs'], 2)}
         sk = r['skew']
-        row['skew'] = {'mode': sk['mode'], 'beta_used': sk['beta_used'], 'beta_impl': sk['beta_impl'],
+        row['skew'] = {'mode': sk['mode'], 'beta_used': sk['beta_used'], 'beta_impl': sk['beta_impl'], 'calibrated_on': sk.get('calibrated_on'),
                        'rr_mkt': pts(sk['rr_mkt']), 'rr25_beta0': pts(sk['rr25_beta0']), 'rr_ref': [pts(x) for x in sk['rr_ref']],
                        'sabr_rho0': sk['sabr_rho0']}
         rows.append(row)
@@ -2891,7 +3040,7 @@ def run_build(body):
             'sign_note': s['sign_note'], 'rows': rows, 'errors': s['errors'],
             'calendar_flags': s['calendar_flags'], 'secs': round(time.time() - t0, 2),
             'atm_anchor': body.get('atm_anchor', 'formula'), 'fly_conv': body.get('fly_conv', 'broker'),
-            'wings': wings}
+            'wings': wings, 'calibrated_on_bbg': bool(s.get('calibrated_on_bbg'))}
 
 
 _POOL = {'ex': None}
@@ -3230,7 +3379,13 @@ class Handler(BaseHTTPRequestHandler):
                                  'tls': SERVER['tls'], 'viewers_pull': viewer_may_pull(),
                                  'shared': {**STORE.stats(), 'refresh': refresh_info()}})
             elif u.path == '/api/surface':
-                self._data('surface', get_surface, q['pair'].upper())
+                role_, pref = self._role(), self.headers.get('X-CV-Source') == 'store'
+                code, out = serve_data(role_, 'surface', get_surface, q['pair'].upper(), prefer_store=pref)
+                if code == 200:
+                    out = apply_marks(out, 'bbg' if q.get('marks') == 'bbg' else 'mine')
+                self._send(code, out, headers={'X-Data-Version': str(STORE.version)} if (role_ == 'host' and not pref) else None)
+            elif u.path == '/api/marks':
+                self._send(200, {'marks': marks_summary()})
             elif u.path == '/api/corr':
                 self._data('corr', get_corr, q['a'].upper(), q['b'].upper())
             elif u.path == '/api/cross_market':
@@ -3254,7 +3409,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     with CAD_BOARD.lock:
                         src = q.get('rho_src')
-                        snap = CAD_BOARD.snaps.get(src) if src else CAD_BOARD.snapshot
+                        snap = CAD_BOARD.snaps.get(f"{src}|{q.get('marks') or 'mine'}") if src else CAD_BOARD.snapshot
                     self._send(200, {'snapshot': snap, **CAD_BOARD.status()})
             else:
                 self._send(404, {'error': 'not found'})
@@ -3314,6 +3469,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(401, {'error': 'locked'})
                     return
                 src = body.get('rho_src', 'implied') if body.get('rho_src') in ('implied', 'realized') else 'implied'
+                src = f"{src}|{'bbg' if body.get('marks') == 'bbg' else 'mine'}"
                 mode = 'live' if (role == 'host' or viewer_may_pull()) else 'store'
                 if mode == 'store':                          # viewers rebuild from the shared data, never Bloomberg
                     with CAD_BOARD.lock:
@@ -3323,6 +3479,25 @@ class Handler(BaseHTTPRequestHandler):
                         return
                 started = CAD_BOARD.start(src, mode=mode)
                 self._send(200, {'started': started, **CAD_BOARD.status()})
+                return
+            if path == '/api/marks':
+                if role != 'host':
+                    self._send(403, {'error': 'only the host publishes marks'})
+                    return
+                pair = str(body.get('pair', '')).upper()
+                if pair not in LEG_PAIRS:
+                    self._send(400, {'error': f'unknown pair {pair}'})
+                    return
+                with data_mode_ctx('prefer_store'):
+                    raw = get_surface(pair)
+                n = publish_marks(pair, body.get('cells') or {}, body.get('spot'), raw)
+                STORE.touch()                                     # every open page reloads; cached results go stale
+                log(f'marks {pair}: {n} cell(s) published' if n else f'marks {pair}: cleared (back to Bloomberg)')
+                with CAD_BOARD.lock:
+                    mine = [k for k in CAD_BOARD.snaps if k.endswith('|mine')]
+                if mine and any(pair in ab for ab in CAD_CROSSES):
+                    threading.Thread(target=CAD_BOARD.start, args=(mine, 'prefer_store', True), daemon=True).start()
+                self._send(200, {'n': n, 'surface': apply_marks(raw, 'mine'), 'marks': marks_summary()})
                 return
             if path == '/api/refresh_shared':
                 if role != 'host':
@@ -3468,6 +3643,8 @@ table.grid input.num{width:100%;min-width:58px;border-radius:3px;cursor:cell}
 table.grid input.num:focus{outline:2px solid var(--accent);outline-offset:-1px;cursor:text}
 table.grid input.num.gsel{background:rgba(57,135,229,.20);border-color:var(--accent)}
 table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
+table.grid input.num.marked,.meta input.num.marked{background:rgba(201,133,0,.17)}
+.badge.marks{background:rgba(201,133,0,.18);color:var(--s4)}
 </style></head><body>
 <header><h1>Cross Vol Builder</h1><span class="pill"><span id="bbgDot" class="dot"></span><span id="bbgTxt">checking Bloomberg…</span></span>
 <span class="pill" id="asof" style="background:none"></span><span class="pill" id="roleTag" style="display:none"></span><button class="act" id="btnSignOut" style="display:none;padding:3px 9px;font-size:11px">Sign out</button>
@@ -3485,6 +3662,7 @@ table.grid input.num.dirty{border-color:var(--s4);border-width:2px}
   <div class="f"><label class="f">Wings</label><div class="seg" data-k="wings"><button data-v="vov">Vol-of-vol</button><button data-v="copula">Copula</button></div></div>
   <div class="f"><label class="f">Cross ATM</label><div class="seg" data-k="atm_anchor"><button data-v="formula">Variance formula</button><button data-v="copula">Raw copula</button></div></div>
   <div class="f"><label class="f">Delta</label><div class="seg" data-k="delta_mode"><button data-v="auto">Auto</button><button data-v="spot">Spot</button><button data-v="forward">Fwd</button></div></div>
+  <div class="f"><label class="f">Calculate with</label><div class="seg" id="marksMode" title="Your marks = Bloomberg with your published marks (and any unpublished edits) on top. Compare builds both and shows what your marks do to the cross."><button data-v="mine">My marks</button><button data-v="bbg">Bloomberg</button><button data-v="compare">Compare</button></div></div>
   <span style="flex:1"></span>
   <button class="act" id="btnPull" title="Fresh Bloomberg pull of both legs and the market cross quotes (implied ρ)">Refresh BBG + implied ρ</button>
   <button class="act" id="btnCorr">Pull realized</button>
@@ -3509,9 +3687,9 @@ const TENORS=['1W','2W','1M','2M','3M','6M','9M','1Y','18M','2Y'];
 const FIELDS=[['fwd_pts','Fwd pts'],['atm','ATM'],['rr25','25 RR'],['rr10','10 RR'],['bf25','25 BF'],['bf10','10 BF']];
 const LS='crossvol_state_v9';
 let S={pairA:'EURUSD',pairB:'USDCAD',usd_rate:4.0,fly_conv:'broker',wings:'vov',atm_anchor:'formula',delta_mode:'auto',
-       legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{},beta:{}},skew_src:'implied',hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
+       legs:{A:null,B:null},corr:null,ov:{rho:{},rs:{},sr:{},beta:{}},skew_src:'implied',marks_mode:'mine',hl_ov:null,result:null,selTenor:'3M',mkt:null,rho_src:'implied',an:{tenor:'3M',years:3,vega:100000},hist:null,mon:{tenor:'1M',window:21,ma:5,years:1},monData:null};
 const $=id=>document.getElementById(id);
-function save(){try{localStorage.setItem(LS,JSON.stringify({...S,role:undefined,loadErr:undefined,result:null,hist:null,monData:null,ciData:null,skewData:null,band:null,bandBusy:false,lastBody:null,_ciP:null,_bandP:null,_syncP:undefined,sharedSite:undefined,dataVer:undefined,bbgUp:undefined}));}catch(e){}}
+function save(){try{localStorage.setItem(LS,JSON.stringify({...S,resultBbg:null,_cmpP:null,role:undefined,loadErr:undefined,result:null,hist:null,monData:null,ciData:null,skewData:null,band:null,bandBusy:false,lastBody:null,_ciP:null,_bandP:null,_syncP:undefined,sharedSite:undefined,dataVer:undefined,bbgUp:undefined}));}catch(e){}}
 function load(){try{const r=localStorage.getItem(LS);if(r)Object.assign(S,JSON.parse(r));}catch(e){}}
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 function status(msg,cls){const el=$('status');el.className='status '+(cls||'');el.textContent=msg||'';}
@@ -3604,6 +3782,8 @@ function legGrid(which){
   const paint=(force)=>{for(let r=0;r<nR;r++)for(let c=0;c<nC;c++){const el=cell(r,c);if(!el)continue;
       if(force||document.activeElement!==el)el.value=show(get(r,c));
       const o=orig(r,c),v=get(r,c);el.classList.toggle('dirty',o!==undefined&&!(o===v||(o==null&&v==null)||(o!=null&&v!=null&&Math.abs(o-v)<1e-12)));
+      const mk=L.marked&&L.marked[TENORS[r]]&&L.marked[TENORS[r]][GRID_KEYS[c]];el.classList.toggle('marked',!!mk);
+      el.title=mk?'Your mark '+show(mk.v)+' · Bloomberg when you published '+show(mk.bbg_then)+' · Bloomberg now '+show(mk.bbg_now):'';
       const s=G.sel,inS=r>=Math.min(s.r0,s.r1)&&r<=Math.max(s.r0,s.r1)&&c>=Math.min(s.c0,s.c1)&&c<=Math.max(s.c0,s.c1);
       el.classList.toggle('gsel',inS&&!(s.r0===s.r1&&s.c0===s.c1));}
     const nd=tbl.querySelectorAll('input.dirty').length,el=$('gridInfo'+which);
@@ -3688,10 +3868,15 @@ function renderLeg(which){
   const L=S.legs[which],el=$('card'+which),pair=which==='A'?S.pairA:S.pairB;
   if(!L){const er=(S.loadErr||{})[which];el.innerHTML='<h2>'+pair+'</h2><div class="empty'+(er?' warn':'')+'">'+(er||'loading…')+'</div>';return;}
   if(!L._orig)L._orig=JSON.parse(JSON.stringify(L.rows));
-  let h='<h2>Leg '+which+' — '+L.pair+' <span class="badge '+L.source+'">'+L.source+'</span><span style="flex:1"></span>'
-    +'<button class="act" style="padding:3px 9px;font-size:11px" id="gCopy'+which+'">Copy table</button>'
-    +'<button class="act" style="padding:3px 9px;font-size:11px" id="gRevert'+which+'">Revert to pull</button></h2>';
-  h+='<div class="meta"><label>Spot <input class="num wide" data-k="spot" value="'+L.spot+'"></label>'
+  const nM=marksCount(L),host=S.role!=='viewer',bbgMode=S.marks_mode==='bbg',bt='padding:3px 9px;font-size:11px';
+  let h='<h2>Leg '+which+' — '+L.pair+' <span class="badge '+String(L.source).split('+')[0]+'">'+String(L.source).split('+')[0]+'</span>'
+    +(nM?' <span class="badge marks" title="Published '+(L.marks_at||'')+'. Bloomberg refreshes don\'t touch these cells.">MY MARKS · '+nM+'</span>':'')
+    +(bbgMode&&L.has_marks?' <span class="badge info" title="Calculate with: Bloomberg">marks hidden</span>':'')+'<span style="flex:1"></span>'
+    +'<button class="act" style="'+bt+'" id="gCopy'+which+'">Copy table</button>'
+    +'<button class="act" style="'+bt+'" id="gRevert'+which+'" title="Throw away unpublished edits (back to your published marks / Bloomberg)">Discard edits</button>'
+    +(host&&!bbgMode?'<button class="act primary" style="'+bt+'" id="gPublish'+which+'" title="Make the edited cells your marks: kept through Bloomberg refreshes and used everywhere (CAD tab, colleagues)">Publish</button>'
+      +'<button class="act" style="'+bt+'" id="gBbg'+which+'" title="Delete your marks for '+L.pair+' and go back to Bloomberg"'+(L.has_marks?'':' disabled')+'>Revert to Bloomberg</button>':'')+'</h2>';
+  h+='<div class="meta"><label>Spot <input class="num wide'+(L.marked_spot?' marked':'')+'" data-k="spot" value="'+(+(+L.spot).toPrecision(12))+'"'+(L.marked_spot?' title="Your mark '+L.marked_spot.v+' · Bloomberg now '+L.marked_spot.bbg_now+'"':'')+'></label>'
     +'<label>Fwd scale <input class="num" data-k="fwd_scale" value="'+L.fwd_scale+'"></label>'
     +(L.asof?'<span>as of '+L.asof+'</span>':'')+'<span id="gridInfo'+which+'" class="warn"></span></div>';
   h+='<div class="scroll"><table class="grid" id="grid'+which+'"><thead><tr><th>Tenor</th>'+FIELDS.map(x=>'<th>'+x[1]+'</th>').join('')+'</tr></thead><tbody>';
@@ -3702,12 +3887,17 @@ function renderLeg(which){
   if(L.note)h+='<div class="note '+(L.source==='PLACEHOLDER'?'warn':'')+'">'+L.note+'</div>';
   h+='<div class="note">RR = '+L.pair.slice(0,3)+' calls minus puts. Vols/RR/BF in vol points; fwd pts in pips (F = spot + pts / scale). '
     +'<b>Excel-style:</b> paste a block from Excel into any cell (or a whole sheet with headers / tenor labels, matched by name); arrows / Enter / Tab move; '
-    +'click + type replaces, double-click or F2 edits in place; shift+arrows or drag select; Ctrl+C copies, Delete clears, Ctrl+D fills down, Ctrl+Z undoes. Changed cells are outlined.</div>';
+    +'click + type replaces, double-click or F2 edits in place; shift+arrows or drag select; Ctrl+C copies, Delete clears, Ctrl+D fills down, Ctrl+Z undoes. '
+    +'<b>Edited cells are outlined</b>: unpublished edits, used in your own calculations only. <b>Publish</b> makes them your marks (shaded): kept through Bloomberg refreshes, '
+    +'used on the CAD tab and by colleagues, saved on the server. Implied correlation and skew always calibrate on the Bloomberg legs, so your marks move the cross.</div>';
   el.innerHTML=h;
   el.querySelectorAll('.meta input[data-k]').forEach(inp=>inp.onchange=()=>{const v=parseCell(inp.value);if(v!=null&&!Number.isNaN(v))L[inp.dataset.k]=v;inp.classList.add('dirty');save();renderTri();});
   $('gCopy'+which).onclick=async()=>{const txt=gridTSV(which);try{await navigator.clipboard.writeText(txt);status('Copied '+L.pair+' table (paste straight into Excel)');}
     catch(e){status('Clipboard blocked by the browser — select a range and use Ctrl+C instead','warn');}};
-  $('gRevert'+which).onclick=()=>$('grid'+which)._g.api.revert();
+  $('gRevert'+which).onclick=()=>{$('grid'+which)._g.api.revert();const sp=el.querySelector('.meta input[data-k="spot"]');if(L._origSpot!=null){L.spot=L._origSpot;if(sp){sp.value=L.spot;sp.classList.remove('dirty');}}};
+  if($('gPublish'+which))$('gPublish'+which).onclick=()=>publishLeg(which);
+  if($('gBbg'+which))$('gBbg'+which).onclick=()=>revertLegToBbg(which);
+  if(L._origSpot==null)L._origSpot=L.spot;
   legGrid(which);
 }
 
@@ -3718,7 +3908,7 @@ function realized(kind,t){const C=S.corr;if(!C)return null;
   return C.corr_vol&&C.corr_vol.value!=null?C.corr_vol.value:null;}
 function orient(p){return p.slice(3)==='USD'?1:-1;}
 function impliedQ(t){const M=S.mkt;if(!M||!M.rows||!M.rows[t]||!S.legs.A||!S.legs.B)return null;
-  const ra=S.legs.A.rows[t],rb=S.legs.B.rows[t];if(!ra||!rb)return null;
+  const ra=(S.legs.A.bbg_rows||S.legs.A.rows)[t],rb=(S.legs.B.bbg_rows||S.legs.B.rows)[t];if(!ra||!rb)return null;   // calibrate on Bloomberg, not on your marks
   const a=+ra.atm,b=+rb.atm,x=+M.rows[t].atm;if(!(a>0&&b>0&&x>0))return null;
   return orient(S.legs.A.pair)*orient(S.legs.B.pair)*(a*a+b*b-x*x)/(2*a*b);}
 function used(kind,t){const o=ovr(kind,t);if(o!==null)return o;
@@ -3766,7 +3956,7 @@ function renderCorr(){
 async function loadLeg(which){
   const pair=which==='A'?S.pairA:S.pairB;S.legs[which]=null;renderLeg(which);
   S.loadErr=S.loadErr||{};delete S.loadErr[which];
-  try{S.legs[which]=await api('/api/surface?pair='+pair);S.asof=new Date();updateAsof();}catch(e){S.loadErr[which]=e.message;status('Surface '+pair+': '+e.message,'err');}
+  try{S.legs[which]=await api('/api/surface?pair='+pair+'&marks='+marksQ());S.asof=new Date();updateAsof();}catch(e){S.loadErr[which]=e.message;status('Surface '+pair+': '+e.message,'err');}
   renderLeg(which);save();
 }
 async function loadMkt(){try{S.mkt=await api('/api/cross_market?a='+S.pairA+'&b='+S.pairB);}catch(e){S.mkt=null;status('Cross quotes: '+e.message,'err');}
@@ -3783,14 +3973,15 @@ async function build(){
   const pick=k=>{const o={};TENORS.forEach(t=>{const v=used(k,t);if(v!==null)o[t]=v;});return o;};
   const legBody=L=>{const rows={};TENORS.forEach(t=>{const r=L.rows[t];if(r&&r.atm!==null&&isFinite(r.atm))rows[t]=r;});
     return {pair:L.pair,spot:+L.spot,fwd_scale:+L.fwd_scale,rows};};
-  const body={legA:legBody(S.legs.A),legB:legBody(S.legs.B),rho:pick('rho'),rho_sig:pick('rs'),sig_rho:pick('sr'),rho_half_life:usedHL(),
+  const body={legA:legBody(S.legs.A),legB:legBody(S.legs.B),
+    ...((legDiffers(S.legs.A)||legDiffers(S.legs.B))?{legA_mkt:mktBody(S.legs.A),legB_mkt:mktBody(S.legs.B)}:{}),rho:pick('rho'),rho_sig:pick('rs'),sig_rho:pick('sr'),rho_half_life:usedHL(),
     usd_rate:parseFloat($('usdRate').value)||0,fly_conv:S.fly_conv,wings:S.wings,atm_anchor:S.atm_anchor,delta_mode:S.delta_mode,skew:skewBody()};
   status('Building '+crossName(S.pairA,S.pairB)+'…');$('btnBuild').disabled=true;
   try{S.result=await api('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});S.lastBody=body;S.resultSig=Date.now();S.band=null;
     const R=S.result;if(!R.rows.find(r=>r.tenor===S.selTenor)&&R.rows.length)S.selTenor=R.rows[Math.min(4,R.rows.length-1)].tenor;
     const ne=Object.keys(R.errors).length;
     status('Built '+R.cross+' — '+R.rows.length+' tenors in '+R.secs+'s'+(ne?' · errors on '+Object.keys(R.errors).join(', '):''),ne?'warn':'');
-    renderResults();S._ciP=ciAfterBuild();}
+    renderResults();S._ciP=ciAfterBuild();S._cmpP=compareBuild(body);}
   catch(e){status('Build failed: '+e.message,'err');}
   $('btnBuild').disabled=false;
 }
@@ -3849,7 +4040,9 @@ function renderResults(){
     +'<td class="sep">'+f(l.bf25_in,3)+'</td><td>'+f(l.bs25,3)+'</td><td>'+f(l.bf10_in,3)+'</td><td>'+f(l.bs10,3)+'</td>'
     +(i?'<td class="sep" colspan="6"></td>':'<td class="sep">'+f(p['10P'][0],5)+'</td><td>'+f(p['25P'][0],5)+'</td><td>'+f(p['ATM'][0],5)+'</td><td>'+f(p['25C'][0],5)+'</td><td>'+f(p['10C'][0],5)+'</td><td>'+r.secs+'</td>')+'</tr>';}));
   h+='</tbody></table></div></details>';
+  h+='<div id="marksEffect"></div>';
   el.innerHTML=h;
+  if(S.resultBbg)renderMarksEffect();
   $('btnCsv').onclick=exportCsv;
   $('selTenor').onchange=e=>{S.selTenor=e.target.value;drawSmile();};
   drawSmile();drawTerms();renderRR();
@@ -4355,7 +4548,7 @@ async function refreshMarket(opts){          // legs (fresh Bloomberg pull) + ma
   if(n&&!opts.choice){choice=await askEdits(n);if(choice==='cancel'){status('Refresh cancelled');return 'cancel';}}
   status('Refreshing Bloomberg legs and '+crossNm()+' quotes…');
   const pull=async w=>{const pair=w==='A'?S.pairA:S.pairB;
-    try{const L=await api('/api/surface?pair='+pair);L._orig=JSON.parse(JSON.stringify(L.rows));
+    try{const L=await api('/api/surface?pair='+pair+'&marks='+marksQ());L._orig=JSON.parse(JSON.stringify(L.rows));
       if(choice==='keep')ed[w].forEach(([t,k,v])=>{L.rows[t]=L.rows[t]||{};L.rows[t][k]=v;});
       S.legs[w]=L;return null;}catch(e){return pair+': '+e.message;}};
   const errs=(await Promise.all([pull('A'),pull('B')])).filter(Boolean);
@@ -4656,6 +4849,48 @@ function smileBandTraces(t,K){const B=bandFresh();if(!B)return [];const cs=['lo'
   return [{x:K,y:up,mode:'lines',line:{width:0},showlegend:false,hoverinfo:'skip'},
     {x:K,y:dn,mode:'lines',line:{width:0},fill:'tonexty',fillcolor:'rgba(57,135,229,0.16)',name:CI_LAB[ciCfg().level]+' ρ band',hoverinfo:'skip'}];}
 
+// ===================== Your marks: publish / revert / calculate with =====================
+function marksQ(){return S.marks_mode==='bbg'?'bbg':'mine';}
+function marksCount(L){if(!L||!L.marked)return 0;let n=0;Object.values(L.marked).forEach(r=>n+=Object.keys(r).length);return n+(L.marked_spot?1:0);}
+function mktBody(L){const rows={},src=L.bbg_rows||L.rows;TENORS.forEach(t=>{const r=src[t];if(r&&r.atm!=null&&isFinite(r.atm))rows[t]=r;});
+  return {pair:L.pair,spot:+(L.bbg_spot!=null?L.bbg_spot:L.spot),fwd_scale:+L.fwd_scale,rows};}
+function legDiffers(L){if(!L||!L.bbg_rows)return false;if(L.bbg_spot!=null&&Math.abs(+L.spot-(+L.bbg_spot))>1e-12)return true;
+  return TENORS.some(t=>{const a=L.rows[t]||{},b=L.bbg_rows[t]||{};return GRID_KEYS.some(k=>{const x=a[k],y=b[k];return (x==null)!==(y==null)||(x!=null&&Math.abs(x-y)>1e-12);});});}
+async function publishLeg(which){
+  const L=S.legs[which];if(!L)return;const cells={};let n=0;
+  TENORS.forEach(t=>{const r=L.rows[t]||{},b=(L.bbg_rows||{})[t]||{};GRID_KEYS.forEach(k=>{const v=r[k],w=b[k];
+    if(v!=null&&isFinite(v)&&(w==null||Math.abs(v-w)>1e-12)){(cells[t]=cells[t]||{})[k]=+v;n++;}});});
+  const spot=(L.bbg_spot!=null&&Math.abs(+L.spot-(+L.bbg_spot))>1e-12)?+L.spot:null;
+  try{const r=await api('/api/marks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pair:L.pair,cells,spot})});
+    const N=r.surface;N._orig=JSON.parse(JSON.stringify(N.rows));N._origSpot=N.spot;S.legs[which]=N;renderLeg(which);renderCorr();save();
+    status(r.n?'Published '+r.n+' mark'+(r.n>1?'s':'')+' on '+L.pair+' — kept through Bloomberg refreshes, used on the CAD tab and by colleagues':'No differences from Bloomberg: '+L.pair+' has no marks');
+    if(S.result)await build();}
+  catch(e){status('Publish failed: '+e.message,'err');}}
+async function revertLegToBbg(which){
+  const L=S.legs[which];if(!L)return;
+  try{const r=await api('/api/marks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pair:L.pair,cells:{},spot:null})});
+    const N=r.surface;N._orig=JSON.parse(JSON.stringify(N.rows));N._origSpot=N.spot;S.legs[which]=N;renderLeg(which);renderCorr();save();
+    status(L.pair+' is back on Bloomberg (your marks for it are deleted)');if(S.result)await build();}
+  catch(e){status('Revert failed: '+e.message,'err');}}
+async function compareBuild(body){
+  const el=$('marksEffect');S.resultBbg=null;
+  if(S.marks_mode!=='compare'){if(el)el.innerHTML='';return;}
+  if(!(legDiffers(S.legs.A)||legDiffers(S.legs.B))){if(el)el.innerHTML='<div class="note">Compare: no marks or edits on these legs, so the cross is the same on Bloomberg.</div>';return;}
+  if(el)el.innerHTML='<div class="note">Compare: building the cross on Bloomberg legs…</div>';
+  const b2={...body,legA:mktBody(S.legs.A),legB:mktBody(S.legs.B)};delete b2.legA_mkt;delete b2.legB_mkt;
+  try{S.resultBbg=await api('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b2)});}catch(e){if(el)el.innerHTML='<div class="note err">Compare failed: '+e.message+'</div>';return;}
+  renderMarksEffect();}
+function renderMarksEffect(){
+  const el=$('marksEffect'),R=S.result,B=S.resultBbg;if(!el||!R||!B)return;const bk=R.fly_conv==='broker';
+  const ks=[['atm','ATM'],['rr25','25 RR'],['rr10','10 RR'],[bk?'bf25b':'bf25s','25 BF'],[bk?'bf10b':'bf10s','10 BF']];
+  let h='<h2 style="margin-top:14px">Effect of your marks on '+R.cross+' <span class="badge marks">MY MARKS vs BLOOMBERG</span></h2><div class="scroll"><table id="cmpTable"><thead><tr><th></th>'
+    +ks.map(k=>'<th class="grp sep" colspan="3">'+k[1]+'</th>').join('')+'</tr><tr><th>Tenor</th>'+ks.map(()=>'<th class="sep">Mine</th><th>Bloomberg</th><th>Diff</th>').join('')+'</tr></thead><tbody>';
+  R.rows.forEach(r=>{const b=B.rows.find(x=>x.tenor===r.tenor)||{};h+='<tr data-t="'+r.tenor+'"><td class="lab">'+r.tenor+'</td>'
+    +ks.map(([k])=>{const d=(r[k]!=null&&b[k]!=null)?r[k]-b[k]:null;return '<td class="sep">'+f(r[k],3)+'</td><td>'+f(b[k],3)+'</td><td class="'+(d!=null&&Math.abs(d)>0.0005?'hl':'')+'">'+sgn(d,3)+'</td>';}).join('')+'</tr>';});
+  h+='</tbody></table></div><div class="note">Same correlation and correlation skew in both (calibrated on the Bloomberg legs); the only difference is your leg marks / edits. '
+    +'Leg differences: '+['A','B'].map(w=>S.legs[w].pair+' '+(legDiffers(S.legs[w])?'marked':'= Bloomberg')).join(', ')+'.</div>';
+  el.innerHTML=h;}
+
 // ===================== Risk reversals & correlation skew =====================
 // beta = d rho_Y / d ln(cross). On screen: rho per +1% in the cross = beta / 100.
 function skewKey(){return S.pairA+'|'+S.pairB;}
@@ -4936,11 +5171,11 @@ function renderCadLock(msg){
 }
 async function cadLock(){try{await api('/api/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}cadClear();renderCadLock('Locked.');}
 async function cadLoadSnap(){
-  try{const r=await api('/api/cad/snapshot?rho_src='+CAD.rho_src);CAD.snap=r.snapshot;CAD.st=r;if(CAD.snap)renderCad();else renderCadStatus();}
+  try{const r=await api('/api/cad/snapshot?rho_src='+CAD.rho_src+'&marks='+(CAD.marks||'mine'));CAD.snap=r.snapshot;CAD.st=r;if(CAD.snap)renderCad();else renderCadStatus();}
   catch(e){if(/locked/.test(e.message)){cadClear();renderCadLock('Session expired — unlock again.');}else status('CAD board: '+e.message,'err');}
 }
 async function cadRefresh(){
-  try{const r=await api('/api/cad/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rho_src:CAD.rho_src})});
+  try{const r=await api('/api/cad/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rho_src:CAD.rho_src,marks:CAD.marks||'mine'})});
     if(!r.started&&r.current){await cadLoadSnap();return;}   // viewer: board already built from the latest shared data
     CAD.st=r;renderCadStatus();cadPoll();}
   catch(e){if(/locked/.test(e.message)){cadClear();renderCadLock('Session expired — unlock again.');}else status('CAD refresh: '+e.message,'err');}
@@ -4963,6 +5198,7 @@ function renderCad(){
     +'<button class="act" id="cadLockBtn" style="padding:3px 9px;font-size:11px">Lock</button></h2>'
     +'<div class="controls" style="gap:8px 14px;margin-bottom:6px">'
     +'<div class="f"><label class="f">Correlation</label><div class="seg" id="cadRho"><button data-v="implied">Implied (live mkt)</button><button data-v="realized">Realized</button></div></div>'
+    +'<div class="f"><label class="f">Legs</label><div class="seg" id="cadMarks" title="My marks: the host\'s published leg marks on top of Bloomberg"><button data-v="mine">My marks</button><button data-v="bbg">Bloomberg</button></div></div>'
     +'<label class="f">Tenor<select id="cadTenor">'+TENORS.map(t=>'<option'+(t===CAD.tenor?' selected':'')+'>'+t+'</option>').join('')+'</select></label>'
     +'<button class="act primary" id="cadRefresh">Refresh now</button>'
     +'<label class="f">Auto-refresh<select id="cadAuto">'+[[0,'Off'],[1,'Every 1 min'],[5,'Every 5 min'],[15,'Every 15 min']].map(([v,l])=>'<option value="'+v+'"'+(v==CAD.auto?' selected':'')+'>'+l+'</option>').join('')+'</select></label>'
@@ -5019,6 +5255,7 @@ function renderCad(){
 }
 function cadWire(){
   $('cadLockBtn').onclick=cadLock;$('cadRefresh').onclick=cadRefresh;
+  document.querySelectorAll('#cadMarks button').forEach(b=>{b.classList.toggle('on',(CAD.marks||'mine')===b.dataset.v);b.onclick=()=>{CAD.marks=b.dataset.v;document.querySelectorAll('#cadMarks button').forEach(x=>x.classList.toggle('on',x===b));cadRefresh();};});
   document.querySelectorAll('#cadRho button').forEach(b=>{b.classList.toggle('on',CAD.rho_src===b.dataset.v);b.onclick=()=>{CAD.rho_src=b.dataset.v;document.querySelectorAll('#cadRho button').forEach(x=>x.classList.toggle('on',x===b));cadRefresh();};});
   $('cadTenor').onchange=e=>{CAD.tenor=e.target.value;renderCad();};
   $('cadAuto').onchange=e=>cadSetAuto(+e.target.value);
@@ -5062,6 +5299,10 @@ async function init(){
   if(S.corr&&S.corr.vol_vol)renderCorr();else loadCorr();
   loadMkt();renderMonitor();renderAnalytics();renderTri();renderCI();}
   $('btnShared').onclick=refreshSharedNow;
+  document.querySelectorAll('#marksMode button').forEach(b=>{b.classList.toggle('on',S.marks_mode===b.dataset.v);
+    b.onclick=async()=>{const prev=marksQ();S.marks_mode=b.dataset.v;save();document.querySelectorAll('#marksMode button').forEach(x=>x.classList.toggle('on',x===b));
+      if(marksQ()!==prev){await Promise.all([loadLeg('A'),loadLeg('B')]);renderCorr();}
+      if(S.legs.A&&S.legs.B&&S.result)await build();else if(S.marks_mode!=='compare'){S.resultBbg=null;const e=$('marksEffect');if(e)e.innerHTML='';}};});
   renderShared(st.shared);if(st.shared)S.dataVer=st.shared.version;
   setInterval(pollShared,SHARED_POLL_MS);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pollShared();});
 }
@@ -5848,6 +6089,53 @@ def selftest():
         bs_.append(skew_beta_realized(0.007 * g1, 0.006 * (0.4 * g1 + math.sqrt(1 - 0.16) * g2))['beta'])
     check('realized-correlation skew is unbiased when there is no skew', abs(np.mean(bs_)) < 3 * np.std(bs_) / math.sqrt(len(bs_)), f'(mean {np.mean(bs_):+.2f}, sd {np.std(bs_):.2f})')
 
+    print('\n20) Your marks: publish, apply over Bloomberg, calibrate on Bloomberg then move the cross')
+    import tempfile
+    global MARKS_FILE
+    real_mf, real_m = MARKS_FILE, dict(MARKS)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            MARKS_FILE = os.path.join(td, 'm.json')
+            MARKS.clear()
+            raw = placeholder_surface('USDCAD')
+            n = publish_marks('USDCAD', {'3M': {'atm': raw['rows']['3M']['atm'] + 0.5, 'rr25': 0.9}, '6M': {'junk': 1}}, spot=1.40, raw=raw)
+            m_ = apply_marks(raw, 'mine')
+            b_ = apply_marks(raw, 'bbg')
+            check('publish stores per-cell marks with the Bloomberg value at the time; applied on top, raw kept alongside',
+                  n == 3 and m_['rows']['3M']['atm'] == raw['rows']['3M']['atm'] + 0.5 and m_['rows']['1M'] == raw['rows']['1M'] and m_['spot'] == 1.40
+                  and m_['bbg_rows']['3M']['atm'] == raw['rows']['3M']['atm'] and b_['rows'] == raw['rows'] and set(m_['marked']['3M']) == {'atm', 'rr25'}
+                  and json.load(open(MARKS_FILE))['USDCAD']['cells']['3M']['atm']['bbg'] == raw['rows']['3M']['atm'])
+            raw2 = json.loads(json.dumps(raw))
+            for t_ in raw2['rows']:
+                raw2['rows'][t_]['atm'] += 0.2
+            m2 = apply_marks(raw2, 'mine')
+            check('a Bloomberg refresh moves only the unmarked cells', m2['rows']['3M']['atm'] == raw['rows']['3M']['atm'] + 0.5
+                  and abs(m2['rows']['1M']['atm'] - raw['rows']['1M']['atm'] - 0.2) < 1e-12 and abs(m2['marked']['3M']['atm']['bbg_now'] - raw2['rows']['3M']['atm']) < 1e-12)
+            MARKS.clear()
+            load_marks(MARKS_FILE)
+            restored = 'USDCAD' in MARKS
+            publish_marks('USDCAD', {}, None, raw)
+            check('marks reload from disk; publishing nothing deletes them', restored and 'USDCAD' not in MARKS and json.load(open(MARKS_FILE)) == {})
+            La_, Lb_ = placeholder_surface('EURUSD'), placeholder_surface('USDCAD')
+            Lm = json.loads(json.dumps(Lb_))
+            Lm['rows']['3M']['atm'] += 0.5
+            Lm['rows']['3M']['rr25'] += 0.3
+            rho_ = {'3M': -0.40}
+            kw = dict(rho_sig_by_tenor={'3M': 0.6}, sig_rho_by_tenor={'3M': 0.2})
+            sk = {'3M': {'mode': 'implied', 'rr_mkt': -0.60}}
+            sb = build_calibrated(La_, Lb_, rho_, skew_by_tenor=sk, **kw)
+            sm = build_calibrated(La_, Lm, rho_, legA_mkt=La_, legB_mkt=Lb_, skew_by_tenor=sk, **kw)
+            rb_, rm_ = sb['tenors'][0], sm['tenors'][0]
+            exp = triangle_cross(La_['rows']['3M']['atm'] / 100, Lm['rows']['3M']['atm'] / 100, 0.40) * 100
+            check('marked legs: skew calibrated on Bloomberg legs and held; the cross ATM / RR move with the marks',
+                  abs(rm_['skew']['beta_used'] - rb_['skew']['beta_impl']) < 1e-12 and abs(rb_['res']['rr25'] * 100 + 0.60) < 1e-6
+                  and abs(rm_['res']['rr25'] * 100 + 0.60) > 0.01 and abs(rm_['res']['atm'] * 100 - exp) < 2e-3 and not legs_differ(La_, La_) and legs_differ(Lm, Lb_),
+                  f"(25 RR -0.600 -> {rm_['res']['rr25'] * 100:+.3f}; ATM {rb_['res']['atm'] * 100:.3f} -> {rm_['res']['atm'] * 100:.3f})")
+    finally:
+        MARKS_FILE = real_mf
+        MARKS.clear()
+        MARKS.update(real_m)
+
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)
 
@@ -5887,6 +6175,7 @@ def main():
         return
     if args.selftest:
         raise SystemExit(0 if selftest() else 1)
+    load_marks()
     REFRESH['mins'] = max(0, args.refresh_mins)
     REFRESH['weekdays_only'] = not args.refresh_weekends
     if args.refresh_window.strip().lower() in ('all', '24h', ''):
