@@ -942,6 +942,25 @@ def corr_est(a, b, zero_mean=None):
     return float(np.sum(a * b)) / den if den > 0 else float('nan')
 
 
+def realized_vols(px_a, px_b, pair_a, pair_b, windows=None):
+    """Per tenor: realized vol of each leg and of the cross (annualized, vol pts, zero-mean, 252 days),
+    on the same windows as realized_corr. With zero-mean estimators on one window the cross vol obeys
+    the triangle exactly: x^2 = a^2 + b^2 - 2 rho_Y a b with rho_Y = the realized correlation."""
+    windows = windows or CORR_WINDOW_BDAYS
+    sA, sB = leg_info(pair_a)[1], leg_info(pair_b)[1]
+    ya = sA * np.diff(np.log(np.asarray(px_a, float)))
+    yb = sB * np.diff(np.log(np.asarray(px_b, float)))
+    out = {}
+    for t, n in windows.items():
+        m = min(n, len(ya))
+        if m < 10:
+            out[t] = {'window': n, 'n': m, 'a': None, 'b': None, 'x': None}
+            continue
+        va, vb, vx = (math.sqrt(252 * float(np.mean(r * r))) * 100 for r in (ya[-m:], yb[-m:], ya[-m:] - yb[-m:]))
+        out[t] = {'window': n, 'n': m, 'a': va, 'b': vb, 'x': vx}
+    return out
+
+
 def realized_corr(px_a, px_b, pair_a, pair_b, windows=None):
     """px_a, px_b: aligned daily closes. Per-tenor rho as quoted and rho_Y."""
     windows = windows or CORR_WINDOW_BDAYS
@@ -2340,7 +2359,7 @@ def get_corr(a, b):
                     if len(vd) > 30 else (None, len(vd))
                 vv[t] = {'rho_sig': r, 'n': n}
             return {'source': 'BBG', 'from': dates[0].isoformat(), 'to': dates[-1].isoformat(),
-                    'n_obs': len(dates), 'by_tenor': realized_corr(pa_, pb_, a, b),
+                    'n_obs': len(dates), 'by_tenor': realized_corr(pa_, pb_, a, b), 'vol_realized': realized_vols(pa_, pb_, a, b),
                     'vol_vol': vv, 'corr_vol': corr_vol(pa_, pb_)}
         except NotInStore:
             raise
@@ -3673,6 +3692,7 @@ table.grid input.num.marked,.meta input.num.marked{background:rgba(201,133,0,.17
 <div class="status" id="status"></div>
 <section class="grid2"><div class="card" id="cardA"></div><div class="card" id="cardB"></div></section>
 <section class="card" id="cardC"></section>
+<section class="card" id="cardIR"></section>
 <section class="card" id="results"><h2>Cross surface</h2><div class="empty">Generate to build the cross surface.</div></section>
 <section class="card" id="cardRR"></section>
 <section class="card" id="cardCI"></section>
@@ -3694,7 +3714,7 @@ function load(){try{const r=localStorage.getItem(LS);if(r)Object.assign(S,JSON.p
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
 function status(msg,cls){const el=$('status');el.className='status '+(cls||'');el.textContent=msg||'';}
 function f(x,d=2){return (x===null||x===undefined||!isFinite(x))?'—':Number(x).toFixed(d);}
-function sgn(x,d=2){return (x===null||x===undefined||!isFinite(x))?'—':(x>=0?'+':'')+Number(x).toFixed(d);}
+function sgn(x,d=2){if(x===null||x===undefined||!isFinite(x))return '—';if(Math.abs(x)<0.5*Math.pow(10,-d))x=0;return (x>=0?'+':'')+Number(x).toFixed(d);}   // no '-0.000'
 function legCcy(p){return p.slice(3)==='USD'?p.slice(0,3):p.slice(3);}
 const RANK=['EUR','GBP','AUD','NZD','USD','CAD','CHF','NOK','SEK','DKK','PLN','CZK','HUF','ILS','TRY','ZAR','MXN','BRL','CLP','COP','CNH','CNY','HKD','SGD','TWD','KRW','INR','IDR','PHP','THB','JPY'];
 function crossName(a,b){const ca=legCcy(a),cb=legCcy(b);if(ca===cb)return null;return RANK.indexOf(ca)<RANK.indexOf(cb)?ca+cb:cb+ca;}
@@ -3945,7 +3965,7 @@ function renderCorr(){
   el.querySelectorAll('input.ovr').forEach(inp=>inp.onchange=()=>{const v=inp.value.trim();
     S.ov[inp.dataset.kind][inp.dataset.t]=v===''?null:parseFloat(v);save();renderCorr();});
   $('hlOv').onchange=e=>{const v=e.target.value.trim();S.hl_ov=v===''?null:parseFloat(v);save();renderCorr();};
-  renderTri();renderCI();renderRR();
+  renderTri();renderCI();renderRR();renderIR();
   document.querySelectorAll('#rhoSrc button').forEach(b=>{b.classList.toggle('on',S.rho_src===b.dataset.v);
     b.onclick=()=>{S.rho_src=b.dataset.v;save();renderCorr();};});
   if(S.mkt)el.insertAdjacentHTML('beforeend','<div class="note">Implied ρ backs out the variance formula from the market '+S.mkt.cross
@@ -4385,6 +4405,7 @@ function triSolve(st,solve,sg){                // fill in the solved variable; r
   return {v:o,ok,msg,roots};
 }
 function renderTri(){
+  try{renderIR();}catch(e){}                 // implied-vs-realized table follows grid edits too
   const el=$('cardTri');if(!el)return;const C=triCfg(),c=crossNm(),pa=S.pairA,pb=S.pairB;
   let h='<h2>Triangle &amp; gamma hedge — '+c+'<span style="flex:1"></span><label class="f" style="flex-direction:row;align-items:center;gap:6px;font-weight:400">Tenor <select id="triTenor">'
     +TENORS.map(t=>'<option'+(t===C.tenor?' selected':'')+'>'+t+'</option>').join('')+'</select></label></h2>';
@@ -4591,7 +4612,7 @@ function loadScriptOnce(name){
     s.onload=()=>res(!!window[name]);s.onerror=()=>{s.remove();res(false);};document.head.appendChild(s);})),Promise.resolve(false));
 }
 function allSectionDefs(){const c=crossNm(),A=S.legs.A,B=S.legs.B;
-  return [['cardA','Leg A'+(A?' — '+A.pair:'')],['cardB','Leg B'+(B?' — '+B.pair:'')],['cardC','Correlation inputs'],['results','Cross surface'],['cardRR','Risk reversals & correlation skew'],['cardCI','Confidence band & outliers'],
+  return [['cardA','Leg A'+(A?' — '+A.pair:'')],['cardB','Leg B'+(B?' — '+B.pair:'')],['cardC','Correlation inputs'],['cardIR','ATM implied vs realized'],['results','Cross surface'],['cardRR','Risk reversals & correlation skew'],['cardCI','Confidence band & outliers'],
     ['cardTri','Triangle & gamma hedge'],['cardMon','Correlation monitor'],['cardAn','Correlation analytics']].map(([id,l])=>({id,label:l,cross:c}))
     .concat([['cadOverview','CAD crosses — overview'],['cadBook','CAD book — dephased vega'],['cadSurf','CAD crosses — surfaces']].map(([id,l])=>({id,label:l,cross:'CAD'})));}
 function sectionDefs(){return allSectionDefs().filter(d=>{const e=$(d.id);return e&&e.offsetParent!==null;});}   // sections on the visible tab
@@ -4611,6 +4632,7 @@ function redrawCharts(){
   try{if($('chTri'))triUpdate();}catch(e){}
   try{if(S.ciData)drawCI();}catch(e){}
   try{if(S.result)drawRR();}catch(e){}
+  try{if($('chIRx'))drawIR();}catch(e){}
 }
 function freezeInputs(root){                  // copy live values into attributes so the clone shows them
   root.querySelectorAll('input').forEach(i=>{if(i.type==='checkbox'||i.type==='radio'){if(i.checked)i.setAttribute('checked','');else i.removeAttribute('checked');}
@@ -4848,6 +4870,57 @@ function smileBandTraces(t,K){const B=bandFresh();if(!B)return [];const cs=['lo'
   if(cs.length<2)return [];const up=K.map(x=>Math.max(...cs.map(c=>interp(c.k,c.v,x)))),dn=K.map(x=>Math.min(...cs.map(c=>interp(c.k,c.v,x))));
   return [{x:K,y:up,mode:'lines',line:{width:0},showlegend:false,hoverinfo:'skip'},
     {x:K,y:dn,mode:'lines',line:{width:0},fill:'tonexty',fillcolor:'rgba(57,135,229,0.16)',name:CI_LAB[ciCfg().level]+' ρ band',hoverinfo:'skip'}];}
+
+// ===================== ATM implied vs realized (cross and both legs) =====================
+// Cross: the SAME implied USD leg ATMs at implied correlation and at realized correlation, so the
+// difference is purely correlation. Legs: implied ATM vs realized vol.
+function irRows(){
+  const C=S.corr,A=S.legs.A,B=S.legs.B,M=S.mkt;if(!A||!B)return null;
+  const sg=orient(A.pair)*orient(B.pair),VR=(C&&C.vol_realized)||{};
+  return TENORS.map(t=>{const ra=A.rows[t],rb=B.rows[t],vr=VR[t]||{};
+    const ia=ra&&isFinite(+ra.atm)?+ra.atm:null,ib=rb&&isFinite(+rb.atm)?+rb.atm:null;
+    const rq=realized('rho',t),ryR=rq==null?null:sg*rq,iq=impliedQ(t),ryI=iq==null?null:sg*iq;
+    const tri=(a,b,y)=>(a==null||b==null||y==null)?null:Math.sqrt(Math.max(a*a+b*b-2*y*a*b,0));
+    const mx=M&&M.rows&&M.rows[t]&&M.rows[t].atm!=null&&isFinite(M.rows[t].atm)?+M.rows[t].atm:null;
+    const atI=tri(ia,ib,ryI),atR=tri(ia,ib,ryR);
+    return {tenor:t,window:vr.window,mkt:mx,atI,atR,diff:(atI!=null&&atR!=null)?atI-atR:null,ryI,ryR,ia,ib,
+      ra:vr.a!=null?vr.a:null,rb:vr.b!=null?vr.b:null};});}
+function renderIR(){
+  const el=$('cardIR');if(!el)return;const A=S.legs.A,B=S.legs.B,c=crossNm();
+  let h='<h2>ATM implied vs realized — '+(c||'')+' and its legs</h2>';
+  const rows=irRows();if(!rows){el.innerHTML=h+'<div class="empty">Loading legs…</div>';return;}
+  const hasR=rows.some(r=>r.ra!=null),mk=(L)=>(L&&(marksCount(L)||legDiffers(L)))?' <span class="badge marks" title="Implied leg vols are your grid: Bloomberg + your marks / edits">your marks</span>':'';
+  const cls=x=>x==null?'':x>0?'pos':'negv';
+  h+='<div class="scroll"><table id="irTable"><thead><tr><th></th><th class="grp sep" colspan="3">'+c+' ATM (implied USD legs)</th>'
+    +'<th class="grp sep" colspan="3">'+A.pair+' ATM'+mk(A)+'</th><th class="grp sep" colspan="3">'+B.pair+' ATM'+mk(B)+'</th><th class="sep"></th></tr>'
+    +'<tr><th>Tenor</th><th class="sep" title="the two implied USD leg ATMs at IMPLIED correlation (= the market cross ATM when the legs are Bloomberg)">At implied ρ</th>'
+    +'<th title="the same implied USD leg ATMs at REALIZED correlation">At realized ρ</th><th title="implied-ρ ATM minus realized-ρ ATM: the correlation premium in vol points">Implied − realized</th>'
+    +'<th class="sep">Implied</th><th>Realized</th><th>Impl − real</th><th class="sep">Implied</th><th>Realized</th><th>Impl − real</th><th class="sep">Window</th></tr></thead><tbody>';
+  rows.forEach(r=>{const d=(x,y)=>(x!=null&&y!=null)?x-y:null,da=d(r.ia,r.ra),db=d(r.ib,r.rb);
+    h+='<tr data-t="'+r.tenor+'"><td class="lab">'+r.tenor+'</td>'
+      +'<td class="sep hl" title="ρ_Y implied '+sgn(r.ryI,3)+(r.mkt!=null?' · market '+c+' ATM '+f(r.mkt,3):'')+'">'+f(r.atI,3)+'</td>'
+      +'<td title="ρ_Y realized '+sgn(r.ryR,3)+'">'+f(r.atR,3)+'</td><td class="'+cls(r.diff)+'">'+sgn(r.diff,3)+'</td>'
+      +'<td class="sep hl">'+f(r.ia,3)+'</td><td>'+f(r.ra,3)+'</td><td class="'+cls(da)+'">'+sgn(da,3)+'</td>'
+      +'<td class="sep hl">'+f(r.ib,3)+'</td><td>'+f(r.rb,3)+'</td><td class="'+cls(db)+'">'+sgn(db,3)+'</td>'
+      +'<td class="sep">'+(r.window?r.window+'d':'—')+'</td></tr>';});
+  h+='</tbody></table></div>';
+  h+='<div class="charts" style="margin-top:12px;grid-template-columns:1fr 1fr"><div><div class="meta"><b style="color:var(--text-primary)">'+c+'</b> ATM at implied vs realized ρ</div><div id="chIRx" class="chart"></div></div>'
+    +'<div><div class="meta"><b style="color:var(--text-primary)">Legs</b> implied vs realized</div><div id="chIRl" class="chart"></div></div></div>';
+  h+='<div class="note">Both '+c+' columns use the same implied USD leg ATMs (the leg grids, with your marks if any) in σX² = σA² + σB² − 2ρσAσB, once with implied ρ and once with realized ρ, '
+    +'so <b>Implied − realized</b> is purely the correlation premium in vol points (positive: the cross is priced over what realized correlation gives). With Bloomberg legs, the implied-ρ ATM is the market cross ATM. '
+    +'Leg realized vols and realized ρ use the same window per tenor (the tenor in business days, min 21; zero-mean, 252 days a year). Hover a cross cell for the ρ used.'
+    +(hasR?'':' <span class="warn">Realized vols need Bloomberg history (placeholder data has none).</span>')+'</div>';
+  el.innerHTML=h;drawIR(rows);
+}
+function drawIR(rows){
+  if(typeof Plotly==='undefined'||!$('chIRx'))return;rows=rows||irRows();if(!rows)return;const x=rows.map(r=>r.tenor),A=S.legs.A,B=S.legs.B;
+  const ln=(y,name,col,dash)=>({x,y,mode:'lines+markers',name,line:{color:col,width:2,dash:dash||'solid'},marker:{size:5},connectgaps:false});
+  const L=baseLayout('ATM vol');L.xaxis.type='category';L.hovermode='x unified';L.margin.r=16;
+  Plotly.react('chIRx',[ln(rows.map(r=>r.atI),'At implied ρ',css('--s1')),ln(rows.map(r=>r.atR),'At realized ρ',css('--s2'),'dash')],L,CFG);
+  const L2=baseLayout('ATM vol');L2.xaxis.type='category';L2.hovermode='x unified';L2.margin.r=16;
+  Plotly.react('chIRl',[ln(rows.map(r=>r.ia),A.pair+' implied',css('--s1')),ln(rows.map(r=>r.ra),A.pair+' realized',css('--s1'),'dot'),
+    ln(rows.map(r=>r.ib),B.pair+' implied',css('--s2')),ln(rows.map(r=>r.rb),B.pair+' realized',css('--s2'),'dot')],L2,CFG);
+}
 
 // ===================== Your marks: publish / revert / calculate with =====================
 function marksQ(){return S.marks_mode==='bbg'?'bbg':'mine';}
@@ -6135,6 +6208,21 @@ def selftest():
         MARKS_FILE = real_mf
         MARKS.clear()
         MARKS.update(real_m)
+
+    print('\n21) ATM implied vs realized: realized leg / cross vols')
+    rng_ = np.random.default_rng(9)
+    n_ = 600
+    g1, g2 = rng_.standard_normal(n_), rng_.standard_normal(n_)
+    ya_ = 0.0047 * g1
+    yb_ = 0.0038 * (0.35 * g1 + math.sqrt(1 - 0.35 ** 2) * g2)
+    pa_ = 1.08 * np.exp(np.concatenate([[0], np.cumsum(ya_)]))            # EURUSD: Y = spot
+    pb_ = 1.37 * np.exp(-np.concatenate([[0], np.cumsum(yb_)]))           # USDCAD: Y = 1/spot
+    V_ = realized_vols(pa_, pb_, 'EURUSD', 'USDCAD')
+    Cq = realized_corr(pa_, pb_, 'EURUSD', 'USDCAD')
+    idw = max(abs(V_[t]['x'] - math.sqrt(V_[t]['a'] ** 2 + V_[t]['b'] ** 2 - 2 * Cq[t]['rho_y'] * V_[t]['a'] * V_[t]['b'])) for t in TENORS)
+    exp_a = math.sqrt(252 * float(np.mean(ya_[-252:] ** 2))) * 100
+    check('realized vols: annualized zero-mean, same windows as correlation; cross = triangle of the realized legs exactly',
+          abs(V_['1Y']['a'] - exp_a) < 1e-12 and V_['1W']['window'] == 21 and idw < 1e-9, f"(1Y EURUSD {V_['1Y']['a']:.3f}, identity {idw:.1e})")
 
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)
